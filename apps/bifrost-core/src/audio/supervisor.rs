@@ -191,6 +191,7 @@ pub struct AudioHandle {
     priority: mpsc::Sender<Command>,
     talk_epoch: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
+    bound_generation: Option<u64>,
     shutdown: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
 }
@@ -225,10 +226,19 @@ struct PendingPrivacy {
 }
 
 impl AudioHandle {
+    /// Pins a private safety view to one child incarnation. A bound clone cannot
+    /// be rebound, and never retags stale privacy work onto a replacement child.
+    pub(crate) fn for_generation(&self, expected: u64) -> Self {
+        let mut handle = self.clone();
+        handle.bound_generation = Some(self.bound_generation.unwrap_or(expected));
+        handle
+    }
+
     async fn command(&self, message: Msg) -> Result<Reply> {
         let admitted_at = Instant::now();
-        let generation = self.generation.load(Ordering::Acquire);
-        if generation == 0 {
+        let current = self.generation.load(Ordering::Acquire);
+        let generation = self.bound_generation.unwrap_or(current);
+        if generation == 0 || generation != current {
             return Err(AudioSupervisorError::Unavailable);
         }
         let mut frame = w::AudioFrame {
@@ -372,7 +382,9 @@ impl AudioHandle {
     }
     /// Clears all transient native and remote talk, preserving persistent unmute.
     pub async fn ptt_release_all(&self) -> Result<u64> {
-        self.written(Msg::PttReleaseAll(w::PttReleaseAll {})).await
+        self.for_generation(self.generation.load(Ordering::Acquire))
+            .written(Msg::PttReleaseAll(w::PttReleaseAll {}))
+            .await
     }
     pub async fn set_media_watch(&self, enabled: bool) -> Result<u64> {
         self.written(Msg::SetMediaWatch(w::SetMediaWatch { enabled }))
@@ -392,6 +404,11 @@ impl AudioHandle {
         .await
     }
     pub async fn shutdown(&self) -> Result<()> {
+        // Generation-pinned safety views must never control the supervisor's
+        // generation-independent shutdown channel.
+        if self.bound_generation.is_some() {
+            return Err(AudioSupervisorError::Unavailable);
+        }
         // Reserved stop admission: disabling audio also interrupts backoff/launch
         // and cannot be blocked by the ordinary command queue or generation zero.
         self.shutdown.send_replace(true);
@@ -454,6 +471,7 @@ impl AudioSupervisor {
                 priority,
                 talk_epoch,
                 generation,
+                bound_generation: None,
                 shutdown,
                 stopped,
             },
@@ -1358,6 +1376,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_bound_safety_view_never_retags_or_rebinds_after_restart() {
+        let (commands, mut ordinary) = mpsc::channel(2);
+        let (priority, mut safety) = mpsc::channel(2);
+        let (shutdown, requested) = watch::channel(false);
+        let handle = AudioHandle {
+            commands,
+            priority,
+            talk_epoch: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
+            shutdown,
+            stopped: watch::channel(true).1,
+        };
+        let bound = handle.for_generation(7);
+        let (result, ()) = tokio::join!(bound.ptt_release_all(), async {
+            let command = safety.recv().await.unwrap();
+            assert_eq!(command.generation, 7);
+            // A restart racing admission leaves the queued command tagged OLD;
+            // the actor's existing generation check rejects it, never replays it.
+            handle.generation.store(8, Ordering::Release);
+            assert_eq!(command.generation, 7);
+            let _ = command.reply.send(Err(AudioSupervisorError::ChildLost));
+        });
+        assert_eq!(result, Err(AudioSupervisorError::ChildLost));
+        let epoch = handle.talk_epoch.load(Ordering::Acquire);
+        for stale in [
+            bound.clone(),
+            bound.for_generation(8),
+            handle.for_generation(0),
+        ] {
+            assert_eq!(
+                stale.ptt_release_all().await,
+                Err(AudioSupervisorError::Unavailable)
+            );
+            assert_eq!(
+                stale.set_mic_mute(99, true).await,
+                Err(AudioSupervisorError::Unavailable)
+            );
+            assert_eq!(
+                stale.shutdown().await,
+                Err(AudioSupervisorError::Unavailable)
+            );
+        }
+        assert_eq!(handle.talk_epoch.load(Ordering::Acquire), epoch);
+        assert!(!*requested.borrow());
+        assert!(safety.try_recv().is_err());
+        assert!(ordinary.try_recv().is_err());
+        let fresh = handle.for_generation(8);
+        let (result, ()) = tokio::join!(fresh.set_mic_mute(99, true), async {
+            let command = safety.recv().await.unwrap();
+            assert_eq!(command.generation, 8);
+            let _ = command.reply.send(Ok(Reply::Written(42)));
+        });
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
     async fn invalid_commands_never_enter_secret_queue() {
         let (commands, mut rx) = mpsc::channel(1);
         let handle = AudioHandle {
@@ -1365,6 +1440,7 @@ mod tests {
             priority: mpsc::channel(1).0,
             talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(1)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
@@ -1417,6 +1493,7 @@ mod tests {
             priority: mpsc::channel(1).0,
             talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
@@ -1443,6 +1520,7 @@ mod tests {
             priority,
             talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
@@ -1848,6 +1926,7 @@ mod tests {
             priority: mpsc::channel(1).0,
             talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
+            bound_generation: None,
             shutdown,
             stopped,
         };
@@ -2170,6 +2249,7 @@ mod tests {
             priority,
             talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
@@ -2224,6 +2304,7 @@ mod tests {
             priority,
             talk_epoch: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
             shutdown: watch::channel(false).0,
             stopped: watch::channel(true).1,
         };
