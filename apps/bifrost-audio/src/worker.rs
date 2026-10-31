@@ -602,6 +602,11 @@ where
     fn stop(&mut self, id: &[u8], reason: i32) {
         if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
             let mut session = self.sessions.remove(index);
+            let path_diagnostic = if reason == 5 {
+                session.media.snapshot().path.diagnostic as i32
+            } else {
+                0
+            };
             session.authorized.store(false, Ordering::Release);
             if session.media.stop().is_err() {
                 self.shared.stop_all();
@@ -617,10 +622,13 @@ where
                 self.socket = None;
             }
             self.shared.remove(id);
-            self.event(id, 5, reason, 0);
+            self.event_with_path(id, 5, reason, 0, path_diagnostic);
         }
     }
     fn event(&self, id: &[u8], kind: i32, reason: i32, port: u32) {
+        self.event_with_path(id, kind, reason, port, 0);
+    }
+    fn event_with_path(&self, id: &[u8], kind: i32, reason: i32, port: u32, path_diagnostic: i32) {
         self.response(
             0,
             Msg::SessionEvent(w::SessionEvent {
@@ -628,6 +636,7 @@ where
                 kind,
                 reason,
                 local_udp_port: port,
+                path_diagnostic,
             }),
         );
     }
@@ -775,6 +784,13 @@ where
                     native_discontinuity_flags: snapshot.native_discontinuity_flags,
                     jitter_rebuffers: snapshot.jitter_rebuffers,
                     render_underruns: snapshot.render_underruns,
+                    path: Some(w::PathHealth {
+                        diagnostic: snapshot.path.diagnostic as i32,
+                        validated: snapshot.path.validated,
+                        probes_sent: snapshot.path.probes_sent,
+                        peer_probes: snapshot.path.peer_probes,
+                        auth_failures: snapshot.path.auth_failures,
+                    }),
                     remote_receiver_quality: snapshot.remote_receiver_quality.map(|quality| {
                         w::RemoteReceiverQuality {
                             received_packets: quality.received_packets,

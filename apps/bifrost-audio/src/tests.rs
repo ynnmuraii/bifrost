@@ -401,6 +401,10 @@ mod local {
         assert_eq!(session_event(&mut listener.core, 1, b).await.reason, 0);
         let stopped = session_event(&mut listener.core, 5, 0).await;
         assert_eq!(stopped.reason, 5);
+        assert_eq!(
+            stopped.path_diagnostic,
+            w::PathDiagnostic::NoAuthenticatedPeerPackets as i32
+        );
         assert!(began.elapsed() >= Duration::from_secs(2));
         listener
             .core
@@ -436,10 +440,18 @@ mod local {
                         if session.capture_active == Some(true) {
                             assert!(matches!(session.clock_source, 1 | 2));
                         }
+                        if session.sending == Some(true) {
+                            assert!(session.path.as_ref().unwrap().validated);
+                        }
                     }
                     source_active|=health.sessions.iter().any(|session|session.capture_active==Some(true)&&session.sending==Some(true)&&session.sent_media_packets>0);
                 }},
                 frame=listener.core.recv()=>{if let Some(Msg::Health(health))=frame.unwrap().frame.msg {
+                    for session in &health.sessions {
+                        if session.counters.as_ref().unwrap().received_packets > 0 {
+                            assert!(session.path.as_ref().unwrap().validated);
+                        }
+                    }
                     listener_received|=health.sessions.iter().any(|session|
                         session.counters.as_ref().unwrap().received_packets>0
                             && session.capture_active==Some(false)

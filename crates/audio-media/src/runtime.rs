@@ -1,6 +1,13 @@
 //! Opt-in std-thread media engine. Construction requires an already authorized peer tuple and
 //! fresh per-session material. Callers must destroy this handle on parent/consent/worker loss.
 //! Backend/control polling stays on the owner thread; no core/IPC/identity dependency is present.
+//!
+//! Firewall invariant: the Listener sends an authenticated path challenge synchronously at
+//! session start, before waiting for the Source; the Source also probes immediately. Media
+//! remains gated on an authenticated response. Each direction sends authenticated traffic
+//! at least once per second while authorized (Source keepalive, Listener receiver report),
+//! including digital silence, to retain a stateful firewall's outbound UDP mapping. Neither
+//! endpoint replies to an unauthenticated datagram; no inbound firewall rule is installed.
 use crate::{
     control::ReceiverReport,
     crypto::{CryptoError, DirectionMaterial, Opener, Sealer},
@@ -40,6 +47,8 @@ pub use listener_group::ListenerGroup;
 pub const PCM_RING_SAMPLES: usize = 32_768;
 pub const EVENT_CAPACITY: usize = 16;
 pub const STOP_DEADLINE: Duration = Duration::from_secs(2);
+/// Maximum scheduled interval for each direction's authenticated idle traffic.
+pub const PATH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Socket is bound by the caller; peer must match the authenticated parent's IP and accepted port.
 /// The engine pins that complete tuple. Authenticated rebinding is intentionally unsupported.
@@ -74,6 +83,25 @@ pub enum MediaEvent {
     RotationRequired,
     Stopped { reason: StopReason },
 }
+/// Observed validation failure, not proof that a particular firewall blocked traffic.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PathDiagnostic {
+    #[default]
+    None = 0,
+    NoAuthenticatedPeerPackets = 1,
+    PeerProbesMissing = 2,
+    ProbeResponsesMissing = 3,
+    AuthenticationFailures = 4,
+}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PathHealth {
+    pub diagnostic: PathDiagnostic,
+    pub validated: bool,
+    pub probes_sent: u32,
+    pub peer_probes: u32,
+    pub auth_failures: u64,
+}
 #[derive(Debug, Clone, Copy)]
 pub struct HealthSnapshot {
     pub health: AudioHealth,
@@ -84,6 +112,7 @@ pub struct HealthSnapshot {
     pub render_underruns: u64,
     /// Authenticated peer observations, never local Source playout state.
     pub remote_receiver_quality: Option<RemoteReceiverQuality>,
+    pub path: PathHealth,
     pub sent_datagrams: u64,
     pub sent_media_packets: u64,
     pub capture_active: bool,
@@ -146,6 +175,7 @@ struct Stats {
     drift: Option<DriftDiagnostics>,
     latency: LatencyDiagnostics,
     remote_receiver_quality: Option<RemoteReceiverQuality>,
+    path: PathHealth,
 }
 impl Stats {
     fn receive_source_report(&mut self, payload: &[u8]) {
@@ -245,6 +275,7 @@ impl Shared {
                 drift: None,
                 latency: LatencyDiagnostics::default(),
                 remote_receiver_quality: None,
+                path: PathHealth::default(),
             }),
         }
     }
@@ -451,6 +482,7 @@ impl<S: Stream + 'static> MediaSession<S> {
             jitter_rebuffers: stats.health.underruns,
             render_underruns: self.shared.callback_underruns.load(Ordering::Acquire),
             remote_receiver_quality: stats.remote_receiver_quality,
+            path: stats.path,
             sent_datagrams: stats.sent,
             sent_media_packets: media,
             capture_active: self.source
@@ -969,6 +1001,10 @@ struct PathState {
     attempts: u8,
     validated: bool,
     last_reply: Option<Instant>,
+    peer_packets: u32,
+    peer_probes: u32,
+    auth_failures: u64,
+    diagnostic: PathDiagnostic,
 }
 impl PathState {
     fn new(start: Instant) -> Result<Self, EngineError> {
@@ -983,6 +1019,10 @@ impl PathState {
             attempts: 0,
             validated: false,
             last_reply: None,
+            peer_packets: 0,
+            peer_probes: 0,
+            auth_failures: 0,
+            diagnostic: PathDiagnostic::None,
         })
     }
     fn deadline(&self) -> Option<Instant> {
@@ -995,11 +1035,22 @@ impl PathState {
         }
     }
     fn probe(&mut self) -> Result<Option<[u8; 16]>, StopReason> {
+        self.probe_at(Instant::now())
+    }
+    fn probe_at(&mut self, now: Instant) -> Result<Option<[u8; 16]>, StopReason> {
         if self.validated {
             return Ok(None);
         }
-        let now = Instant::now();
         if now.duration_since(self.start) >= Duration::from_secs(2) {
+            self.diagnostic = if self.peer_packets == 0 && self.auth_failures > 0 {
+                PathDiagnostic::AuthenticationFailures
+            } else if self.peer_packets == 0 {
+                PathDiagnostic::NoAuthenticatedPeerPackets
+            } else if self.peer_probes == 0 {
+                PathDiagnostic::PeerProbesMissing
+            } else {
+                PathDiagnostic::ProbeResponsesMissing
+            };
             return Err(StopReason::PathTimeout);
         }
         if self.attempts < 3 && now >= self.next {
@@ -1010,24 +1061,46 @@ impl PathState {
             Ok(None)
         }
     }
+    fn publish(&self, shared: &Shared) {
+        lock(&shared.stats).path = PathHealth {
+            diagnostic: self.diagnostic,
+            validated: self.validated,
+            probes_sent: u32::from(self.attempts),
+            peer_probes: self.peer_probes,
+            auth_failures: self.auth_failures,
+        };
+    }
+    fn probe_published(&mut self, shared: &Shared) -> Result<Option<[u8; 16]>, StopReason> {
+        let result = self.probe();
+        self.publish(shared);
+        result
+    }
     fn control(&mut self, header: Header, payload: &[u8]) -> bool {
+        self.control_at(header, payload, Instant::now())
+    }
+    fn control_at(&mut self, header: Header, payload: &[u8], now: Instant) -> bool {
+        self.peer_packets = self.peer_packets.saturating_add(1);
         if payload.len() != 16 {
             return false;
+        }
+        if header.kind == PacketKind::PathChallenge {
+            self.peer_probes = self.peer_probes.saturating_add(1);
         }
         if header.kind == PacketKind::PathResponse
             && payload == self.token
             && self.attempts > 0
-            && Instant::now().duration_since(self.next - Duration::from_millis(500))
-                <= Duration::from_millis(500)
+            && now
+                .checked_duration_since(self.next - Duration::from_millis(500))
+                .is_some_and(|elapsed| elapsed <= Duration::from_millis(500))
         {
             self.validated = true;
         }
         if header.kind == PacketKind::PathChallenge
-            && self
-                .last_reply
-                .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
+            && self.last_reply.is_none_or(|last| {
+                now.saturating_duration_since(last) >= Duration::from_millis(100)
+            })
         {
-            self.last_reply = Some(Instant::now());
+            self.last_reply = Some(now);
             return true;
         }
         false
@@ -1111,7 +1184,7 @@ impl SourceWorker {
                     converter.reset();
                 }
             }
-            if let Some(token) = self.path.probe()? {
+            if let Some(token) = self.path.probe_published(&self.context.shared)? {
                 let n = self
                     .sender
                     .control(
@@ -1147,9 +1220,15 @@ impl SourceWorker {
                             lock(&self.context.shared.stats).receive_source_report(payload);
                         }
                     }
-                    Err(_) => lock(&self.context.shared.stats).rejected += 1,
+                    Err(error) => {
+                        if error == CryptoError::Authentication {
+                            self.path.auth_failures = self.path.auth_failures.saturating_add(1);
+                        }
+                        lock(&self.context.shared.stats).rejected += 1;
+                    }
                 }
             }
+            self.path.publish(&self.context.shared);
             if self.context.shared.is_stopped() {
                 break;
             }
@@ -1188,7 +1267,7 @@ impl SourceWorker {
                     )
                     .map_err(crypto_reason)?;
                 self.context.send(&outgoing[..n])?;
-                next_keepalive = Instant::now() + Duration::from_secs(1);
+                next_keepalive = Instant::now() + PATH_KEEPALIVE_INTERVAL;
             }
             let needed = self
                 .converter
@@ -1289,7 +1368,7 @@ struct ReceiveWorker {
 }
 impl ReceiveWorker {
     fn send_probe(&mut self, outgoing: &mut [u8]) -> Result<(), StopReason> {
-        if let Some(token) = self.path.probe()? {
+        if let Some(token) = self.path.probe_published(&self.context.shared)? {
             let n = self
                 .sealer
                 .seal(
@@ -1354,9 +1433,15 @@ impl ReceiveWorker {
                                 .store(self.context.now_ms(), Ordering::Release);
                         }
                     }
-                    Err(_) => lock(&self.context.shared.stats).rejected += 1,
+                    Err(error) => {
+                        if matches!(error, MediaError::Crypto(CryptoError::Authentication)) {
+                            self.path.auth_failures = self.path.auth_failures.saturating_add(1);
+                        }
+                        lock(&self.context.shared.stats).rejected += 1;
+                    }
                 }
             }
+            self.path.publish(&self.context.shared);
             if self.path.validated {
                 self.context.shared.started(&self.context.events);
                 if Instant::now() >= next_report {
@@ -1383,7 +1468,7 @@ impl ReceiveWorker {
                         )
                         .map_err(crypto_reason)?;
                     self.context.send(&outgoing[..n])?;
-                    next_report = Instant::now() + Duration::from_secs(1);
+                    next_report = Instant::now() + PATH_KEEPALIVE_INTERVAL;
                 }
             }
             // Revisit stop/path/report deadlines even under a continuously full queue.
@@ -1400,6 +1485,45 @@ impl ReceiveWorker {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+    #[test]
+    fn path_timeout_reports_observations_without_guessing_firewall_blame() {
+        let start = Instant::now();
+        for (packets, probes, failures, expected) in [
+            (0, 0, 0, PathDiagnostic::NoAuthenticatedPeerPackets),
+            (1, 0, 0, PathDiagnostic::PeerProbesMissing),
+            (1, 1, 0, PathDiagnostic::ProbeResponsesMissing),
+            (0, 0, 7, PathDiagnostic::AuthenticationFailures),
+        ] {
+            let mut path = PathState::new(start).unwrap();
+            path.peer_packets = packets;
+            path.peer_probes = probes;
+            path.auth_failures = failures;
+            for ms in [0, 500, 1000] {
+                assert!(path
+                    .probe_at(start + Duration::from_millis(ms))
+                    .unwrap()
+                    .is_some());
+                assert_eq!(path.diagnostic, PathDiagnostic::None);
+            }
+            assert!(path
+                .probe_at(start + Duration::from_millis(1500))
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                path.probe_at(start + Duration::from_secs(2)),
+                Err(StopReason::PathTimeout)
+            );
+            assert_eq!(path.diagnostic, expected);
+            let shared = Shared::new(Arc::new(AtomicBool::new(true)));
+            path.publish(&shared);
+            let health = lock(&shared.stats).path;
+            assert_eq!(health.diagnostic, expected);
+            assert_eq!(health.probes_sent, 3);
+            assert_eq!(health.peer_probes, probes);
+            assert_eq!(health.auth_failures, failures);
+            assert!(!health.validated);
+        }
+    }
     #[test]
     fn source_receiver_report_recovers_after_extreme_snapshot_without_resetting_local_stats() {
         let shared = Shared::new(Arc::new(AtomicBool::new(true)));

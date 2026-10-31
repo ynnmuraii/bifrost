@@ -147,27 +147,62 @@ impl Drop for Relay {
 struct Energy {
     sum: f64,
     count: u64,
-    real: f64,
-    imaginary: f64,
+    tone_sum: f64,
 }
 impl Energy {
     fn add(&mut self, samples: impl Iterator<Item = f32>, frequency: f64, rate: u32) {
+        // Accumulate magnitudes per native callback, not phase across the whole 400 ms
+        // observation. Valid drift trimming (up to 5000 ppm) changes phase appreciably over
+        // that interval; a coarse correction can also move it without removing the tone.
+        let (mut real, mut imaginary, mut count) = (0.0, 0.0, 0u64);
         for x in samples {
             assert!(x.is_finite());
             self.sum += f64::from(x).powi(2);
-            let phase =
-                std::f64::consts::TAU * frequency * (self.count / 2) as f64 / f64::from(rate);
-            self.real += f64::from(x) * phase.cos();
-            self.imaginary += f64::from(x) * phase.sin();
-            self.count += 1;
+            let phase = std::f64::consts::TAU * frequency * (count / 2) as f64 / f64::from(rate);
+            real += f64::from(x) * phase.cos();
+            imaginary += f64::from(x) * phase.sin();
+            count += 1;
         }
+        self.count += count;
+        self.tone_sum += 2.0 * real.hypot(imaginary);
     }
     fn rms(&self) -> f64 {
         (self.sum / self.count.max(1) as f64).sqrt()
     }
     fn tone_amplitude(&self) -> f64 {
-        2.0 * self.real.hypot(self.imaginary) / self.count.max(1) as f64
+        self.tone_sum / self.count.max(1) as f64
     }
+}
+
+#[test]
+fn callback_tone_measurement_tolerates_clock_trim_but_rejects_unrelated_pcm() {
+    let mut tone = Energy::default();
+    let mut unrelated = Energy::default();
+    for block in 0..40 {
+        let phase_jump = if block >= 20 {
+            std::f64::consts::PI
+        } else {
+            0.0
+        };
+        tone.add(
+            (0..960).map(|sample| {
+                let time = (block * 480 + sample / 2) as f64 / 48_000.0;
+                (0.3 * (std::f64::consts::TAU * 375.0 * 1.005 * time + phase_jump).sin()) as f32
+            }),
+            375.0,
+            48_000,
+        );
+        unrelated.add(
+            (0..960).map(|sample| {
+                (0.3 * (std::f64::consts::TAU * 1000.0 * (sample / 2) as f64 / 48_000.0).sin())
+                    as f32
+            }),
+            375.0,
+            48_000,
+        );
+    }
+    assert!((0.25..0.35).contains(&tone.tone_amplitude()));
+    assert!(unrelated.tone_amplitude() < 0.1);
 }
 
 #[test]

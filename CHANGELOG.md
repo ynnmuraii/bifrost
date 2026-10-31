@@ -28,6 +28,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Audio media internals**
 
 - Recover Listener health when valid decoded PCM resumes after Wi-Fi loss instead of retaining a permanent degraded label; distinguish jitter rebuffer episodes from native zero-fill callbacks, keep peer receiver quality separate from local Source state, and fall back safely when a native render position stops advancing.
+- Document Listener-first authenticated UDP hole punching and one-second idle traffic as runtime invariants; report bounded path-probe/authentication observations on health and terminal timeouts without guessing which firewall blocked traffic.
 
 - Add bounded timestamp-grid jitter scheduling, adaptive Ethernet/Wi-Fi targets and loss/concealment counters. No audio devices or network sessions are activated.
 - Add a separate slow, slew-limited drift PI controller with anti-windup and bounded frame corrections.
@@ -130,6 +131,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Внутренний аудиотракт**
 
 - Состояние Listener восстанавливается после возобновления декодированного PCM при потерях Wi-Fi, а не остаётся навсегда ухудшенным; эпизоды повторного буферизования отделены от нативных callback с заполнением тишиной, отчёты удалённого приёмника — от локального состояния Source, а остановившаяся нативная позиция безопасно переключается на резервные часы.
+- Закреплены инварианты исходящего аутентифицированного UDP-запроса Listener до ожидания Source и секундного служебного трафика; Health и завершение по тайм-ауту передают ограниченные наблюдения проверки пути и аутентификации без догадок о виновном брандмауэре.
 
 - Добавлены ограниченный джиттер-буфер по временным меткам, адаптивная задержка Ethernet/Wi-Fi и счётчики потерь/маскирования. Аудиоустройства и сетевые сеансы не активируются.
 - Добавлен отдельный медленный ПИ-регулятор дрейфа с ограничением скорости, защитой интегратора и ограниченной коррекцией кадров.
