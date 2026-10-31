@@ -56,21 +56,39 @@ mod windows {
 
     pub fn main() -> Result<()> {
         let args: Vec<_> = std::env::args().skip(1).collect();
-        if args == ["--audible", "--harness"] {
+        let mut seconds = 6u64;
+        let (mut audible, mut child_mode) = (false, false);
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--audible" => audible = true,
+                "--harness" => child_mode = true,
+                "--seconds" => {
+                    seconds = args.next().ok_or("--seconds requires N")?.parse()?;
+                    if seconds < 6 {
+                        return Err("--seconds must be at least 6 (use 60 for a long run)".into());
+                    }
+                }
+                _ => return Err("Usage: --audible [--seconds N]".into()),
+            }
+        }
+        let duration = Duration::from_secs(seconds);
+        let deadline = duration
+            .checked_add(Duration::from_secs(12))
+            .ok_or("--seconds exceeds the diagnostic deadline range")?;
+        if !audible {
+            return Err("Explicit consent required: --audible [--seconds N] (default 6)".into());
+        }
+        if child_mode {
             return tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(harness());
-        }
-        if args != ["--audible"] {
-            return Err(
-                "Explicit consent required: --audible (plays 1 kHz for six seconds)".into(),
-            );
+                .block_on(harness(deadline));
         }
         println!("Audible Windows E2E: no endpoint, volume, mute, input or installed configuration changes.");
         let mut child = HelperChild(
             Command::new(std::env::current_exe()?)
-                .args(["--audible", "--harness"])
+                .args(["--audible", "--harness", "--seconds", &seconds.to_string()])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()?,
@@ -86,27 +104,49 @@ mod windows {
                 break;
             }
         }
+        // Drain throughout playback: a long run must not block the child's IPC loop
+        // on a full stdout pipe.
+        let output = thread::spawn(move || -> std::io::Result<()> {
+            for line in output.lines() {
+                println!("{}", line?);
+            }
+            Ok(())
+        });
         // Parent is not in the harness child's process tree. Spawning a tone child from
         // the harness itself would silently exclude the intended source signal too.
-        let (mut tx, rx) = rtrb::RingBuffer::new(48_000 * 8);
-        for i in 0..48_000 * 8 {
-            let x = (std::f64::consts::TAU * 1000.0 * i as f64 / 48_000.0).sin() as f32 * 0.1;
-            tx.push([x; 2]).map_err(|_| "helper ring full")?;
-        }
+        // One second of bounded headroom, continuously replenished every 2ms.
+        let (mut tx, rx) = rtrb::RingBuffer::new(48_000);
+        let mut sample = 0u64;
+        let mut fill = |tx: &mut rtrb::Producer<[f32; 2]>| {
+            while !tx.is_full() {
+                let phase = (sample % 48) as f64 / 48.0;
+                let x = (std::f64::consts::TAU * phase).sin() as f32 * 0.1;
+                if tx.push([x; 2]).is_err() {
+                    break;
+                }
+                sample += 1;
+            }
+        };
+        fill(&mut tx);
         let mut tone = start_render(EndpointSelection::FollowDefaultMultimedia, rx)?;
-        thread::sleep(Duration::from_secs(6));
+        let begun = Instant::now();
+        while begun.elapsed() < duration {
+            fill(&mut tx);
+            thread::sleep(Duration::from_millis(2));
+        }
         tone.stop();
         let stopped = qpc_100ns()?;
-        println!(
-            "HELPER stopped qpc_100ns={stopped} render={:?}",
-            tone.snapshot()
-        );
+        let helper_health = tone.snapshot();
+        println!("HELPER stopped qpc_100ns={stopped} seconds={seconds} render={helper_health:?}");
         writeln!(
             child.0.stdin.as_mut().ok_or("missing child stdin")?,
             "{stopped}"
         )?;
-        for line in output.lines() {
-            println!("{}", line?);
+        output
+            .join()
+            .map_err(|_| "harness stdout reader panicked")??;
+        if helper_health.underrun_frames != 0 {
+            return Err("helper streaming ring underrun invalidates tone continuity".into());
         }
         if !child.0.wait()?.success() {
             return Err("Windows E2E child failed".into());
@@ -248,6 +288,50 @@ mod windows {
         }
         Ok(())
     }
+    // Retain five seconds of onset and five of tail, independent of run length.
+    // Clock statistics include every delivered frame, including discarded PCM.
+    #[derive(Default)]
+    struct CaptureHistory {
+        beginning: Vec<CapturedFrame>,
+        tail: VecDeque<CapturedFrame>,
+        delivered: u64,
+        first_clock: Option<(u64, u64, u64)>,
+        last_clock: Option<(u64, u64, u64)>,
+    }
+    impl CaptureHistory {
+        fn push(&mut self, frame: CapturedFrame) {
+            if frame.timestamp_valid {
+                let clock = (self.delivered, frame.qpc_100ns, frame.device_position);
+                self.first_clock.get_or_insert(clock);
+                self.last_clock = Some(clock);
+            }
+            self.delivered += 1;
+            if self.beginning.len() < 48_000 * 5 {
+                self.beginning.push(frame);
+            } else {
+                if self.tail.len() == 48_000 * 5 {
+                    self.tail.pop_front();
+                }
+                self.tail.push_back(frame);
+            }
+        }
+
+        fn finish(self, label: &str) -> Result<Vec<CapturedFrame>> {
+            let first = self.first_clock.ok_or("no valid capture clock")?;
+            let last = self.last_clock.ok_or("no valid capture clock")?;
+            let span = last
+                .1
+                .checked_sub(first.1)
+                .filter(|n| *n != 0)
+                .ok_or("empty or regressed capture clock span")?;
+            let ppm = ((last.0 - first.0) as f64 / (span as f64 * 48_000.0 / 10_000_000.0) - 1.0)
+                * 1_000_000.0;
+            println!("CLOCK {label} delivered_sample_vs_QPC_drift_ppm={ppm:.3} duration_ms={:.1} native_position_first={} native_position_last={} delivered_frames={}; independent capture estimate, NOT the worker receiver PI ratio", span as f64 / 10_000.0, first.2, last.2, self.delivered);
+            let mut frames = self.beginning;
+            frames.extend(self.tail);
+            Ok(frames)
+        }
+    }
 
     #[derive(Default)]
     struct Measurement {
@@ -296,27 +380,8 @@ mod windows {
         );
         m
     }
-    fn clock_drift(label: &str, frames: &[CapturedFrame]) -> Result<()> {
-        let valid: Vec<_> = frames.iter().filter(|f| f.timestamp_valid).collect();
-        let first = valid.first().ok_or("no valid capture clock")?;
-        let last = valid.last().ok_or("no valid capture clock")?;
-        let qpc_span = last
-            .qpc_100ns
-            .checked_sub(first.qpc_100ns)
-            .ok_or("capture clock regressed")?;
-        if qpc_span == 0 {
-            return Err("empty capture clock span".into());
-        }
-        // Process loopback can return a constant native device position. Count delivered
-        // samples instead; ring-overflow assertions below guard this clock estimate.
-        let sample_span = frames.len().saturating_sub(1);
-        let ppm =
-            (sample_span as f64 / (qpc_span as f64 * 48_000.0 / 10_000_000.0) - 1.0) * 1_000_000.0;
-        println!("CLOCK {label} delivered_sample_vs_QPC_drift_ppm={ppm:.3} duration_ms={:.1} native_position_first={} native_position_last={}; independent capture estimate, NOT the worker receiver PI ratio", qpc_span as f64 / 10_000.0, first.device_position, last.device_position);
-        Ok(())
-    }
 
-    async fn harness() -> Result<()> {
+    async fn harness(deadline: Duration) -> Result<()> {
         let mut source = worker("source").await?;
         let mut listener = worker("listener").await?;
         let reserve_source = UdpSocket::bind("127.0.0.1:0")?;
@@ -359,7 +424,8 @@ mod windows {
             };
             stopped.store(value, Ordering::Release);
         });
-        let (mut endpoint_pcm, mut include_pcm) = (Vec::new(), Vec::new());
+        let (mut endpoint_pcm, mut include_pcm) =
+            (CaptureHistory::default(), CaptureHistory::default());
         let mut pending = VecDeque::<(Instant, Vec<u8>)>::new();
         let mut packet = [0; MAX_DATAGRAM_LEN + 1];
         let mut tick = tokio::time::interval(Duration::from_millis(2));
@@ -367,10 +433,26 @@ mod windows {
         let mut serial = 0;
         let mut announced = false;
         let mut signal_after = 0;
+        let mut steady_baseline = None;
+        let mut steady_last = None;
+        let mut steady_samples = 0u64;
         loop {
             tokio::select! {
                 frame = source.core.recv() => observe(&mut source, "source", frame?.frame.msg)?,
-                frame = listener.core.recv() => observe(&mut listener, "listener", frame?.frame.msg)?,
+                frame = listener.core.recv() => {
+                    let msg = frame?.frame.msg;
+                    let health = matches!(&msg, Some(Msg::Health(_)));
+                    observe(&mut listener, "listener", msg)?;
+                    // Exclude startup (including the deliberately delayed first packet)
+                    // and assess only health received during sustained helper playback.
+                    if health && announced && qpc_100ns()? >= signal_after + 20_000_000
+                        && helper_stopped.load(Ordering::Acquire) == 0
+                    {
+                        steady_baseline.get_or_insert(listener.counters.underruns);
+                        steady_last = Some(listener.counters.underruns);
+                        steady_samples += 1;
+                    }
+                },
                 incoming = relay.recv_from(&mut packet) => {
                     let (n, peer) = incoming?;
                     if peer == source_addr {
@@ -408,7 +490,7 @@ mod windows {
                     let stop = helper_stopped.load(Ordering::Acquire);
                     if stop == u64::MAX { return Err("helper stop timestamp missing".into()); }
                     if stop != 0 && qpc_100ns()? > stop + 20_000_000 { break; }
-                    if begun.elapsed() > Duration::from_secs(18) { return Err("helper timeout".into()); }
+                    if begun.elapsed() > deadline { return Err("helper timeout".into()); }
                 }
             }
         }
@@ -420,6 +502,20 @@ mod windows {
         while let Ok(frame) = include_rx.pop() {
             include_pcm.push(frame);
         }
+        let endpoint_pcm = endpoint_pcm.finish("endpoint")?;
+        let include_pcm = include_pcm.finish("listener_include")?;
+        println!(
+            "FINAL_HEALTH source sent={} received={} counters={:?}",
+            source.sent, source.received, source.counters
+        );
+        println!(
+            "FINAL_HEALTH listener sent={} received={} counters={:?}",
+            listener.sent, listener.received, listener.counters
+        );
+        let steady_delta = steady_last
+            .zip(steady_baseline)
+            .map(|(last, first)| last.saturating_sub(first));
+        println!("STEADY listener warmup_after_helper_ms=2000 samples={steady_samples} baseline_underruns={steady_baseline:?} last_underruns={steady_last:?} delta_underruns={steady_delta:?}");
         // Stop workers explicitly; dropping also revokes authority on every error path.
         source
             .core
@@ -475,13 +571,16 @@ mod windows {
             stop + 12_000_000,
             stop + 17_000_000,
         );
-        clock_drift("endpoint", &endpoint_pcm)?;
-        clock_drift("listener_include", &include_pcm)?;
         println!(
             "PROBE endpoint={:?} include={:?}",
             endpoint.snapshot(),
             include.snapshot()
         );
+        if steady_samples < 2 || steady_delta != Some(0) {
+            return Err(
+                "listener steady-state Health must prove zero underrun delta after warmup".into(),
+            );
+        }
         if baseline.tone_power > 0.00001 || include_baseline.tone_power > 0.00001 {
             return Err("pre-existing 1kHz signal contaminates attribution".into());
         }

@@ -1,4 +1,4 @@
-//! Explicit native diagnostic; --timing initializes streams without starting or playing them.
+//! Explicit native diagnostic. --timing initializes without playback; --stress-period is audible.
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use audio_backend::{Backend, Stream};
@@ -6,6 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::{thread, time::Duration};
     if std::env::args().nth(1).as_deref() == Some("--timing") {
         return timing();
+    }
+    if std::env::args().any(|arg| arg == "--stress-period") {
+        return stress_period();
     }
     let mut backend = platform_audio_win::WindowsBackend::new()?;
     let fixed = audio_backend::AudioFormat {
@@ -145,6 +148,21 @@ fn timing() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let _com = Com;
+    use platform_audio_win::render_config::{
+        initialize_legacy_render, initialize_shared_render, SAFE_PERIOD_FRAMES,
+    };
+    let args: Vec<_> = std::env::args().collect();
+    let candidate = args.iter().position(|arg| arg == "--period");
+    let floor = match candidate
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str)
+    {
+        None if candidate.is_none() => SAFE_PERIOD_FRAMES,
+        Some("min") => 0,
+        Some("5ms") => SAFE_PERIOD_FRAMES,
+        Some("10ms") => 480,
+        _ => return Err("--period requires min, 5ms or 10ms".into()),
+    };
     let format = WaveFormat::new(32, 32, &SampleType::Float, 48_000, 2, None);
     let device = DeviceEnumerator::new()?
         .get_default_device_for_role(&Direction::Render, &Role::Multimedia)?;
@@ -164,6 +182,20 @@ fn timing() -> Result<(), Box<dyn std::error::Error>> {
         capture.get_device_period(),
         unsafe { raw.GetStreamLatency() }
     );
+    {
+        let (raw, config) = initialize_shared_render(&device, floor)?;
+        println!(
+            "TIMING negotiated requested_floor_frames={floor} config={config:?} stream_latency_hns={}",
+            unsafe { raw.GetStreamLatency()? },
+        );
+    }
+    {
+        let (raw, config) = initialize_legacy_render(&device, None)?;
+        println!(
+            "TIMING legacy config={config:?} stream_latency_hns={}",
+            unsafe { raw.GetStreamLatency()? },
+        );
+    }
     for duration in [0, 100_000] {
         let mut client = device.get_iaudioclient()?;
         let period = client.get_device_period()?;
@@ -179,6 +211,90 @@ fn timing() -> Result<(), Box<dyn std::error::Error>> {
         println!("TIMING render requested_duration_hns={duration} buffer_frames={} default_period_hns={} minimum_period_hns={} stream_latency_hns={}", unsafe { raw.GetBufferSize()? }, period.0, period.1, unsafe { raw.GetStreamLatency()? });
     }
     println!("PASS timing-only: no stream started, no endpoint settings changed");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stress_period() -> Result<(), Box<dyn std::error::Error>> {
+    use platform_audio_win::{render_config::SAFE_PERIOD_FRAMES, stream::*};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let args: Vec<_> = std::env::args().collect();
+    let candidate = args
+        .iter()
+        .position(|arg| arg == "--stress-period")
+        .ok_or("missing --stress-period")?;
+    let floor = match args.get(candidate + 1).map(String::as_str) {
+        Some("min") => 0,
+        Some("5ms") => SAFE_PERIOD_FRAMES,
+        Some("10ms") => 480,
+        _ => return Err("--stress-period requires min, 5ms or 10ms".into()),
+    };
+    let duration_arg = args.iter().position(|arg| arg == "--seconds");
+    let seconds = match duration_arg {
+        Some(index) => args
+            .get(index + 1)
+            .ok_or("--seconds requires a value")?
+            .parse::<u64>()?,
+        None => 60,
+    };
+    if !(1..=600).contains(&seconds) {
+        return Err("--seconds must be in 1..=600".into());
+    }
+    // A bounded producer ring is continuously replenished, not a finite prerecorded tone.
+    let (mut tx, rx) = rtrb::RingBuffer::new(SAMPLE_RATE as usize / 2);
+    let mut phase = 0_u32;
+    let gain = 10_f32.powf(-18.0 / 20.0);
+    let mut replenish = || {
+        for _ in 0..tx.slots() {
+            let sample = (std::f32::consts::TAU * phase as f32 / 48.0).sin() * gain;
+            if tx.push([sample; 2]).is_err() {
+                break;
+            }
+            phase = (phase + 1) % 48;
+        }
+    };
+    replenish();
+    println!("Audible 1 kHz candidate stress at -18 dBFS: requested_floor_frames={floor}, warmup=2s, measured={seconds}s; no endpoint settings changed.");
+    let mut render = start_render_for_probe(EndpointSelection::FollowDefaultMultimedia, rx, floor)?;
+    let config = render
+        .snapshot()
+        .render_configuration
+        .ok_or("missing render configuration")?;
+    let starvation_observable = config.queue_limit_frames >= config.period_frames.saturating_mul(2);
+    println!("STRESS negotiated {config:?} engine_starvation_heuristic_available={starvation_observable}");
+    let warmup = Instant::now();
+    while warmup.elapsed() < Duration::from_secs(2) {
+        replenish();
+        thread::sleep(Duration::from_millis(1));
+    }
+    let baseline = render.snapshot();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(seconds) {
+        replenish();
+        thread::sleep(Duration::from_millis(1));
+    }
+    let measured_seconds = started.elapsed().as_secs_f64();
+    let final_snapshot = render.snapshot();
+    render.stop();
+    let underruns = final_snapshot
+        .underrun_frames
+        .saturating_sub(baseline.underrun_frames);
+    let padding_zero = final_snapshot
+        .render_padding_zero_events
+        .saturating_sub(baseline.render_padding_zero_events);
+    let starvation = final_snapshot
+        .engine_starvation_events
+        .saturating_sub(baseline.engine_starvation_events);
+    println!("STRESS warmup={baseline:?}");
+    println!("STRESS final={final_snapshot:?}");
+    println!("STRESS measured_seconds={measured_seconds:.3} transferred_frames={} source_underrun_frames={underruns} raw_padding_zero_events={padding_zero} engine_starvation_events={starvation} stopped_status={:?}", final_snapshot.transferred_frames.saturating_sub(baseline.transferred_frames), render.snapshot().status);
+    if underruns != 0 || starvation != 0 || final_snapshot.status != StreamStatus::Running {
+        return Err("candidate stress failed: post-warmup source underrun, two-period queue starvation or stopped stream".into());
+    }
+    println!("PASS candidate stress: zero post-warmup source underruns and observed two-period engine starvation events; raw padding-zero is diagnostic only");
     Ok(())
 }
 #[cfg(not(windows))]

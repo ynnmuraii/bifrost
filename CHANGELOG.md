@@ -46,6 +46,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Keep an uninterrupted transmitted sample grid through capture silence without DTX. Fill uncovered host-time gaps with bounded silence (at most 200 ms), reanchor larger gaps, and report native discontinuity flags separately from actual capture repairs.
 - Expose bounded per-stage latency observations, use 5 ms aggregate mix blocks with a native-callback quantum floor, and bound decoded lane queues. A deterministic wired chirp fixture with a modeled 20 ms native FIFO improves from 86.688 to 81.688 ms without changing jitter profile targets; native hardware timing requires platform verification.
 - Wake the mixer from render consumption and refill a complete native quantum before parking. When safe before the next callback, honor an imminent jitter deadline rather than queueing an extra silent output period.
+- Windows render negotiates low-latency shared/event periods through IAudioClient3 with a 5 ms floor and a two-period queue bound. Unsupported/locked configurations retain typed diagnostics and fall back to legacy shared conversion; process-loopback capture semantics are unchanged.
+- Extend Windows audio diagnostics with negotiated periods, explicit audible candidate stress and bounded-memory long E2E runs reporting post-warmup underruns.
 
 **Shared Listener media**
 
@@ -121,6 +123,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - При тишине захвата сохраняется непрерывная временная сетка отправленных кадров без DTX. Непокрытые разрывы времени host заполняются тишиной до 200 мс; большие разрывы переустанавливают опорную точку. Нативные флаги discontinuity учитываются отдельно от реальных исправлений захвата.
 - Добавлены ограниченные наблюдения задержки по стадиям, блоки общего микшера 5 мс с запасом не меньше нативного callback и ограниченные очереди декодированных входов. Детерминированный тест с моделью нативного FIFO 20 мс улучшился с 86,688 до 81,688 мс без изменения профилей джиттера; нативные задержки проверяются на соответствующей платформе.
 - Микшер пробуждается при потреблении выхода и перед ожиданием заполняет весь нативный квант. Если запас до следующего callback позволяет, он ждёт близкий срок джиттера вместо постановки лишнего периода тишины в очередь.
+- Вывод Windows согласует низкую задержку shared/event через IAudioClient3 с нижней границей 5 мс и очередью не более двух периодов. Неподдерживаемые и заблокированные конфигурации возвращаются к прежнему shared-преобразованию с типизированной причиной; семантика EXCLUDE-захвата не меняется.
+- Диагностика Windows дополнена согласованными периодами, явно запускаемой звуковой проверкой кандидатов и длительным E2E с ограниченной памятью и счётчиками underrun после прогрева.
 
 **Общий аудиовыход Listener**
 
