@@ -55,6 +55,7 @@ fn smtc_sessions_and_subscriptions_are_read_only() {
     }
     if let Some(current) = snapshot.current {
         assert!(snapshot.sessions.iter().any(|s| s.token == current));
+        assert_eq!(snapshot.sessions.first().map(|s| s.token), Some(current));
     }
     manager.shutdown();
 }
@@ -80,4 +81,66 @@ fn shared_backend_reads_devices_defaults_mute_and_media() {
         assert!(session.subtitle().len() <= 256);
         assert!(session.app().len() <= 128);
     }
+}
+
+/// RegisterHotKey/UnregisterHotKey only: no mute guard, media command or input synthesis.
+#[test]
+fn shared_backend_ptt_registration_collision_and_cleanup_without_input() {
+    use audio_backend::{Backend, BackendError, Event, PttHotkey};
+    use platform_audio_win::WindowsBackend;
+    use std::time::{Duration, Instant};
+
+    let mut owner = WindowsBackend::new().unwrap();
+    assert!(owner.capabilities().global_ptt);
+    let key = PttHotkey {
+        key_code: 0x72, // HID F23: Ctrl+Alt+Shift+F23.
+        control: true,
+        alt: true,
+        shift: true,
+        meta: false,
+    };
+    let reserved = PttHotkey {
+        shift: false,
+        ..key
+    };
+    assert_eq!(
+        owner.configure_ptt(Some(key), &[reserved]),
+        Err(BackendError::Conflict)
+    );
+    owner
+        .configure_ptt(Some(key), &[])
+        .expect("rare chord unavailable: registration must fail without replacing its owner");
+    let mut contender = WindowsBackend::new().unwrap();
+    assert!(
+        contender.configure_ptt(Some(key), &[]).is_err(),
+        "a second backend must not steal the existing registration"
+    );
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        assert!(
+            !matches!(
+                owner.poll_event(),
+                Some(Event::PttPressed { .. } | Event::PttRenewed { .. })
+            ),
+            "registration alone must not invent a physical press or renewal"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Rejected reserved replacement must leave the original binding registered.
+    assert_eq!(
+        owner.configure_ptt(Some(key), &[reserved]),
+        Err(BackendError::Conflict)
+    );
+    assert!(contender.configure_ptt(Some(key), &[]).is_err());
+    owner.configure_ptt(None, &[]).unwrap();
+    assert!(matches!(owner.poll_event(), Some(Event::PttReleased)));
+    contender
+        .configure_ptt(Some(key), &[])
+        .expect("explicit unregister must free the chord");
+    contender.configure_ptt(None, &[]).unwrap();
+    assert!(matches!(contender.poll_event(), Some(Event::PttReleased)));
+    assert!(!matches!(
+        owner.poll_event(),
+        Some(Event::PttPressed { .. } | Event::PttRenewed { .. })
+    ));
 }

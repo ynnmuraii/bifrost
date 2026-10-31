@@ -6,10 +6,12 @@ pub(super) enum Script {
     Event(ScriptEvent),
     CompleteMedia,
     Stall(Duration),
+    FailMedia(BackendError, tokio::sync::oneshot::Sender<()>),
 }
 struct ScriptedBackend {
     dry: DryBackend,
     script: sync_mpsc::Receiver<Script>,
+    media_failure: Option<BackendError>,
 }
 static FACTORIES: LazyLock<[Mutex<Option<ScriptedBackend>>; 2]> =
     LazyLock::new(|| std::array::from_fn(|_| Mutex::new(None)));
@@ -58,6 +60,9 @@ impl Backend for ScriptedBackend {
         self.dry.current_media_session()
     }
     fn media_command(&mut self, request: MediaCommandRequest) -> Result<(), BackendError> {
+        if let Some(error) = self.media_failure.take() {
+            return Err(error);
+        }
         self.dry.media_command(request)
     }
     fn cancel_media_commands(&mut self) {
@@ -76,6 +81,10 @@ impl Backend for ScriptedBackend {
                 Ok(Script::Event(event)) => self.dry.apply(event).expect("valid Dry script"),
                 Ok(Script::CompleteMedia) => self.dry.pump_control(),
                 Ok(Script::Stall(duration)) => thread::sleep(duration),
+                Ok(Script::FailMedia(error, ready)) => {
+                    self.media_failure = Some(error);
+                    let _ = ready.send(());
+                }
                 Err(_) => break,
             }
         }
@@ -124,11 +133,12 @@ pub(super) async fn child(index: usize) -> (Fixture, sync_mpsc::Sender<Script>) 
     assert!(lock(&slots[index])
         .replace(ScriptedBackend {
             dry,
-            script: receiver
+            script: receiver,
+            media_failure: None,
         })
         .is_none());
     let directory = tempfile::tempdir().unwrap();
-    let endpoint = Endpoint::socket(directory.path().join("audio.sock"));
+    let endpoint = test_endpoint(&directory);
     let mut listener = transport::listen(&endpoint).unwrap();
     let observed = Arc::new(Observed::default());
     let child_observed = observed.clone();
