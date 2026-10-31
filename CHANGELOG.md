@@ -14,11 +14,13 @@ Each release is described in English and Russian. / Каждый выпуск о
 - A popup mini-player shows now-playing information and playback timing where the Source's player supports it.
 - Play/pause, next and previous buttons require a separate permission on each Source; sharing sound alone does not grant media control.
 - Listener-local per-source volume and mute, output-device selection, and Ethernet/Wi-Fi buffering profiles.
-- Select a trusted Listener by name; its audio group is discovered automatically. Manual group pinning remains an Advanced option.
+- Turn on **Receive system audio** on the headset computer; on each Source, choose **Destination** and turn on **Share system audio**. The group is automatic: no separate Apply, Start or per-computer system-audio grant is required. Devices, profiles and explicit denies remain in Advanced.
 - Optional system-wide microphone mute/PTT controls the Listener's physical microphone for all apps using it. Enable and permit it separately; no microphone audio is streamed.
 
 **Fixes**
 
+- Audio settings use responsive, inset RU/EN task controls; the independent native mini-player is opaque, correctly sized and free of nested hide panels or unnecessary single-card scrolling.
+- Sharing intent, connection progress, startup failures and observed running audio remain distinct. System-audio OFF cancels a pending start without changing mic/PTT or media-control settings; with resume disabled, restarting a Source leaves sharing stopped until a fresh ON.
 - Audio settings and popup warnings show observed path-failure reasons and local/peer UDP ports, with conditional role-scoped guidance rather than unproven firewall blame.
 - A newer pairing attempt visibly cancels the older ceremony on both computers; delayed confirmations cannot approve the replacement.
 - CLI pairing rejection and EOF cancellation now exit unsuccessfully, including when the pairing window belongs to an already-running core.
@@ -53,11 +55,13 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Всплывающий мини-плеер показывает текущий трек и время воспроизведения, если плеер источника это поддерживает.
 - Кнопки воспроизведения/паузы, следующего и предыдущего трека требуют отдельного разрешения на каждом источнике; передача звука сама по себе его не даёт.
 - Местные громкость и заглушение каждого источника на Listener, выбор выхода и профили буферизации Ethernet/Wi-Fi.
-- Доверенный Listener выбирается по имени; его аудиогруппа находится автоматически. Ручная фиксация группы остаётся в Advanced.
+- На компьютере с гарнитурой включается «Принимать системный звук»; на каждом источнике выбирается «Куда передавать» и включается «Передавать системный звук». Группа автоматическая: отдельные «Применить», запуск и разрешения системного звука для каждого компьютера не нужны. Устройства, профили и явные запреты остаются в «Дополнительно».
 - Необязательные системные mute/PTT управляют физическим микрофоном Listener во всех использующих его приложениях. Включение и разрешения задаются отдельно; звук микрофона не передаётся.
 
 **Исправления**
 
+- Элементы аудионастроек адаптируются к узкому окну в RU/EN и сохраняют отступы; отдельный нативный мини-плеер непрозрачен, правильно рассчитан по содержимому, без вложенной панели скрытия и лишней прокрутки одной карточки.
+- Намерение передачи, подключение, ошибка запуска и наблюдаемый работающий звук не выдаются друг за друга. Выключение системного звука отменяет ожидающий запуск, не меняя микрофон/PTT и медиакоманды; при выключенном возобновлении после перезапуска источника требуется новое включение передачи.
 - Настройки и предупреждения плеера показывают наблюдаемую причину отказа аудиопути и местный/удалённый UDP-порты; подсказки учитывают роль и не объявляют брандмауэр виновным без доказательств.
 - Новая попытка сопряжения видимо отменяет старую на обоих компьютерах; запоздавшее подтверждение не может одобрить замену.
 - Отказ от сопряжения в CLI и отмена через EOF завершаются ошибкой, в том числе когда окно сопряжения обслуживает уже запущенная служба.
