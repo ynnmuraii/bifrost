@@ -76,6 +76,7 @@
 //! ```
 
 pub mod agent;
+pub mod audio_worker;
 pub mod clock;
 pub mod error;
 pub mod framed;

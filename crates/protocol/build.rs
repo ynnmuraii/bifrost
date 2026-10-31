@@ -12,6 +12,7 @@ use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/protocol.proto");
     println!("cargo:rerun-if-changed=proto/ipc.proto");
+    println!("cargo:rerun-if-changed=proto/audio_ipc.proto");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
 
@@ -20,6 +21,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     prost_build::Config::new()
         .out_dir(&out_dir)
         .compile_fds(fds)?;
+
+    let audio_fds = protox::compile(["proto/audio_ipc.proto"], ["proto"])?;
+    prost_build::Config::new()
+        .out_dir(&out_dir)
+        .skip_debug([
+            ".bifrost.audio_worker.v1.Attach",
+            ".bifrost.audio_worker.v1.DirectionMaterial",
+            ".bifrost.audio_worker.v1.StartSession",
+        ])
+        .compile_fds(audio_fds)?;
 
     Ok(())
 }

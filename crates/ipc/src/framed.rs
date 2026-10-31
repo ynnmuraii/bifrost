@@ -16,6 +16,7 @@ use protocol::frame::{FrameDecoder, LENGTH_PREFIX_LEN};
 use protocol::Channel;
 
 use crate::error::IpcError;
+use zeroize::{Zeroize, Zeroizing};
 
 /// How much is read at once. Bounded so a stalled peer cannot grow the buffer.
 pub const READ_CHUNK: usize = 8 * 1024;
@@ -43,6 +44,18 @@ impl<S> Framed<S> {
     /// A link for the local IPC channel ([`Channel::Ipc`], 65536-byte frames).
     pub fn ipc(io: S) -> Self {
         Framed::new(io, Channel::Ipc)
+    }
+
+    /// Fixed-capacity receive storage for a private channel carrying key material.
+    pub fn sensitive_ipc(io: S) -> Self {
+        let mut framed = Self::ipc(io);
+        framed.buffer = Vec::with_capacity(framed.max_buffered_len());
+        framed
+    }
+
+    pub(crate) fn clear_sensitive(&mut self) {
+        self.buffer.resize(self.buffer.capacity(), 0);
+        self.buffer.zeroize();
     }
 
     /// The channel this link validates against.
@@ -103,6 +116,12 @@ where
         self.write_all(&bytes).await
     }
 
+    /// The encoded body/prefix are erased after I/O, including cancelled/failed sends.
+    pub async fn send_sensitive<M: prost::Message>(&mut self, message: &M) -> Result<(), IpcError> {
+        let bytes = Zeroizing::new(protocol::frame::encode_message(self.channel, message)?);
+        self.write_all(&bytes).await
+    }
+
     /// Encode and write an already-encoded body.
     pub async fn send_bytes(&mut self, body: &[u8]) -> Result<(), IpcError> {
         let bytes = protocol::frame::encode(self.channel, body)?;
@@ -145,6 +164,34 @@ impl<S: AsyncRead + Unpin> Framed<S> {
             };
             self.buffer.drain(..consumed);
             return Ok(body);
+        }
+    }
+
+    /// Reuses the same framing/length checks, but erases consumed bytes and stack reads.
+    pub async fn recv_sensitive_bytes(&mut self) -> Result<Zeroizing<Vec<u8>>, IpcError> {
+        loop {
+            if let Some(frame) = self.decoder.decode(&self.buffer)? {
+                let consumed = frame.consumed_len();
+                let body = Zeroizing::new(frame.body().to_vec());
+                let old_len = self.buffer.len();
+                self.buffer[..consumed].zeroize();
+                self.buffer.drain(..consumed);
+                let remaining = self.buffer.len();
+                self.buffer.resize(old_len, 0);
+                self.buffer[remaining..].zeroize();
+                self.buffer.truncate(remaining);
+                return Ok(body);
+            }
+            let mut chunk = Zeroizing::new([0u8; READ_CHUNK]);
+            let read = self
+                .io
+                .read(&mut chunk[..])
+                .await
+                .map_err(|source| IpcError::io("reading private IPC", source))?;
+            if read == 0 {
+                return Err(IpcError::Closed);
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
         }
     }
 

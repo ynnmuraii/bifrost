@@ -28,6 +28,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Add an explicitly connected local Unix Pulse protocol backend, without libpulse/PipeWire/ALSA linkage: stable device names, pinned monitor/microphone capture, playback, cached native timing and bounded device-change events. Process exclusion, ownership-safe endpoint mute, media sessions and global PTT are explicitly unavailable. Live tests are opt-in and use only uniquely owned null sinks, including encrypted Linux-to-Linux UDP audio; no default routing is changed.
 
+**Audio child IPC**
+
+- Add a separate private audio-worker protobuf/AudioLink contract with bounded commands, version/generation/sequence checks, explicit backend probing, one-use secret extraction and recursive Debug redaction. Reuse existing same-user IPC endpoints; no samples or secrets enter GUI messages.
+
 ### Русский
 
 **Исправления**
@@ -51,6 +55,10 @@ Each release is described in English and Russian. / Каждый выпуск о
 **Внутренний аудиобэкенд Linux**
 
 - Добавлен явно подключаемый бэкенд локального Unix-протокола Pulse без зависимостей от libpulse/PipeWire/ALSA: стабильные имена устройств, закреплённый захват монитора/микрофона, воспроизведение, снимки времени и ограниченная очередь изменений устройств. Исключение своего процесса, безопасное владение заглушением, медиасеансы и глобальный PTT явно недоступны. Натурные тесты включаются отдельно и используют только собственные null-sink, включая шифрованный UDP-тракт Linux→Linux; маршруты по умолчанию не меняются.
+
+**IPC дочернего аудиопроцесса**
+
+- Добавлен отдельный закрытый контракт protobuf/AudioLink аудиопроцесса с ограниченными командами, проверкой версии/поколения/последовательности, явным запросом проверки бэкенда, одноразовым извлечением секретов и скрытием их в Debug. Используются существующие локальные IPC-каналы того же пользователя; сэмплы и секреты не попадают в GUI.
 
 ## 0.4.0 — 2026-10-30
 

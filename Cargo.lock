@@ -2161,6 +2161,7 @@ dependencies = [
  "protocol",
  "tokio",
  "windows",
+ "zeroize",
 ]
 
 [[package]]
@@ -3564,6 +3565,7 @@ dependencies = [
  "prost-build",
  "protox",
  "semver",
+ "zeroize",
 ]
 
 [[package]]
