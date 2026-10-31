@@ -5986,6 +5986,7 @@ mod link_generation_tests {
         assert_eq!(session.clipboard_links.get(&peer).unwrap().0, connection_b);
         assert!(session.clipboard_follow.peers.contains_key(&peer));
         assert_eq!(session.router.focus(), fr::FocusState::Preparing);
+        assert!(!session.agent_lost_reported);
         session
             .on_link_event(LinkEvent::Down {
                 peer,
@@ -5997,11 +5998,11 @@ mod link_generation_tests {
         assert!(!session.layout_connections.contains_key(&peer));
         assert!(!session.clipboard_links.contains_key(&peer));
         assert!(!session.clipboard_follow.peers.contains_key(&peer));
-        assert!(matches!(
-            session.router.lease(),
-            fr::LeaseSlot::Source(lease)
-                if lease.state == fr::SourceState::Releasing && lease.channel_gone
-        ));
+        // This fixture has no agent process: releasing capture reports AgentLost,
+        // which completes the FSM's release immediately instead of awaiting its guard.
+        assert!(session.agent_lost_reported);
+        assert!(matches!(session.router.lease(), fr::LeaseSlot::Idle));
+        assert_eq!(session.router.focus(), fr::FocusState::Blocked);
         drop(session);
         std::fs::remove_dir_all(root).expect("remove test state");
     }
