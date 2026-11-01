@@ -233,6 +233,58 @@ struct PendingPrivacy {
 }
 
 impl AudioHandle {
+    #[cfg(test)]
+    pub(crate) fn controlled_stop(
+        generation: u64,
+    ) -> (
+        Self,
+        mpsc::Receiver<[u8; 16]>,
+        watch::Receiver<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (commands, mut incoming) = mpsc::channel::<Command>(4);
+        let (priority, mut safety) = mpsc::channel(4);
+        let (stops, observed) = mpsc::channel(4);
+        let (shutdown, mut requested) = watch::channel(false);
+        let observed_shutdown = requested.clone();
+        let (finished, stopped) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_requested(&mut requested) => break,
+                    command = next_command(&mut safety, &mut incoming) => {
+                        let Some(command) = command else { break };
+                        assert_eq!(command.generation, generation);
+                        match command.message {
+                            Msg::StopSession(stop) => {
+                                stops.send(stop.session_id.try_into().expect("session ID")).await.unwrap();
+                            }
+                            Msg::ConfigurePtt(_) | Msg::PttReleaseAll(_) => {}
+                            _ => panic!("unexpected controlled stop fixture command"),
+                        }
+                        let _ = command.reply.send(Ok(Reply::Written(1)));
+                    }
+                }
+            }
+            finished.send_replace(true);
+        });
+        (
+            Self {
+                commands,
+                priority,
+                talk_epoch: Arc::new(AtomicU64::new(0)),
+                explicit_mute_epoch: Arc::new(AtomicU64::new(0)),
+                generation: Arc::new(AtomicU64::new(generation)),
+                bound_generation: None,
+                shutdown,
+                stopped,
+            },
+            observed,
+            observed_shutdown,
+            task,
+        )
+    }
+
     /// Pins a private safety view to one child incarnation. A bound clone cannot
     /// be rebound, and never retags stale privacy work onto a replacement child.
     pub(crate) fn for_generation(&self, expected: u64) -> Self {

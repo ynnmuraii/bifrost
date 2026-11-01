@@ -78,6 +78,7 @@ impl Actor {
             && (self.system_enabled()
                 || self.config.microphone.control_enabled
                 || self.config.microphone.ptt_enabled)
+            || self.native_stops_pending()
     }
 
     pub(super) async fn sync_system_off(&mut self) -> Result<(), Code> {
@@ -391,6 +392,509 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn system_off_retires_only_after_matching_native_stop() {
+        controlled_system_off(false, NativeStart::Started).await;
+    }
+
+    #[tokio::test]
+    async fn system_off_still_reports_real_worker_loss_and_rejects_stale_stops() {
+        controlled_system_off(true, NativeStart::Started).await;
+    }
+
+    #[tokio::test]
+    async fn system_off_retires_a_committed_session_without_a_native_start() {
+        controlled_system_off(false, NativeStart::Fenced).await;
+    }
+
+    #[tokio::test]
+    async fn system_off_waits_for_issued_start_without_a_started_ack() {
+        controlled_system_off(false, NativeStart::Issued).await;
+    }
+
+    #[tokio::test]
+    async fn system_off_issued_start_without_ack_still_fails_on_worker_loss() {
+        controlled_system_off(true, NativeStart::Issued).await;
+    }
+
+    #[tokio::test]
+    async fn system_off_actor_processes_trust_revoke_before_native_stop() {
+        controlled_system_off(false, NativeStart::RevokePending).await;
+    }
+
+    #[tokio::test]
+    async fn system_off_actor_processes_control_withdrawal_before_native_stop() {
+        controlled_system_off(false, NativeStart::ControlPending).await;
+    }
+
+    enum NativeStart {
+        Fenced,
+        Issued,
+        Started,
+        RevokePending,
+        ControlPending,
+    }
+
+    async fn controlled_system_off(worker_lost: bool, native: NativeStart) {
+        let native_issued = !matches!(native, NativeStart::Fenced);
+        let native_started = matches!(
+            native,
+            NativeStart::Started | NativeStart::RevokePending | NativeStart::ControlPending
+        );
+        let revoke_pending = matches!(native, NativeStart::RevokePending);
+        let control_pending = matches!(native, NativeStart::ControlPending);
+        let root = std::env::temp_dir().join(format!(
+            "bf-stop-{}",
+            u128::from_be_bytes(identity::random16().expect("owned fixture ID"))
+        ));
+        let paths = config::Paths::new(&root, &root, &root, Some(root.clone()));
+        let identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(&root))
+                .expect("owned identity")
+                .0,
+        );
+        let local = identity.node_id();
+        let peer = NodeId::new([7; 32]);
+        let (manager, _links, _) = manager_for(identity, peer, None, Vec::new());
+        let audio = config::AudioConfig {
+            enabled: true,
+            system_sharing: Some(true),
+            role: config::AudioRole::Source,
+            group_id: Some(config::audio::HexId([3; 16])),
+            listener_node_id: Some(config::audio::HexId(*peer.as_bytes())),
+            ..Default::default()
+        };
+        let mut persisted = config::Config {
+            audio: audio.clone(),
+            ..Default::default()
+        };
+        persisted.network.listen_address = "127.0.0.1".into();
+        persisted.validate().expect("valid owned configuration");
+        persisted
+            .save(paths.config_file())
+            .expect("owned persisted configuration");
+        let (events, mut consumer) = broadcast::channel(32);
+        let (coordinator, mut actor) = Coordinator::prepare(
+            audio,
+            local,
+            manager,
+            paths,
+            "127.0.0.1:0".parse().unwrap(),
+            true,
+            events,
+        );
+        actor.system_requested = true;
+        actor.configure().unwrap();
+        actor.effects.clear();
+        let parent = fsm::Parent {
+            peer: *peer.as_bytes(),
+            connection_id: [4; 16],
+            generation: [5; 16],
+        };
+        let support = fsm::Support {
+            control: true,
+            system_source: false,
+            listener: true,
+        };
+        let hello = fsm::Hello {
+            role: model::AudioRole::Listener,
+            group: Some([3; 16]),
+            listener: *peer.as_bytes(),
+            available: true,
+            allowed: true,
+            consent_revision: 1,
+        };
+        actor.peers.insert(
+            peer,
+            Peer {
+                parent,
+                name: "receiver".into(),
+                remote: "127.0.0.1:40002".parse().unwrap(),
+                support,
+                trusted: true,
+                hello: Some(hello),
+                focus_support: false,
+                mic_support: false,
+                media_support: false,
+                focus_sent_revision: 0,
+                focus_request_at: None,
+                focus_reply_at: None,
+                focus_reply: false,
+            },
+        );
+        // Establish a session at the accepted model seam; only native IPC is controlled.
+        let mut effects = Vec::new();
+        for input in [
+            fsm::Input::WorkerUp {
+                generation: generation(1, 0),
+                capture: true,
+                render: false,
+            },
+            fsm::Input::PeerUp {
+                parent,
+                support,
+                trusted: true,
+                local_allowed: true,
+                consent_revision: 1,
+            },
+            fsm::Input::Receive {
+                parent,
+                message: fsm::Control::Hello(hello),
+            },
+            fsm::Input::Receive {
+                parent,
+                message: fsm::Control::Offer(fsm::Offer {
+                    request_id: None,
+                    session: [6; 16],
+                    listener_nonce: [8; 32],
+                    parent_connection_id: parent.connection_id,
+                    group: [3; 16],
+                    listener: *peer.as_bytes(),
+                    source: *local.as_bytes(),
+                    format: format(Profile::Ethernet),
+                    format_sha256: wire::format_sha256(format(Profile::Ethernet)),
+                    listener_port: 40002,
+                    consent_revision: 1,
+                }),
+            },
+            fsm::Input::SourceNonce {
+                parent,
+                session: [6; 16],
+                nonce: [9; 32],
+            },
+        ] {
+            actor.model.handle(0, input, &mut effects).unwrap();
+        }
+        let agreement = effects
+            .iter()
+            .find_map(|effect| match effect {
+                fsm::Effect::DeriveKeys { agreement, .. } => Some(*agreement),
+                _ => None,
+            })
+            .expect("real model agreement");
+        let view = actor.model.session(parent.peer).unwrap();
+        for input in [
+            fsm::Input::KeysReady {
+                view,
+                transcript_sha256: [10; 32],
+            },
+            fsm::Input::ChildPrepared(view),
+            fsm::Input::Receive {
+                parent,
+                message: fsm::Control::Commit {
+                    session: view.session,
+                    transcript_sha256: [10; 32],
+                },
+            },
+        ] {
+            actor.model.handle(0, input, &mut effects).unwrap();
+        }
+        if native_issued {
+            actor
+                .model
+                .handle(0, fsm::Input::ChildStartIssued(view), &mut effects)
+                .unwrap();
+        }
+        if native_started {
+            for input in [fsm::Input::ChildStarted(view), fsm::Input::PathReady(view)] {
+                actor.model.handle(0, input, &mut effects).unwrap();
+            }
+        }
+        let view = actor.model.session(parent.peer).unwrap();
+        assert_eq!(
+            view.phase,
+            if native_started {
+                fsm::Phase::Active
+            } else {
+                fsm::Phase::Committed
+            }
+        );
+        actor.records.insert(
+            peer,
+            Record {
+                view,
+                agreement,
+                role: model::AudioRole::Source,
+                material: None,
+                start_request_id: native_issued.then_some(1),
+                health: Default::default(),
+                health_state: model::StreamHealth::Ready,
+                latency_estimate_ms: None,
+                latency_stages: None,
+                path_diagnostic: model::PathDiagnostic::None,
+                remote_quality: None,
+                capture_active: native_started.then_some(true),
+                sending: native_started.then_some(true),
+                applied_gain: None,
+            },
+        );
+        let (handle, mut stops, mut shutdown, native) = AudioHandle::controlled_stop(1);
+        actor.worker = Some(Worker {
+            handle,
+            generation: 1,
+            alive: true,
+            model_ready: true,
+            pid: 0,
+            probe_ack: 0,
+        });
+        let (native_events, events) = mpsc::channel(8);
+        actor.worker_events = Some(events);
+        if revoke_pending || control_pending {
+            coordinator.links.send_modify(|links| {
+                links.peers = actor.peers.clone();
+                links.trusted.insert(peer);
+            });
+            actor.admitted.insert(peer);
+            let runner = tokio::spawn(actor.run());
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let (_, message) = consumer.recv().await.unwrap();
+                    if matches!(message, gui::gui_frame::Msg::AudioStatus(status)
+                        if status.sessions.iter().any(|session|
+                            session.session_id == view.session
+                                && session.state == gui::AudioSessionState::Running as i32))
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("actual actor publishes established session");
+            let (out, mut replies) = mpsc::channel(4);
+            coordinator
+                .submit(Request {
+                    request_id: 91,
+                    connection_id: [11; 16],
+                    message: gui::gui_frame::Msg::SetSystemAudioSharing(
+                        gui::SetSystemAudioSharing {
+                            enabled: false,
+                            role: i32::MAX,
+                            listener_node_id: Vec::new(),
+                            expected_revision: 0,
+                        },
+                    ),
+                    out: out.clone(),
+                })
+                .expect("real actor OFF admission");
+            assert_eq!(stops.recv().await, Some(view.session));
+            assert!(!*shutdown.borrow(), "native stop remains withheld");
+            native_events
+                .send(AudioSupervisorEvent::Health {
+                    generation: 1,
+                    health: worker::Health {
+                        sessions: vec![worker::SessionHealth {
+                            session_id: view.session.to_vec(),
+                            capture_active: Some(false),
+                            sending: Some(false),
+                            ..Default::default()
+                        }],
+                    },
+                })
+                .await
+                .unwrap();
+            if revoke_pending {
+                coordinator.trusted(&identity::TrustStore::new());
+            } else {
+                coordinator.capabilities_changed(peer, &[]);
+            }
+            coordinator
+                .submit(Request {
+                    request_id: 92,
+                    connection_id: [11; 16],
+                    message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                    out,
+                })
+                .expect("ordinary public status command while native stop is withheld");
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let (_, message) = consumer.recv().await.unwrap();
+                    if let gui::gui_frame::Msg::AudioStatus(status) = message {
+                        if status.sessions.iter().any(|session| {
+                            session.session_id == view.session
+                                && session.state == gui::AudioSessionState::Failed as i32
+                        }) {
+                            assert_eq!(status.system_sharing_requested, Some(false));
+                            break;
+                        }
+                    }
+                }
+                loop {
+                    let (request_id, message) = replies.recv().await.unwrap();
+                    if request_id == 92 {
+                        assert!(matches!(message, gui::gui_frame::Msg::AudioStatus(_)));
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("queued security withdrawal and public command precede native Stopped");
+            coordinator.stopping.send_replace(true);
+            runner.await.unwrap();
+            native.await.unwrap();
+            drop(coordinator);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let (out, mut replies) = mpsc::channel(4);
+        coordinator
+            .submit(Request {
+                request_id: 91,
+                connection_id: [11; 16],
+                message: gui::gui_frame::Msg::SetSystemAudioSharing(gui::SetSystemAudioSharing {
+                    enabled: false,
+                    role: i32::MAX,
+                    listener_node_id: Vec::new(),
+                    expected_revision: 0,
+                }),
+                out,
+            })
+            .expect("real Coordinator OFF admission");
+        let completion = async {
+            if !native_issued {
+                // An unrelated event is a deterministic receive-loop barrier: if
+                // retirement waits here, the actor will fence that unknown start.
+                native_events
+                    .send(AudioSupervisorEvent::SessionEvent {
+                        generation: 1,
+                        event: worker::SessionEvent {
+                            session_id: vec![12; 16],
+                            kind: worker::EventKind::Started as i32,
+                            ..Default::default()
+                        },
+                    })
+                    .await
+                    .unwrap();
+                tokio::select! {
+                    result = shutdown.changed() => result.unwrap(),
+                    stop = stops.recv() => panic!(
+                        "retirement waited for a nonexistent native session: {stop:?}"
+                    ),
+                }
+                return;
+            }
+            assert_eq!(stops.recv().await, Some(view.session));
+            assert!(
+                !*shutdown.borrow(),
+                "wire write is not native stop completion"
+            );
+            native_events
+                .send(AudioSupervisorEvent::Health {
+                    generation: 1,
+                    health: worker::Health {
+                        sessions: vec![worker::SessionHealth {
+                            session_id: view.session.to_vec(),
+                            capture_active: Some(false),
+                            sending: Some(false),
+                            ..Default::default()
+                        }],
+                    },
+                })
+                .await
+                .unwrap();
+            for (gen, session) in [(0, view.session), (1, [12; 16])] {
+                native_events
+                    .send(AudioSupervisorEvent::SessionEvent {
+                        generation: gen,
+                        event: worker::SessionEvent {
+                            session_id: session.to_vec(),
+                            kind: worker::EventKind::Stopped as i32,
+                            ..Default::default()
+                        },
+                    })
+                    .await
+                    .unwrap();
+            }
+            let event = if worker_lost {
+                AudioSupervisorEvent::Failed {
+                    generation: 1,
+                    session_id: None,
+                    reason: AudioSupervisorError::Unavailable,
+                }
+            } else {
+                AudioSupervisorEvent::SessionEvent {
+                    generation: 1,
+                    event: worker::SessionEvent {
+                        session_id: view.session.to_vec(),
+                        kind: worker::EventKind::Stopped as i32,
+                        ..Default::default()
+                    },
+                }
+            };
+            native_events.send(event).await.unwrap();
+        };
+        let ((), ()) = tokio::join!(actor.system_intent(), completion);
+        let (_, reply) = replies.recv().await.expect("actual OFF response");
+        assert!(
+            matches!(&reply, gui::gui_frame::Msg::OpResult(result) if result.ok),
+            "actual OFF response: {reply:?}"
+        );
+        if native_issued {
+            assert!(actor.native_stops_pending());
+            assert_eq!(
+                actor.model.session(parent.peer).unwrap().phase,
+                fsm::Phase::Stopping
+            );
+        }
+        while actor.worker.is_some() {
+            let event = actor.worker_events.as_mut().unwrap().recv().await.unwrap();
+            let completion_fact = match &event {
+                AudioSupervisorEvent::SessionEvent { generation, event } => {
+                    *generation == 1
+                        && event.session_id == view.session
+                        && event.kind == worker::EventKind::Stopped as i32
+                }
+                AudioSupervisorEvent::Failed { generation: 1, .. } => true,
+                _ => false,
+            };
+            actor.on_worker(event).await;
+            actor.drain().await;
+            actor.reconcile_system().await;
+            if !completion_fact {
+                assert!(
+                    actor.worker.is_some(),
+                    "Health/stale Stop cannot retire the worker"
+                );
+                assert!(actor.native_stops_pending());
+                assert_eq!(
+                    actor.model.session(parent.peer).unwrap().phase,
+                    fsm::Phase::Stopping
+                );
+            }
+        }
+        actor.drain().await;
+        actor.publish("controlled_stop_completion");
+        let mut status = None;
+        while let Ok((_, gui::gui_frame::Msg::AudioStatus(value))) = consumer.try_recv() {
+            status = Some(value);
+        }
+        let status = status.expect("consumer receives completed OFF");
+        assert_eq!(status.system_sharing_requested, Some(false));
+        let stopped = status
+            .sessions
+            .iter()
+            .find(|session| session.session_id == view.session)
+            .expect("consumer retains matching stop result");
+        if worker_lost {
+            assert_eq!(stopped.state, gui::AudioSessionState::Failed as i32);
+            assert_eq!(stopped.capture_active, None);
+            assert_eq!(stopped.sending, None);
+            assert_eq!(
+                actor.model.session(parent.peer).unwrap().reason,
+                Some(fsm::Reason::WorkerLost)
+            );
+        } else {
+            assert_eq!(stopped.state, gui::AudioSessionState::Idle as i32);
+            let observation = native_issued.then_some(false);
+            assert_eq!(stopped.capture_active, observation);
+            assert_eq!(stopped.sending, observation);
+        }
+        assert!(actor.worker.is_none(), "completed generation is retired");
+        native.await.unwrap();
+        drop(actor);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn reconciliation_failure_is_published_before_queued_activation_cas() {

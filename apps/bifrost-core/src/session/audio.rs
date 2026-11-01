@@ -495,6 +495,7 @@ struct Record {
     agreement: fsm::Agreement,
     role: model::AudioRole,
     material: Option<Materials>,
+    // Outstanding native start write; only matching native Stopped retires it.
     start_request_id: Option<u64>,
     health: model::AudioHealth,
     health_state: model::StreamHealth,
@@ -1401,6 +1402,7 @@ impl Actor {
                 record.start_request_id = Some(*request_id);
                 record.applied_gain = None;
             }
+            let _ = self.feed(fsm::Input::ChildStartIssued(view));
         }
         if matches!(
             &result,
@@ -1532,8 +1534,14 @@ impl Actor {
         self.publish_caps();
         for record in self.records.values_mut() {
             record.material = None;
-            record.capture_active = None;
-            record.sending = None;
+            if record.view.phase != fsm::Phase::Stopped
+                || record.start_request_id.is_some()
+                || record.capture_active != Some(false)
+                || record.sending != Some(false)
+            {
+                record.capture_active = None;
+                record.sending = None;
+            }
             record.latency_estimate_ms = None;
             record.latency_stages = None;
         }
@@ -1558,7 +1566,25 @@ impl Actor {
             let _ = self.ensure_worker().await;
         }
     }
+    fn native_stops_pending(&self) -> bool {
+        self.worker.as_ref().is_some_and(|worker| {
+            worker.alive
+                && self.records.values().any(|record| {
+                    record.view.worker_generation
+                        == generation(worker.generation, self.worker_epoch)
+                        && record.start_request_id.is_some()
+                        && matches!(
+                            record.view.phase,
+                            fsm::Phase::Stopping | fsm::Phase::Stopped
+                        )
+                })
+        })
+    }
     async fn stop_worker(&mut self) -> Result<(), Code> {
+        // Keep the ordinary actor loop responsive until actual native Stopped.
+        if self.native_stops_pending() {
+            return Ok(());
+        }
         self.mic_stop().await;
         self.worker_lost();
         let Some(worker) = self.worker.take() else {
@@ -1769,6 +1795,7 @@ impl Actor {
                             let _ = self.feed(fsm::Input::ChildFailed { view, reason });
                         }
                         if let Some(record) = self.records.get_mut(&peer) {
+                            record.start_request_id = None;
                             record.capture_active = Some(false);
                             record.sending = Some(false);
                         }

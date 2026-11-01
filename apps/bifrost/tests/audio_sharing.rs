@@ -78,6 +78,29 @@ fn saved(node: &common::Node) -> config::AudioConfig {
         .audio
 }
 
+fn stopped_cleanly(window: &mut Window, id: &[u8]) {
+    window.wait(
+        "matching native stop completes without a false failure",
+        |status| {
+            let Some(session) = status
+                .sessions
+                .iter()
+                .find(|session| session.session_id == id)
+            else {
+                return false;
+            };
+            assert_ne!(
+                session.state,
+                wire::AudioSessionState::Failed as i32,
+                "deliberate SYSTEM OFF must not become a worker-loss/revocation failure"
+            );
+            session.state == wire::AudioSessionState::Idle as i32
+                && session.capture_active == Some(false)
+                && session.sending == Some(false)
+        },
+    );
+}
+
 #[test]
 fn one_toggle_from_defaults_starts_real_media_and_off_preserves_user_preferences() {
     let _guard = common::serial();
@@ -177,8 +200,8 @@ fn one_toggle_from_defaults_starts_real_media_and_off_preserves_user_preferences
         Some(false)
     );
     assert!(acknowledged_off.system_sharing_error.is_empty());
-    pair.source.stopped(&session);
-    pair.listener.stopped(&session);
+    stopped_cleanly(&mut pair.source, &session);
+    stopped_cleanly(&mut pair.listener, &session);
     assert_eq!(pair.source.status().system_sharing_requested, Some(false));
     let off = saved(&pair.nodes.b);
     assert_eq!(off.system_sharing, Some(false));
@@ -409,8 +432,8 @@ fn system_off_stops_real_media_without_disabling_independent_microphone_policy()
             listener_node_id: vec![255],
             expected_revision: 0,
         }));
-    pair.listener.stopped(&session);
-    pair.source.stopped(&session);
+    stopped_cleanly(&mut pair.listener, &session);
+    stopped_cleanly(&mut pair.source, &session);
     let status = pair.listener.status();
     assert_eq!(status.system_sharing_requested, Some(false));
     let microphone = status.microphone.expect("independent microphone status");

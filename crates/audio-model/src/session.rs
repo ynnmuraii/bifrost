@@ -327,6 +327,8 @@ pub enum Input {
         transcript_sha256: [u8; 32],
     },
     ChildPrepared(SessionView),
+    /// The validated StartSession command was written; native startup is still unconfirmed.
+    ChildStartIssued(SessionView),
     ChildStarted(SessionView),
     PathReady(SessionView),
     Buffering(SessionView),
@@ -360,6 +362,7 @@ struct Session {
     digest: Option<[u8; 32]>,
     derive_issued: bool,
     prepare_issued: bool,
+    start_issued: bool,
     started: bool,
     deadline: u64,
     setup_deadline: u64,
@@ -390,14 +393,14 @@ impl Session {
         self.view.reason = Some(reason);
         self.view.phase = if failed {
             Phase::Failed
-        } else if self.prepare_issued || self.started {
+        } else if self.start_issued || self.started {
             Phase::Stopping
         } else {
             Phase::Stopped
         };
         // Revoke the local gate/keys before worker IPC or network can block.
         out.push(Effect::InvalidateSession { view: self.view });
-        if self.prepare_issued || self.started {
+        if self.start_issued || self.started {
             out.push(Effect::StopChild { view: self.view });
         }
         if notify {
@@ -657,7 +660,13 @@ impl ControlPlane {
                 {
                     peer.finish_request(Err(Reason::Revoked), out);
                     if let Some(session) = &mut peer.session {
-                        session.terminate(Reason::Revoked, true, false, now, out);
+                        // Either side's matching UserStop can withdraw media, not control/trust.
+                        let completing_user_stop = support.control
+                            && session.view.reason == Some(Reason::UserStop)
+                            && matches!(session.view.phase, Phase::Stopping | Phase::Stopped);
+                        if !completing_user_stop {
+                            session.terminate(Reason::Revoked, true, false, now, out);
+                        }
                     }
                 }
                 let index = self.peer_index(parent)?;
@@ -977,6 +986,13 @@ impl ControlPlane {
                 }
                 out.push(Effect::PublishStatus);
             }
+            Input::ChildStartIssued(view) => {
+                let entry = self.entry_mut(view)?;
+                if entry.view.phase != Phase::Committed {
+                    return Err(Error::InvalidState);
+                }
+                entry.start_issued = true;
+            }
             Input::ChildStarted(view) => {
                 let role = self.settings.role.ok_or(Error::InvalidState)?;
                 let peer = self.peer_mut(view.parent)?;
@@ -1097,6 +1113,7 @@ impl ControlPlane {
             digest: None,
             derive_issued: false,
             prepare_issued: false,
+            start_issued: false,
             started: false,
             deadline: now.saturating_add(SETUP_TIMEOUT_MS),
             setup_deadline: now.saturating_add(SETUP_TIMEOUT_MS),

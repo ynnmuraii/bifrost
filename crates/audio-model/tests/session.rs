@@ -1359,6 +1359,29 @@ fn keepalives_cannot_extend_path_validation_past_original_setup_deadline() {
 }
 
 #[test]
+fn prepared_sessions_stop_logically_without_inventing_native_completion() {
+    let mut pair = Pair::new(true, true);
+    pair.prepared();
+    for (node, peer) in [(&mut pair.listener, SOURCE), (&mut pair.source, LISTENER)] {
+        let effects = run(
+            node,
+            20,
+            Input::Stop {
+                peer,
+                reason: Reason::UserStop,
+            },
+        );
+        let stopped = node.session(peer).unwrap();
+        assert_eq!(stopped.phase, Phase::Stopped);
+        assert_eq!(stopped.reason, Some(Reason::UserStop));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StopChild { .. })));
+        assert_eq!(starts(&effects), 0);
+    }
+}
+
+#[test]
 fn stop_guard_starts_at_stop_and_preserves_the_original_reason() {
     let mut pair = Pair::new(true, true);
     let (_, sv, _) = pair.prepared();
@@ -1371,6 +1394,18 @@ fn stop_guard_starts_at_stop_and_preserves_the_original_reason() {
             },
         );
     }
+    run(
+        &mut pair.source,
+        5000,
+        Input::Receive {
+            parent: pair.sp,
+            message: Control::Commit {
+                session: sv.session,
+                transcript_sha256: DIGEST,
+            },
+        },
+    );
+    run(&mut pair.source, 5000, Input::ChildStartIssued(sv));
     run(
         &mut pair.source,
         5000,
@@ -1403,6 +1438,289 @@ fn stop_guard_starts_at_stop_and_preserves_the_original_reason() {
         Some(Reason::UserStop)
     );
     run(&mut pair.source, 6000, Input::ChildStopped(sv));
+}
+
+#[test]
+fn source_capability_withdrawal_completes_matching_remote_user_stop() {
+    let mut pair = Pair::new(true, true);
+    let (view, _) = pair.active();
+    run(
+        &mut pair.listener,
+        20,
+        Input::Receive {
+            parent: pair.lp,
+            message: Control::Stop {
+                session: view.session,
+                reason: Reason::UserStop,
+            },
+        },
+    );
+    assert_eq!(
+        pair.listener.session(SOURCE).unwrap().phase,
+        Phase::Stopping
+    );
+    let effects = run(
+        &mut pair.listener,
+        21,
+        Input::PeerSupport {
+            parent: pair.lp,
+            support: Support {
+                control: true,
+                system_source: false,
+                listener: false,
+            },
+        },
+    );
+    let stopping = pair.listener.session(SOURCE).unwrap();
+    assert_eq!(stopping.phase, Phase::Stopping);
+    assert_eq!(stopping.reason, Some(Reason::UserStop));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::InvalidateSession { .. } | Effect::StopChild { .. }
+    )));
+    run(&mut pair.listener, 22, Input::ChildStopped(view));
+    let stopped = pair.listener.session(SOURCE).unwrap();
+    assert_eq!(stopped.phase, Phase::Stopped);
+    assert_eq!(stopped.reason, Some(Reason::UserStop));
+}
+
+#[test]
+fn pending_user_stop_does_not_mask_real_revocation_or_worker_loss() {
+    for failure in 0..8 {
+        let mut pair = Pair::new(true, true);
+        let (view, _) = pair.active();
+        let stop = if failure < 4 {
+            Input::Receive {
+                parent: pair.lp,
+                message: Control::Stop {
+                    session: view.session,
+                    reason: Reason::UserStop,
+                },
+            }
+        } else {
+            Input::Stop {
+                peer: SOURCE,
+                reason: Reason::UserStop,
+            }
+        };
+        run(&mut pair.listener, 20, stop);
+        let (input, reason) = match failure % 4 {
+            0 => (Input::RevokePeer(SOURCE), Reason::Revoked),
+            1 => (
+                Input::ChildFailed {
+                    view,
+                    reason: Reason::ProtocolViolation,
+                },
+                Reason::ProtocolViolation,
+            ),
+            2 => (
+                Input::PeerSupport {
+                    parent: pair.lp,
+                    support: Support {
+                        control: false,
+                        system_source: false,
+                        listener: false,
+                    },
+                },
+                Reason::Revoked,
+            ),
+            _ => (
+                Input::WorkerLost {
+                    generation: view.worker_generation,
+                },
+                Reason::WorkerLost,
+            ),
+        };
+        run(&mut pair.listener, 21, input);
+        let failed = pair.listener.session(SOURCE).unwrap();
+        assert_eq!(failed.phase, Phase::Failed, "failure case {failure}");
+        assert_eq!(failed.reason, Some(reason), "failure case {failure}");
+        assert_eq!(
+            pair.listener
+                .handle(22, Input::ChildStopped(view), &mut Vec::new()),
+            Err(Error::InvalidState),
+            "a late positive stop must not erase genuine failure"
+        );
+    }
+}
+
+#[test]
+fn source_capability_loss_without_matching_user_stop_remains_failure() {
+    for stopping in 0..2 {
+        let mut pair = Pair::new(true, true);
+        let (view, _) = pair.active();
+        if stopping == 1 {
+            run(
+                &mut pair.listener,
+                20,
+                Input::Receive {
+                    parent: pair.lp,
+                    message: Control::Stop {
+                        session: [99; 16],
+                        reason: Reason::UserStop,
+                    },
+                },
+            );
+        }
+        run(
+            &mut pair.listener,
+            21,
+            Input::PeerSupport {
+                parent: pair.lp,
+                support: Support {
+                    control: true,
+                    system_source: false,
+                    listener: false,
+                },
+            },
+        );
+        let failed = pair.listener.session(SOURCE).unwrap();
+        assert_eq!(failed.session, view.session);
+        assert_eq!(failed.phase, Phase::Failed, "stop case {stopping}");
+        assert_eq!(failed.reason, Some(Reason::Revoked));
+    }
+}
+
+#[test]
+fn expected_media_capability_withdrawal_preserves_local_and_remote_user_stop() {
+    for source in [false, true] {
+        for remote in [false, true] {
+            let mut pair = Pair::new(true, true);
+            let (lv, sv) = pair.active();
+            let (node, peer, parent, view) = if source {
+                (&mut pair.source, LISTENER, pair.sp, sv)
+            } else {
+                (&mut pair.listener, SOURCE, pair.lp, lv)
+            };
+            let stop = if remote {
+                Input::Receive {
+                    parent,
+                    message: Control::Stop {
+                        session: view.session,
+                        reason: Reason::UserStop,
+                    },
+                }
+            } else {
+                Input::Stop {
+                    peer,
+                    reason: Reason::UserStop,
+                }
+            };
+            run(node, 20, stop);
+            run(
+                node,
+                21,
+                Input::PeerSupport {
+                    parent,
+                    support: Support {
+                        control: true,
+                        system_source: false,
+                        listener: false,
+                    },
+                },
+            );
+            let stopping = node.session(peer).unwrap();
+            assert_eq!(
+                stopping.phase,
+                Phase::Stopping,
+                "source={source}, remote_stop={remote}"
+            );
+            assert_eq!(stopping.reason, Some(Reason::UserStop));
+            run(node, 22, Input::ChildStopped(view));
+            assert_eq!(node.session(peer).unwrap().phase, Phase::Stopped);
+        }
+    }
+}
+
+#[test]
+fn retired_session_stop_and_old_generation_cannot_settle_a_new_session() {
+    let mut pair = Pair::new(true, true);
+    let (old, _) = pair.active();
+    run(
+        &mut pair.listener,
+        20,
+        Input::Receive {
+            parent: pair.lp,
+            message: Control::Stop {
+                session: old.session,
+                reason: Reason::UserStop,
+            },
+        },
+    );
+    run(&mut pair.listener, 21, Input::ChildStopped(old));
+    for now in [250, 500, 750, 1000] {
+        run(
+            &mut pair.listener,
+            now,
+            Input::WorkerHeartbeat {
+                generation: old.worker_generation,
+            },
+        );
+    }
+    run(
+        &mut pair.listener,
+        1001,
+        Input::Start {
+            parent: pair.lp,
+            session: [77; 16],
+            listener_nonce: [78; 32],
+            format: format(),
+            format_sha256: [13; 32],
+        },
+    );
+    let current = pair.listener.session(SOURCE).unwrap();
+    assert_ne!(current.session, old.session);
+    run(
+        &mut pair.listener,
+        1002,
+        Input::Receive {
+            parent: pair.lp,
+            message: Control::Stop {
+                session: old.session,
+                reason: Reason::UserStop,
+            },
+        },
+    );
+    for view in [
+        old,
+        SessionView {
+            worker_generation: [99; 16],
+            ..current
+        },
+    ] {
+        for input in [Input::ChildStopped(view), Input::ChildStartIssued(view)] {
+            assert_eq!(
+                pair.listener.handle(1003, input, &mut Vec::new()),
+                Err(Error::StaleWorker)
+            );
+        }
+    }
+    run(
+        &mut pair.listener,
+        1004,
+        Input::WorkerLost {
+            generation: [99; 16],
+        },
+    );
+    assert_eq!(pair.listener.session(SOURCE), Some(current));
+    run(
+        &mut pair.listener,
+        1005,
+        Input::PeerSupport {
+            parent: pair.lp,
+            support: Support {
+                control: true,
+                system_source: false,
+                listener: false,
+            },
+        },
+    );
+    assert_eq!(pair.listener.session(SOURCE).unwrap().phase, Phase::Failed);
+    assert_eq!(
+        pair.listener.session(SOURCE).unwrap().reason,
+        Some(Reason::Revoked),
+        "retired remote UserStop must not exempt a new session"
+    );
 }
 
 #[test]
