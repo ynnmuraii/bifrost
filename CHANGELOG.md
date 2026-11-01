@@ -21,7 +21,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Audio settings use responsive, inset RU/EN task controls; the independent native mini-player is opaque, correctly sized and free of nested hide panels or unnecessary single-card scrolling.
 - Sharing intent, connection progress, startup failures and observed running audio remain distinct. System-audio OFF cancels a pending start without changing mic/PTT or media-control settings; with resume disabled, restarting a Source leaves sharing stopped until a fresh ON.
-- System-audio OFF preserves matching native stop completion instead of reporting intentional worker retirement or expected peer-capability withdrawal as a crash/revocation failure. Genuine worker losses and security revocations remain failures.
+- System-audio OFF preserves matching native stop completion instead of reporting intentional worker retirement or expected peer-capability withdrawal as a crash/revocation failure. Genuine worker losses and security revocations remain failures, including when stopping is delayed.
 - Audio settings and popup warnings show observed path-failure reasons and local/peer UDP ports, with conditional role-scoped guidance rather than unproven firewall blame.
 - A newer pairing attempt visibly cancels the older ceremony on both computers; delayed confirmations cannot approve the replacement.
 - CLI pairing rejection and EOF cancellation now exit unsuccessfully, including when the pairing window belongs to an already-running core.
@@ -63,7 +63,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 
 - Элементы аудионастроек адаптируются к узкому окну в RU/EN и сохраняют отступы; отдельный нативный мини-плеер непрозрачен, правильно рассчитан по содержимому, без вложенной панели скрытия и лишней прокрутки одной карточки.
 - Намерение передачи, подключение, ошибка запуска и наблюдаемый работающий звук не выдаются друг за друга. Выключение системного звука отменяет ожидающий запуск, не меняя микрофон/PTT и медиакоманды; при выключенном возобновлении после перезапуска источника требуется новое включение передачи.
-- При выключении системного звука сохраняется подтверждение остановки нативного потока: штатное завершение аудиопроцесса и ожидаемое снятие аудиовозможности пира больше не выдаются за сбой или отзыв доверия. Настоящие потери процесса и отзывы разрешений безопасности остаются ошибками.
+- При выключении системного звука сохраняется подтверждение остановки нативного потока: штатное завершение аудиопроцесса и ожидаемое снятие аудиовозможности пира больше не выдаются за сбой или отзыв доверия. Настоящие потери процесса и отзывы разрешений безопасности остаются ошибками, в том числе при задержке остановки.
 - Настройки и предупреждения плеера показывают наблюдаемую причину отказа аудиопути и местный/удалённый UDP-порты; подсказки учитывают роль и не объявляют брандмауэр виновным без доказательств.
 - Новая попытка сопряжения видимо отменяет старую на обоих компьютерах; запоздавшее подтверждение не может одобрить замену.
 - Отказ от сопряжения в CLI и отмена через EOF завершаются ошибкой, в том числе когда окно сопряжения обслуживает уже запущенная служба.

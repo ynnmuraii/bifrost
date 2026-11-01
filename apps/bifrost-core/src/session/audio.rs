@@ -1781,7 +1781,7 @@ impl Actor {
                         if let Some(record) = self.records.get_mut(&peer) {
                             record.path_diagnostic = native_path_diagnostic(event.path_diagnostic);
                         }
-                        if view.phase == fsm::Phase::Stopping {
+                        if matches!(view.phase, fsm::Phase::Stopping | fsm::Phase::Stopped) {
                             let _ = self.feed(fsm::Input::ChildStopped(view));
                         } else if !matches!(
                             view.phase,

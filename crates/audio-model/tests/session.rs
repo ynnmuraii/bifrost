@@ -1440,6 +1440,134 @@ fn stop_guard_starts_at_stop_and_preserves_the_original_reason() {
     run(&mut pair.source, 6000, Input::ChildStopped(sv));
 }
 
+fn source_stop_after_logical_deadline() -> (Pair, SessionView) {
+    let mut pair = Pair::new(true, true);
+    let (_, view, _) = pair.prepared();
+    for (now, input) in [
+        (
+            13,
+            Input::Receive {
+                parent: pair.sp,
+                message: Control::Commit {
+                    session: view.session,
+                    transcript_sha256: DIGEST,
+                },
+            },
+        ),
+        (14, Input::ChildStartIssued(view)),
+        (15, Input::ChildStarted(view)),
+        (16, Input::PathReady(view)),
+        (
+            20,
+            Input::Stop {
+                peer: LISTENER,
+                reason: Reason::UserStop,
+            },
+        ),
+    ] {
+        run(&mut pair.source, now, input);
+    }
+    assert_eq!(
+        pair.source.session(LISTENER).unwrap().phase,
+        Phase::Stopping
+    );
+    for now in [250, 500, 750, 1000, 1021] {
+        run(
+            &mut pair.source,
+            now,
+            Input::WorkerHeartbeat {
+                generation: view.worker_generation,
+            },
+        );
+        run(&mut pair.source, now, Input::Tick);
+    }
+    let stopped = pair.source.session(LISTENER).unwrap();
+    assert_eq!(stopped.phase, Phase::Stopped);
+    assert_eq!(stopped.reason, Some(Reason::UserStop));
+    (pair, view)
+}
+
+#[test]
+fn worker_loss_after_logical_stop_deadline_with_native_stop_withheld_is_failure() {
+    let (mut pair, view) = source_stop_after_logical_deadline();
+    for stale in [
+        SessionView {
+            worker_generation: [99; 16],
+            ..view
+        },
+        SessionView {
+            session: [99; 16],
+            ..view
+        },
+    ] {
+        assert_eq!(
+            pair.source
+                .handle(1022, Input::ChildStopped(stale), &mut Vec::new()),
+            Err(Error::StaleWorker),
+            "stale positive stop cannot retire current native ownership"
+        );
+    }
+    run(
+        &mut pair.source,
+        1022,
+        Input::WorkerLost {
+            generation: [99; 16],
+        },
+    );
+    assert_eq!(pair.source.session(LISTENER).unwrap().phase, Phase::Stopped);
+    run(
+        &mut pair.source,
+        1023,
+        Input::WorkerLost {
+            generation: view.worker_generation,
+        },
+    );
+    let failed = pair.source.session(LISTENER).unwrap();
+    assert_eq!(failed.phase, Phase::Failed);
+    assert_eq!(failed.reason, Some(Reason::WorkerLost));
+}
+
+#[test]
+fn late_actual_stop_after_logical_deadline_prevents_false_worker_loss_failure() {
+    let (mut pair, view) = source_stop_after_logical_deadline();
+    run(&mut pair.source, 1022, Input::ChildStopped(view));
+    run(
+        &mut pair.source,
+        1023,
+        Input::WorkerLost {
+            generation: view.worker_generation,
+        },
+    );
+    let stopped = pair.source.session(LISTENER).unwrap();
+    assert_eq!(stopped.phase, Phase::Stopped);
+    assert_eq!(stopped.reason, Some(Reason::UserStop));
+}
+
+#[test]
+fn actual_native_stop_before_deadline_prevents_false_worker_loss_failure() {
+    let mut pair = Pair::new(true, true);
+    let (_, view) = pair.active();
+    run(
+        &mut pair.source,
+        20,
+        Input::Stop {
+            peer: LISTENER,
+            reason: Reason::UserStop,
+        },
+    );
+    run(&mut pair.source, 21, Input::ChildStopped(view));
+    run(
+        &mut pair.source,
+        22,
+        Input::WorkerLost {
+            generation: view.worker_generation,
+        },
+    );
+    let stopped = pair.source.session(LISTENER).unwrap();
+    assert_eq!(stopped.phase, Phase::Stopped);
+    assert_eq!(stopped.reason, Some(Reason::UserStop));
+}
+
 #[test]
 fn source_capability_withdrawal_completes_matching_remote_user_stop() {
     let mut pair = Pair::new(true, true);

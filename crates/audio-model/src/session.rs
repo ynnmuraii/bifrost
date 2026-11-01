@@ -387,20 +387,24 @@ impl Session {
         now: u64,
         out: &mut Vec<Effect>,
     ) {
-        if !self.live() || self.view.phase == Phase::Stopping && !failed {
+        let native_pending = self.start_issued || self.started;
+        // Logical stop expiry is not a native stop confirmation.
+        if !self.live() && !(failed && self.view.phase == Phase::Stopped && native_pending)
+            || self.view.phase == Phase::Stopping && !failed
+        {
             return;
         }
         self.view.reason = Some(reason);
         self.view.phase = if failed {
             Phase::Failed
-        } else if self.start_issued || self.started {
+        } else if native_pending {
             Phase::Stopping
         } else {
             Phase::Stopped
         };
         // Revoke the local gate/keys before worker IPC or network can block.
         out.push(Effect::InvalidateSession { view: self.view });
-        if self.start_issued || self.started {
+        if native_pending {
             out.push(Effect::StopChild { view: self.view });
         }
         if notify {
@@ -1061,11 +1065,13 @@ impl ControlPlane {
             }
             Input::ChildStopped(view) => {
                 let entry = self.entry_mut(view)?;
+                if !matches!(entry.view.phase, Phase::Stopping | Phase::Stopped) {
+                    return Err(Error::InvalidState);
+                }
+                entry.start_issued = false;
+                entry.started = false;
                 if entry.view.phase == Phase::Stopped {
                     return Ok(());
-                }
-                if entry.view.phase != Phase::Stopping {
-                    return Err(Error::InvalidState);
                 }
                 entry.view.phase = Phase::Stopped;
                 out.push(Effect::PublishStatus);

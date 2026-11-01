@@ -428,22 +428,37 @@ mod tests {
         controlled_system_off(false, NativeStart::ControlPending).await;
     }
 
+    #[tokio::test]
+    async fn system_off_deadline_does_not_hide_worker_loss() {
+        controlled_system_off(true, NativeStart::Deadline).await;
+    }
+
+    #[tokio::test]
+    async fn system_off_deadline_late_native_stopped_preserves_positive_completion() {
+        controlled_system_off(false, NativeStart::Deadline).await;
+    }
+
     enum NativeStart {
         Fenced,
         Issued,
         Started,
         RevokePending,
         ControlPending,
+        Deadline,
     }
 
     async fn controlled_system_off(worker_lost: bool, native: NativeStart) {
         let native_issued = !matches!(native, NativeStart::Fenced);
         let native_started = matches!(
             native,
-            NativeStart::Started | NativeStart::RevokePending | NativeStart::ControlPending
+            NativeStart::Started
+                | NativeStart::RevokePending
+                | NativeStart::ControlPending
+                | NativeStart::Deadline
         );
         let revoke_pending = matches!(native, NativeStart::RevokePending);
         let control_pending = matches!(native, NativeStart::ControlPending);
+        let past_deadline = matches!(native, NativeStart::Deadline);
         let root = std::env::temp_dir().join(format!(
             "bf-stop-{}",
             u128::from_be_bytes(identity::random16().expect("owned fixture ID"))
@@ -836,6 +851,28 @@ mod tests {
                 fsm::Phase::Stopping
             );
         }
+        if past_deadline {
+            let stopped_at = actor.now();
+            for advance in [250, 500, 750, 1000, 1250] {
+                actor.epoch = Instant::now()
+                    .checked_sub(Duration::from_millis(stopped_at + advance))
+                    .expect("supplied stop-deadline clock");
+                actor
+                    .feed(fsm::Input::WorkerHeartbeat {
+                        generation: view.worker_generation,
+                    })
+                    .unwrap();
+                actor.feed(fsm::Input::Tick).unwrap();
+            }
+            assert_eq!(
+                actor.model.session(parent.peer).unwrap().phase,
+                fsm::Phase::Stopped
+            );
+            assert!(
+                actor.native_stops_pending(),
+                "logical expiry is not a native ACK"
+            );
+        }
         while actor.worker.is_some() {
             let event = actor.worker_events.as_mut().unwrap().recv().await.unwrap();
             let completion_fact = match &event {
@@ -858,7 +895,11 @@ mod tests {
                 assert!(actor.native_stops_pending());
                 assert_eq!(
                     actor.model.session(parent.peer).unwrap().phase,
-                    fsm::Phase::Stopping
+                    if past_deadline {
+                        fsm::Phase::Stopped
+                    } else {
+                        fsm::Phase::Stopping
+                    }
                 );
             }
         }
