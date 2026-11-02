@@ -668,6 +668,58 @@ fn settings_version_is_a_padded_bottom_row_in_both_languages_and_themes() {
 }
 
 #[test]
+fn settings_discovery_and_pairing_toggles_have_independent_stable_interactions() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut vm = connected();
+        vm.look.theme = theme;
+        vm.status.as_mut().unwrap().discovery_enabled = true;
+        vm.status.as_mut().unwrap().accept_pairing_requests = true;
+        vm.local(&Action::ToggleModal(Modal::Settings));
+        let mut harness = Harness::new();
+        for lang in [ui_text::Lang::En, ui_text::Lang::Ru] {
+            vm.look.language = lang;
+            harness.frame(&vm, false, SIZE, Vec::new());
+            harness.now += Duration::from_millis(500);
+            let frame = harness.frame(&vm, false, SIZE, Vec::new());
+            assert!(
+                !frame
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text.contains("widget ID")),
+                "settings must not show egui duplicate-ID diagnostics: {:?}",
+                frame.texts
+            );
+            for (label_key, expected) in [
+                (ui_text::Key::LanDiscovery, Action::SetDiscovery(false)),
+                (
+                    ui_text::Key::PairingRequests,
+                    Action::SetPairingRequests(false),
+                ),
+            ] {
+                let label = frame
+                    .texts
+                    .iter()
+                    .find(|(text, _)| text == &ui_text::text(lang, label_key).to_uppercase())
+                    .expect("visible setting label")
+                    .1;
+                let off = frame
+                    .texts
+                    .iter()
+                    .find(|(text, rect)| {
+                        text == ui_text::text(lang, ui_text::Key::Off)
+                            && rect.left() > label.right()
+                            && (rect.center().y - label.center().y).abs() < 20.0
+                    })
+                    .expect("visible independent off option")
+                    .1;
+                let clicked = harness.frame(&vm, false, SIZE, click_at(off.center()));
+                assert_eq!(clicked.output.actions, vec![expected]);
+            }
+        }
+    }
+}
+
+#[test]
 fn pairing_request_setting_keeps_its_label_clear_of_the_toggle() {
     for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
         for theme in [Theme::Dark, Theme::Light] {

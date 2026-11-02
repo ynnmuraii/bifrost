@@ -35,6 +35,8 @@ struct Running<S: Stream + 'static> {
     role: i32,
     authorized: Arc<AtomicBool>,
     media: MediaSession<S>,
+    source_silence_required: bool,
+    source_silence_attempted: bool,
 }
 struct Inventory {
     request_id: u64,
@@ -56,6 +58,7 @@ where
     responses: mpsc::Sender<Response>,
     health: watch::Sender<w::Health>,
     sessions: Vec<Running<B::Stream>>,
+    retiring_sources: Vec<(Running<B::Stream>, i32, i32)>,
     listener: Option<media::ListenerGroup<B::Stream>>,
     socket: Option<Arc<MediaSocket>>,
     used_ids: Vec<[u8; 16]>,
@@ -95,6 +98,7 @@ pub(crate) fn run<B: Backend + 'static>(
         responses,
         health,
         sessions: Vec::with_capacity(contract::MAX_SESSIONS),
+        retiring_sources: Vec::with_capacity(contract::MAX_SESSIONS),
         listener: None,
         socket: None,
         used_ids: Vec::with_capacity(MAX_STARTS),
@@ -184,6 +188,14 @@ pub(crate) fn run<B: Backend + 'static>(
             "audio session lifecycle"
         );
         worker.shared.remove(&session.id);
+    }
+    for (mut session, _, _) in worker.retiring_sources.drain(..) {
+        let stopped = session.media.stop().is_ok();
+        tracing::info!(
+            event_kind = 5,
+            stopped,
+            "retiring Source native cleanup at shutdown"
+        );
     }
     if let Some(group) = worker.listener.as_mut() {
         let _ = group.stop();
@@ -488,7 +500,11 @@ where
         let id: [u8; 16] = start.session_id.as_slice().try_into().map_err(|_| 6)?;
         let secrets = secrets?;
         let authorized = authorized?;
-        admit_start(&self.used_ids, &id, self.sessions.len())?;
+        admit_start(
+            &self.used_ids,
+            &id,
+            self.sessions.len() + self.retiring_sources.len(),
+        )?;
         let fingerprint = |key: &[u8]| -> [u8; 32] {
             digest(&SHA256, key)
                 .as_ref()
@@ -604,6 +620,12 @@ where
             role: start.role,
             authorized,
             media,
+            source_silence_required: start.role == 1
+                && start
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.kind == 2),
+            source_silence_attempted: false,
         });
         self.event(&id, 1, 0, port);
         Ok(())
@@ -617,6 +639,24 @@ where
                 0
             };
             session.authorized.store(false, Ordering::Release);
+            if session.source_silence_required {
+                // Cancel immediately; restore/native teardown never blocks the P4 worker.
+                if session.media.begin_stop().is_err() {
+                    // Failed scheduling retains real native ownership; never Drop S here
+                    // or synthesize a positive Stopped from an absent task handle.
+                    self.retiring_sources
+                        .push((session, reason, path_diagnostic));
+                    self.shared.stop_all();
+                    return;
+                }
+                self.shared.remove(id);
+                self.retiring_sources
+                    .push((session, reason, path_diagnostic));
+                if self.sessions.is_empty() {
+                    self.socket = None;
+                }
+                return;
+            }
             if session.media.stop().is_err() {
                 self.shared.stop_all();
                 return;
@@ -650,6 +690,20 @@ where
         );
     }
     fn events(&mut self) {
+        let mut retiring = 0;
+        while retiring < self.retiring_sources.len() {
+            let Some(result) = self.retiring_sources[retiring].0.media.poll_stop() else {
+                retiring += 1;
+                continue;
+            };
+            let (session, reason, path) = self.retiring_sources.swap_remove(retiring);
+            if result.is_err() {
+                // Actual uncertain native-stop failure retains the existing global safety path.
+                self.shared.stop_all();
+                return;
+            }
+            self.event_with_path(&session.id, 5, reason, 0, path);
+        }
         if let (Some(pump), Some(backend)) = (self.control_pump, self.backend.as_mut()) {
             pump(backend);
         }
@@ -716,6 +770,60 @@ where
             if !self.sessions[index].authorized.load(Ordering::Acquire) {
                 let id = self.sessions[index].id;
                 self.stop(&id, self.shared.stop_reason(&id));
+                continue;
+            }
+            // This is the existing active-Source admission (auth + committed sending).
+            // Kind1 Windows process exclusion, kind3 and all Listeners never enter it.
+            let session = &mut self.sessions[index];
+            if session.source_silence_required
+                && !session.source_silence_attempted
+                && session.role == 1
+                && self.shared.source_local_sound(&session.id)
+                && session.media.snapshot().sending
+            {
+                session.source_silence_attempted = true;
+                let authorized = session.authorized.clone();
+                let shared = self.shared.clone();
+                let local_sound = self
+                    .shared
+                    .source_local_sound_permit(&session.id)
+                    .expect("live Source permit");
+                let admitted = Arc::new(move || {
+                    authorized.load(Ordering::Acquire)
+                        && !shared.stopping.load(Ordering::Acquire)
+                        && local_sound.load(Ordering::Acquire)
+                });
+                if let Err(error) = session.media.begin_source_silence(admitted) {
+                    let id = session.id;
+                    tracing::warn!(?error, "Source local playback operation could not start");
+                    self.response(
+                        0,
+                        Msg::Error(w::Error {
+                            code: media_error(error),
+                            session_id: id.to_vec(),
+                        }),
+                    );
+                    self.stop(&id, stop_reason(media::StopReason::WorkerFailed));
+                    continue;
+                }
+            }
+            if let Some(Err(error)) = self.sessions[index].media.poll_source_silence() {
+                if error == BackendError::PermissionDenied
+                    && !self.shared.source_local_sound(&self.sessions[index].id)
+                {
+                    index += 1;
+                    continue;
+                }
+                let id = self.sessions[index].id;
+                tracing::warn!(?error, "Source local playback suppression unavailable");
+                self.response(
+                    0,
+                    Msg::Error(w::Error {
+                        code: code(error),
+                        session_id: id.to_vec(),
+                    }),
+                );
+                self.stop(&id, stop_reason(media::StopReason::WorkerFailed));
                 continue;
             }
             let mut ended = None;

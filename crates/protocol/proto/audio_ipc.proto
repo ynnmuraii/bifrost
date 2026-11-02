@@ -21,6 +21,7 @@ message AudioFrame {
     Shutdown shutdown = 16;
     ProbeBackend probe_backend = 17;
     RenewSession renew_session = 70;
+    ReleaseSourceLocalSound release_source_local_sound = 73;
     AcquireMicMute acquire_mic_mute = 18;
     SetMicMute set_mic_mute = 19;
     ReleaseMicMute release_mic_mute = 20;
@@ -92,8 +93,10 @@ message StartSession {
   uint32 local_scope_id = 12; // IPv6 interface scope, zero for IPv4.
   uint32 peer_scope_id = 13;
   uint32 initial_authorization_ms = 14; // Required, 1..1000; zero never grants permission.
+  bool source_local_sound_released = 15; // Local user override; never changes transmission.
 }
 message StopSession { bytes session_id = 1; }
+message ReleaseSourceLocalSound { bytes session_id = 1; } // Source only, idempotent; no native wait.
 message RenewSession { bytes session_id = 1; uint32 ttl_ms = 2; } // Exact 16-byte ID, TTL 1..1000; cannot revive a stopped session.
 message SetGain { bytes session_id = 1; uint32 gain_percent = 2; bool muted = 3; } // Listener-local 0..100.
 
@@ -184,8 +187,8 @@ enum PttArmingState { PTT_ARMING_STATE_UNSPECIFIED = 0; PTT_ARMING_STATE_ARMED =
 enum PttUnavailableReason { PTT_UNAVAILABLE_REASON_UNSPECIFIED = 0; PTT_UNAVAILABLE_REASON_HOST_CLOCK_UNAVAILABLE = 1; PTT_UNAVAILABLE_REASON_PORTAL_FRESHNESS_UNVERIFIABLE = 2; PTT_UNAVAILABLE_REASON_REGISTRATION_UNAVAILABLE = 3; }
 message PttStatus { PttArmingState state = 1; uint64 safety_epoch = 2; bool registered = 3; PttUnavailableReason reason = 4; }
 message SetMediaWatch { bool enabled = 1; } // Success is an asynchronous MediaSessions snapshot.
-enum MediaCommandKind { MEDIA_COMMAND_KIND_UNSPECIFIED = 0; MEDIA_COMMAND_KIND_PLAY = 1; MEDIA_COMMAND_KIND_PAUSE = 2; MEDIA_COMMAND_KIND_TOGGLE = 3; MEDIA_COMMAND_KIND_NEXT = 4; MEDIA_COMMAND_KIND_PREVIOUS = 5; }
-message MediaCommand { uint64 token = 1; uint64 expected_revision = 2; MediaCommandKind command = 3; }
+enum MediaCommandKind { MEDIA_COMMAND_KIND_UNSPECIFIED = 0; MEDIA_COMMAND_KIND_PLAY = 1; MEDIA_COMMAND_KIND_PAUSE = 2; MEDIA_COMMAND_KIND_TOGGLE = 3; MEDIA_COMMAND_KIND_NEXT = 4; MEDIA_COMMAND_KIND_PREVIOUS = 5; MEDIA_COMMAND_KIND_SEEK = 6; }
+message MediaCommand { uint64 token = 1; uint64 expected_revision = 2; MediaCommandKind command = 3; optional uint64 position_ms = 4; }
 enum PlaybackState { PLAYBACK_STATE_UNKNOWN = 0; PLAYBACK_STATE_PLAYING = 1; PLAYBACK_STATE_PAUSED = 2; PLAYBACK_STATE_STOPPED = 3; }
 message MediaInfo {
   uint64 token = 1;
@@ -197,6 +200,9 @@ message MediaInfo {
   optional uint64 duration_ms = 7;
   PlaybackState state = 8;
   uint32 commands = 9; // Play/Pause/Toggle/Next/Previous bits 0..4.
+  optional bool can_seek = 10;
+  optional uint64 seek_min_ms = 11;
+  optional uint64 seek_max_ms = 12;
 }
 message MediaSessions { repeated MediaInfo sessions = 1; optional uint64 current_token = 2; uint64 revision = 3; } // <=32 unique nonzero tokens, push only.
 enum MediaCommandStatus { MEDIA_COMMAND_STATUS_UNSPECIFIED = 0; MEDIA_COMMAND_STATUS_OK = 1; MEDIA_COMMAND_STATUS_STALE_REVISION = 2; MEDIA_COMMAND_STATUS_UNSUPPORTED = 3; MEDIA_COMMAND_STATUS_TIMEOUT = 4; MEDIA_COMMAND_STATUS_CANCELLED = 5; }

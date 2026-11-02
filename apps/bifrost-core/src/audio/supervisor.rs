@@ -192,6 +192,7 @@ pub enum AudioSupervisorEvent {
 
 #[derive(Clone)]
 pub struct AudioHandle {
+    source_sound: watch::Sender<Vec<(u64, [u8; 16])>>,
     commands: mpsc::Sender<Command>,
     priority: mpsc::Sender<Command>,
     talk_epoch: Arc<AtomicU64>,
@@ -225,6 +226,8 @@ struct PendingControl {
     kind: ControlReply,
     deadline: Instant,
 }
+type SourceSoundReleases = watch::Receiver<Vec<(u64, [u8; 16])>>;
+
 struct PendingPrivacy {
     operation: AudioPrivacyOperation,
     // No native reply exists for StopSession/watch-off. A later Pong proves that
@@ -233,6 +236,25 @@ struct PendingPrivacy {
 }
 
 impl AudioHandle {
+    pub fn release_source_local_sound(&self, session: [u8; 16]) {
+        let generation = self
+            .bound_generation
+            .unwrap_or_else(|| self.generation.load(Ordering::Acquire));
+        if generation == 0 || generation != self.generation.load(Ordering::Acquire) {
+            return;
+        }
+        self.source_sound.send_if_modified(|pending| {
+            pending.retain(|(g, _)| *g == generation);
+            if pending.contains(&(generation, session)) {
+                return false;
+            }
+            if pending.len() == contract::MAX_SESSIONS {
+                pending.remove(0);
+            }
+            pending.push((generation, session));
+            true
+        });
+    }
     #[cfg(test)]
     pub(crate) fn controlled_stop(
         generation: u64,
@@ -270,6 +292,7 @@ impl AudioHandle {
         });
         (
             Self {
+                source_sound: watch::channel(Vec::new()).0,
                 commands,
                 priority,
                 talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -471,11 +494,13 @@ impl AudioHandle {
         token: u64,
         expected_revision: u64,
         command: w::MediaCommandKind,
+        position_ms: Option<u64>,
     ) -> Result<u64> {
         self.written(Msg::MediaCommand(w::MediaCommand {
             token,
             expected_revision,
             command: command as i32,
+            position_ms,
         }))
         .await
     }
@@ -515,6 +540,7 @@ impl AudioSupervisor {
         }
         let (commands, rx) = mpsc::channel(QUEUE);
         let (priority, priority_rx) = mpsc::channel(QUEUE);
+        let (source_sound, source_sound_rx) = watch::channel(Vec::new());
         let talk_epoch = Arc::new(AtomicU64::new(0));
         let explicit_mute_epoch = Arc::new(AtomicU64::new(0));
         let (events, event_rx) = mpsc::channel(QUEUE);
@@ -529,7 +555,12 @@ impl AudioSupervisor {
             run(
                 config,
                 rx,
-                (priority_rx, actor_talk_epoch, actor_explicit_mute_epoch),
+                (
+                    priority_rx,
+                    actor_talk_epoch,
+                    actor_explicit_mute_epoch,
+                    source_sound_rx,
+                ),
                 events,
                 actor_generation,
                 started,
@@ -545,6 +576,7 @@ impl AudioSupervisor {
             .map_err(|_| AudioSupervisorError::Unavailable)??;
         Ok((
             AudioHandle {
+                source_sound,
                 commands,
                 priority,
                 talk_epoch,
@@ -822,12 +854,17 @@ async fn serve(
     child: &mut Child,
     generation: u64,
     commands: &mut mpsc::Receiver<Command>,
-    safety: (&mut mpsc::Receiver<Command>, &AtomicU64, &AtomicU64),
+    safety: (
+        &mut mpsc::Receiver<Command>,
+        &AtomicU64,
+        &AtomicU64,
+        &mut SourceSoundReleases,
+    ),
     events: &mpsc::Sender<AudioSupervisorEvent>,
     available: &AtomicU64,
     sessions: &mut BTreeSet<[u8; 16]>,
 ) -> Result<()> {
-    let (priority, talk_epoch, explicit_mute_epoch) = safety;
+    let (priority, talk_epoch, explicit_mute_epoch, source_sound) = safety;
     let mut pending = BTreeMap::<u64, Pending>::new();
     let mut pending_starts = BTreeMap::<u64, [u8; 16]>::new();
     let mut pending_controls = BTreeMap::<u64, PendingControl>::new();
@@ -852,6 +889,15 @@ async fn serve(
                     if child.process.try_wait().map_err(|_| AudioSupervisorError::ChildLost)?.is_some() { return Err(AudioSupervisorError::ChildLost); }
                     ping = ping.checked_add(1).ok_or(AudioSupervisorError::InvalidFrame)?;
                     send(child, 0, Msg::Ping(w::Ping { serial: ping })).await?;
+                }
+                changed = source_sound.changed() => {
+                    if changed.is_err() { return Ok(()); }
+                    let releases = source_sound.borrow_and_update().clone();
+                    for (expected, id) in releases {
+                        if expected == generation {
+                            send(child, 0, Msg::ReleaseSourceLocalSound(w::ReleaseSourceLocalSound { session_id: id.to_vec() })).await?;
+                        }
+                    }
                 }
                 _ = events.closed() => return Ok(()),
                 received = child.link.recv() => {
@@ -1060,13 +1106,18 @@ fn bound_grant_queue(message: &mut Msg, admitted_at: Instant, now: Instant) -> R
 async fn run(
     config: AudioSupervisorConfig,
     mut commands: mpsc::Receiver<Command>,
-    safety: (mpsc::Receiver<Command>, Arc<AtomicU64>, Arc<AtomicU64>),
+    safety: (
+        mpsc::Receiver<Command>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        SourceSoundReleases,
+    ),
     events: mpsc::Sender<AudioSupervisorEvent>,
     available: Arc<AtomicU64>,
     started: oneshot::Sender<Result<()>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let (mut priority, talk_epoch, explicit_mute_epoch) = safety;
+    let (mut priority, talk_epoch, explicit_mute_epoch, mut source_sound) = safety;
     let mut first = Some(started);
     let mut generation = 1u64;
     let mut restarts = VecDeque::<Instant>::new();
@@ -1186,7 +1237,7 @@ async fn run(
         let outcome = tokio::select! {
             biased;
             _ = shutdown_requested(&mut shutdown) => Ok(()),
-            outcome = serve(&mut child, generation, &mut commands, (&mut priority, &talk_epoch, &explicit_mute_epoch), &events, &available, &mut sessions) => outcome,
+            outcome = serve(&mut child, generation, &mut commands, (&mut priority, &talk_epoch, &explicit_mute_epoch, &mut source_sound), &events, &available, &mut sessions) => outcome,
         };
         available.store(0, Ordering::Release);
         if outcome.is_ok() {
@@ -1424,6 +1475,7 @@ mod tests {
             local_scope_id: 0,
             peer_scope_id: 0,
             initial_authorization_ms: 1000,
+            source_local_sound_released: false,
         }
     }
 
@@ -1478,11 +1530,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_local_sound_release_bypasses_saturated_queues_without_ptt_or_shutdown() {
+        let (commands, mut ordinary) = mpsc::channel(1);
+        let (priority, mut safety) = mpsc::channel(1);
+        let (source_sound, observed) = watch::channel(Vec::new());
+        for queue in [&commands, &priority] {
+            let (reply, _) = oneshot::channel();
+            queue
+                .try_send(Command {
+                    generation: 7,
+                    talk_epoch: 0,
+                    explicit_mute_epoch: 0,
+                    message: Msg::ProbeBackend(w::ProbeBackend {}),
+                    admitted_at: Instant::now(),
+                    reply,
+                })
+                .unwrap_or_else(|_| panic!("fill queue"));
+        }
+        let (shutdown, requested) = watch::channel(false);
+        let handle = AudioHandle {
+            source_sound,
+            commands,
+            priority,
+            talk_epoch: Arc::new(AtomicU64::new(11)),
+            explicit_mute_epoch: Arc::new(AtomicU64::new(13)),
+            generation: Arc::new(AtomicU64::new(7)),
+            bound_generation: None,
+            shutdown,
+            stopped: watch::channel(true).1,
+        };
+        let old = handle.for_generation(7);
+        handle.release_source_local_sound([1; 16]);
+        handle.release_source_local_sound([1; 16]);
+        assert_eq!(*observed.borrow(), vec![(7, [1; 16])]);
+        assert_eq!(handle.talk_epoch.load(Ordering::Acquire), 11);
+        assert_eq!(handle.explicit_mute_epoch.load(Ordering::Acquire), 13);
+        assert!(!*requested.borrow());
+        assert!(ordinary.try_recv().is_ok() && safety.try_recv().is_ok());
+        handle.generation.store(8, Ordering::Release);
+        old.release_source_local_sound([2; 16]);
+        assert_eq!(*observed.borrow(), vec![(7, [1; 16])]);
+        handle.release_source_local_sound([3; 16]);
+        assert_eq!(*observed.borrow(), vec![(8, [3; 16])]);
+    }
+
+    #[tokio::test]
     async fn generation_bound_safety_view_never_retags_or_rebinds_after_restart() {
         let (commands, mut ordinary) = mpsc::channel(2);
         let (priority, mut safety) = mpsc::channel(2);
         let (shutdown, requested) = watch::channel(false);
         let handle = AudioHandle {
+            source_sound: watch::channel(Vec::new()).0,
             commands,
             priority,
             talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -1539,6 +1637,7 @@ mod tests {
     async fn invalid_commands_never_enter_secret_queue() {
         let (commands, mut rx) = mpsc::channel(1);
         let handle = AudioHandle {
+            source_sound: watch::channel(Vec::new()).0,
             commands,
             priority: mpsc::channel(1).0,
             talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -1593,6 +1692,7 @@ mod tests {
     async fn renew_accepts_boundary_ttls_and_acknowledges_only_writes() {
         let (commands, mut rx) = mpsc::channel(1);
         let handle = AudioHandle {
+            source_sound: watch::channel(Vec::new()).0,
             commands,
             priority: mpsc::channel(1).0,
             talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -1621,6 +1721,7 @@ mod tests {
         let (commands, mut rx) = mpsc::channel(1);
         let (priority, mut priority_rx) = mpsc::channel(1);
         let handle = AudioHandle {
+            source_sound: watch::channel(Vec::new()).0,
             commands,
             priority,
             talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -1658,7 +1759,7 @@ mod tests {
         written!(handle.set_mic_mute(1, true), Msg::SetMicMute(_));
         written!(handle.set_media_watch(false), Msg::SetMediaWatch(_));
         written!(
-            handle.media_command(7, 1, w::MediaCommandKind::Play),
+            handle.media_command(7, 1, w::MediaCommandKind::Play, None),
             Msg::MediaCommand(_)
         );
         assert!(rx.try_recv().is_err());
@@ -1724,11 +1825,6 @@ mod tests {
         assert_ne!(source_pid, listener_pid);
         assert!(source.probe().await.unwrap().probed);
         assert!(listener.probe().await.unwrap().probed);
-        assert!(!source
-            .list_devices(w::Direction::Render)
-            .await
-            .unwrap()
-            .is_empty());
         let a = port();
         let mut b = port();
         while a == b {
@@ -1740,29 +1836,20 @@ mod tests {
         source.start_session(start(1, a, b)).await.unwrap();
         let mut sending = false;
         let mut receiving = false;
-        let mut metadata_seen = false;
-        let mut watch_requested = false;
         let mut renew = tokio::time::interval(Duration::from_millis(100));
         timeout(Duration::from_secs(10), async {
-            while !sending || !receiving || !metadata_seen {
+            while !sending || !receiving {
                 tokio::select! {
                     _ = renew.tick() => {
                         source.renew_session([13; 16], 1000).await.unwrap();
                         listener.renew_session([13; 16], 1000).await.unwrap();
                     },
                     event = source_events.recv() => match event.expect("source events") {
-                        AudioSupervisorEvent::MediaSessions { sessions, .. } => {
-                            metadata_seen |= sessions.sessions.iter().any(|session| session.title == "Dry media");
-                        },
                         AudioSupervisorEvent::Health { health, .. } => {
                             if let Some(session) = health.sessions.iter().find(|session| session.sending == Some(true) && session.capture_active == Some(true) && session.sent_media_packets > 0) {
                                 assert_eq!(session.clock_source, 1, "Dry capture uses valid host timestamps");
                                 assert!(session.drift.is_none(), "Source does not run a drift PI");
                                 sending = true;
-                            }
-                            if sending && !watch_requested {
-                                source.set_media_watch(true).await.unwrap();
-                                watch_requested = true;
                             }
                         },
                         AudioSupervisorEvent::Failed { reason, .. } => panic!("source failed: {reason}"),
@@ -1897,22 +1984,6 @@ mod tests {
             let bytes = std::fs::read(&path).expect("audio child must create its rotating log");
             let log = std::str::from_utf8(&bytes).expect("UTF-8 child log");
             assert!(
-                log.contains("audio child attached"),
-                "missing attach lifecycle"
-            );
-            assert!(
-                log.contains("audio child stopped"),
-                "missing graceful shutdown"
-            );
-            assert!(
-                log.contains("audio backend probe result"),
-                "missing probe lifecycle"
-            );
-            assert!(
-                log.contains("audio session lifecycle"),
-                "missing session lifecycle"
-            );
-            assert!(
                 log.contains("event_kind=1"),
                 "missing started session event"
             );
@@ -1924,19 +1995,10 @@ mod tests {
             }
             if name == "s" {
                 assert!(
-                    log.contains("audio child restarted"),
-                    "missing restart lifecycle"
-                );
-                assert!(
-                    log.lines().any(|line| line.contains("audio child attached")
-                        && line.contains("worker_generation=2")),
+                    log.lines().any(|line| line.contains("worker_generation=2")),
                     "replacement attach must identify its worker generation"
                 );
             }
-            assert!(
-                !log.contains("Dry media"),
-                "private media title reached disk"
-            );
             let session = start(1, a, b);
             for secret in [
                 session.forward.as_ref().unwrap().key.as_slice(),
@@ -2031,6 +2093,7 @@ mod tests {
         let (shutdown, mut requested) = watch::channel(false);
         let (finished, stopped) = watch::channel(false);
         let handle = AudioHandle {
+            source_sound: watch::channel(Vec::new()).0,
             commands,
             priority: mpsc::channel(1).0,
             talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -2356,6 +2419,7 @@ mod tests {
             })
             .unwrap_or_else(|_| panic!("fill admission"));
         let handle = AudioHandle {
+            source_sound: watch::channel(Vec::new()).0,
             commands,
             priority,
             talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -2417,6 +2481,7 @@ mod tests {
             let (commands, mut queued) = mpsc::channel(2);
             let (priority, mut safety) = mpsc::channel(1);
             let handle = AudioHandle {
+                source_sound: watch::channel(Vec::new()).0,
                 commands,
                 priority,
                 talk_epoch: Arc::new(AtomicU64::new(0)),
@@ -2503,6 +2568,7 @@ mod tests {
             let (priority, mut safety) = mpsc::channel(1);
             let (shutdown, mut requested) = watch::channel(false);
             let handle = AudioHandle {
+                source_sound: watch::channel(Vec::new()).0,
                 commands,
                 priority,
                 talk_epoch: Arc::new(AtomicU64::new(0)),

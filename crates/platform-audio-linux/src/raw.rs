@@ -106,6 +106,11 @@ fn local_server(server: &str) -> Result<PathBuf, BackendError> {
     }
     Ok(PathBuf::from(path))
 }
+pub(crate) fn object_serial(props: &p::Props) -> Option<u64> {
+    let bytes = props.get_bytes(c"object.serial")?.strip_suffix(&[0])?;
+    let serial = std::str::from_utf8(bytes).ok()?.parse::<u64>().ok()?;
+    (serial != 0).then_some(serial)
+}
 pub(crate) fn client_error(error: pulseaudio::ClientError) -> BackendError {
     match error {
         pulseaudio::ClientError::ServerError(p::PulseError::NoEntity) => BackendError::DeviceGone,

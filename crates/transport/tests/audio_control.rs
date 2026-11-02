@@ -907,6 +907,7 @@ fn mic_media_bodies(cap: i32) -> Vec<wire::AudioControl> {
                 token: 1,
                 revision: 1,
                 command: wire::MediaCommandKind::PlayPause as i32,
+                position_ms: None,
             }),
             Body::MediaAck(wire::MediaAck {
                 request_id: vec![2; 16],

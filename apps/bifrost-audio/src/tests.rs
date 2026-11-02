@@ -284,6 +284,7 @@ mod local {
             local_scope_id: 0,
             peer_scope_id: 0,
             initial_authorization_ms: 1000,
+            source_local_sound_released: false,
         }
     }
     async fn renew(core: &mut AudioLink<transport::ClientStream>, id: u8, ttl_ms: u32) {

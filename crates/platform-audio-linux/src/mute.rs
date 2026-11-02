@@ -1,5 +1,6 @@
 use crate::{
     backend::{lock, Entry, Key, State},
+    effective::EffectiveMonitor,
     raw::{self, Config, Connection, Raw},
 };
 use audio_backend::{BackendError, MuteGuard, MuteSnapshot};
@@ -7,6 +8,7 @@ use pulseaudio::{protocol as p, Client};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, Weak},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -48,6 +50,17 @@ impl Ownership {
 
 #[derive(Default)]
 pub(crate) struct MuteWatches(Mutex<BTreeMap<u32, Weak<Mutex<Ownership>>>>);
+/// Render and microphone indices are distinct native namespaces.
+#[derive(Default)]
+pub(crate) struct RenderMuteWatches(MuteWatches);
+impl RenderMuteWatches {
+    pub(crate) fn invalidate_all(&self) {
+        self.0.invalidate_all();
+    }
+    pub(crate) fn observe(&self, event: p::SubscriptionEvent, client: &Client) {
+        self.0.observe_endpoint(event, client, true);
+    }
+}
 impl MuteWatches {
     fn reserve(&self, index: u32, generation: u64) -> Result<Arc<Mutex<Ownership>>, BackendError> {
         let mut watches = lock(&self.0);
@@ -69,7 +82,20 @@ impl MuteWatches {
         event: p::SubscriptionEvent,
         client: &Client,
     ) -> Option<(u32, bool)> {
-        if event.event_facility != p::SubscriptionEventFacility::Source {
+        self.observe_endpoint(event, client, false)
+    }
+    fn observe_endpoint(
+        &self,
+        event: p::SubscriptionEvent,
+        client: &Client,
+        render: bool,
+    ) -> Option<(u32, bool)> {
+        let facility = if render {
+            p::SubscriptionEventFacility::Sink
+        } else {
+            p::SubscriptionEventFacility::Source
+        };
+        if event.event_facility != facility {
             return None;
         }
         let Some(index) = event.index else {
@@ -82,39 +108,44 @@ impl MuteWatches {
             let mut ownership = lock(watch);
             // A late same-value change is external too, even before the query completes.
             if event.event_type != p::SubscriptionEventType::Changed
-                || ownership
-                    .last_write
-                    .is_none_or(|(_, when)| at.duration_since(when) > ECHO_WINDOW)
+                || !render
+                    && ownership
+                        .last_write
+                        .is_none_or(|(_, when)| at.duration_since(when) > ECHO_WINDOW)
             {
                 ownership.owned = false;
             }
-            ownership.checking = true;
+            ownership.checking = !render;
             (ownership.generation, ownership.serial)
         });
         // Never hold a watch/catalog lock while calling Client or waiting for its reactor.
         let info = if event.event_type == p::SubscriptionEventType::Changed {
-            raw::wait(client.source_info(index))
+            if render {
+                raw::wait(client.sink_info(index)).map(|info| (info.index, info.muted))
+            } else {
+                raw::wait(client.source_info(index)).map(|info| (info.index, info.muted))
+            }
         } else {
             Err(BackendError::DeviceGone)
         };
         if let (Some(watch), Some((generation, serial))) = (watch, pending) {
             let mut ownership = lock(&watch);
             ownership.checking = false;
-            if ownership.serial != serial {
+            if render && event.event_type == p::SubscriptionEventType::Changed {
+                // Render silence owns mute, not volume. The render observer reasserts it.
+            } else if ownership.serial != serial {
                 // A write raced this query; the old event cannot prove the new write.
                 ownership.owned = false;
             } else {
                 match &info {
-                    Ok(info) if info.index == index => {
-                        ownership.observe(generation, info.muted, at)
+                    Ok((actual, muted)) if *actual == index => {
+                        ownership.observe(generation, *muted, at)
                     }
                     _ => ownership.owned = false,
                 }
             }
         }
-        info.ok()
-            .filter(|info| info.index == index)
-            .map(|info| (index, info.muted))
+        info.ok().filter(|(actual, _)| *actual == index)
     }
 }
 
@@ -131,6 +162,8 @@ pub struct LinuxMuteGuard {
     raw: Raw,
     ownership: Option<Arc<Mutex<Ownership>>>,
     original: bool,
+    render: bool,
+    restore_write_attempted: bool,
 }
 impl LinuxMuteGuard {
     /// Current local ownership belief, not a stronger native atomic ownership guarantee.
@@ -143,9 +176,25 @@ impl LinuxMuteGuard {
         key: Key,
         entry: Entry,
     ) -> Result<Self, BackendError> {
+        Self::acquire_endpoint(config, state, key, entry, false)
+    }
+    fn acquire_endpoint(
+        config: Arc<Config>,
+        state: Arc<State>,
+        key: Key,
+        entry: Entry,
+        render: bool,
+    ) -> Result<Self, BackendError> {
         let connection = config.client()?;
         let raw = config.raw()?;
-        let ownership = state.mutes.reserve(entry.index, entry.generation)?;
+        let ownership = if render {
+            state
+                .render_mutes
+                .0
+                .reserve(entry.index, entry.generation)?
+        } else {
+            state.mutes.reserve(entry.index, entry.generation)?
+        };
         let mut guard = Self {
             state,
             key,
@@ -154,6 +203,8 @@ impl LinuxMuteGuard {
             raw,
             ownership: Some(ownership),
             original: false,
+            render,
+            restore_write_attempted: false,
         };
         match guard.read() {
             Ok(snapshot) if guard.owned() => {
@@ -179,27 +230,44 @@ impl LinuxMuteGuard {
         if !self.state.valid(&self.key, self.entry.generation) {
             return Err(BackendError::DeviceGone);
         }
-        let info = raw::wait(
-            self.connection
-                .client
-                .source_info_by_name(raw::name(self.entry.device.id.as_str())?),
-        )?;
-        if info.index != self.entry.index || !self.state.valid(&self.key, self.entry.generation) {
+        let (index, muted) = if self.render {
+            let info = raw::wait(
+                self.connection
+                    .client
+                    .sink_info_by_name(raw::name(self.entry.device.id.as_str())?),
+            )?;
+            if raw::object_serial(&info.props) != self.entry.serial {
+                return Err(BackendError::DeviceGone);
+            }
+            (info.index, info.muted)
+        } else {
+            let info = raw::wait(
+                self.connection
+                    .client
+                    .source_info_by_name(raw::name(self.entry.device.id.as_str())?),
+            )?;
+            (info.index, info.muted)
+        };
+        if index != self.entry.index || !self.state.valid(&self.key, self.entry.generation) {
             return Err(BackendError::DeviceGone);
         }
         Ok(MuteSnapshot {
             endpoint: self.entry.device.id.clone(),
             generation: self.entry.generation,
-            muted: info.muted,
+            muted,
         })
     }
     fn write(&mut self, muted: bool) -> Result<(), BackendError> {
-        self.raw
-            .ack(p::Command::SetSourceMute(p::SetDeviceMuteParams {
-                device_index: Some(self.entry.index),
-                device_name: None,
-                mute: muted,
-            }))
+        let params = p::SetDeviceMuteParams {
+            device_index: Some(self.entry.index),
+            device_name: None,
+            mute: muted,
+        };
+        self.raw.ack(if self.render {
+            p::Command::SetSinkMute(params)
+        } else {
+            p::Command::SetSourceMute(params)
+        })
     }
 }
 impl MuteGuard for LinuxMuteGuard {
@@ -210,12 +278,14 @@ impl MuteGuard for LinuxMuteGuard {
         let snapshot = self.read();
         if let Some(watch) = &self.ownership {
             let mut ownership = lock(watch);
-            if !snapshot.as_ref().is_ok_and(|snapshot| {
-                ownership
-                    .last_write
-                    .map_or(self.original, |(written, _)| written)
-                    == snapshot.muted
-            }) {
+            if !self.render
+                && !snapshot.as_ref().is_ok_and(|snapshot| {
+                    ownership
+                        .last_write
+                        .map_or(self.original, |(written, _)| written)
+                        == snapshot.muted
+                })
+            {
                 ownership.owned = false;
             }
         }
@@ -225,6 +295,20 @@ impl MuteGuard for LinuxMuteGuard {
         &mut self,
         expected_generation: u64,
         muted: bool,
+    ) -> Result<(), BackendError> {
+        self.set_admitted(expected_generation, muted, &|| true, None)
+    }
+    fn restore(&mut self) -> Result<(), BackendError> {
+        self.restore_owned()
+    }
+}
+impl LinuxMuteGuard {
+    fn set_admitted(
+        &mut self,
+        expected_generation: u64,
+        muted: bool,
+        admitted: &dyn Fn() -> bool,
+        effective: Option<&mut EffectiveMonitor>,
     ) -> Result<(), BackendError> {
         let watch = self
             .ownership
@@ -242,6 +326,13 @@ impl MuteGuard for LinuxMuteGuard {
                 return Err(error);
             }
         };
+        if let Some(effective) = effective {
+            effective.fresh_false(admitted)?;
+        }
+        if !self.state.valid(&self.key, self.entry.generation) {
+            lock(&watch).owned = false;
+            return Err(BackendError::DeviceGone);
+        }
         {
             let mut ownership = lock(&watch);
             if !ownership.owned || ownership.checking {
@@ -250,13 +341,25 @@ impl MuteGuard for LinuxMuteGuard {
             }
             // No native write means no echo to attribute, and no new restoration responsibility.
             if snapshot.muted == muted {
-                return Ok(());
+                drop(ownership);
+                return if admitted() {
+                    Ok(())
+                } else {
+                    Err(BackendError::PermissionDenied)
+                };
             }
             ownership.serial += 1;
             ownership.last_write = Some((muted, Instant::now()));
             ownership.echo_seen = false;
         }
         // The watcher can process the echo before this acknowledgement without lock inversion.
+        // No blocking query or ownership lock after this final Source admission.
+        if !admitted() {
+            if !self.render {
+                lock(&watch).owned = false;
+            }
+            return Err(BackendError::PermissionDenied);
+        }
         if let Err(error) = self.write(muted) {
             lock(&watch).owned = false;
             return Err(error);
@@ -266,7 +369,7 @@ impl MuteGuard for LinuxMuteGuard {
         }
         Ok(())
     }
-    fn restore(&mut self) -> Result<(), BackendError> {
+    fn restore_owned(&mut self) -> Result<(), BackendError> {
         let Some(watch) = self.ownership.take() else {
             return Ok(());
         };
@@ -276,19 +379,26 @@ impl MuteGuard for LinuxMuteGuard {
             let mut ownership = lock(&watch);
             let valid = ownership.owned
                 && !ownership.checking
-                && (ownership.last_write.is_none() || ownership.echo_seen);
+                && (self.render || ownership.last_write.is_none() || ownership.echo_seen);
             ownership.owned = false;
             if !valid {
                 return Err(BackendError::OwnershipLost);
             }
             let snapshot = snapshot?;
-            match ownership.last_write {
-                Some((written, _)) if written == snapshot.muted => snapshot.muted != self.original,
-                Some(_) => return Err(BackendError::OwnershipLost),
-                None => false,
+            if self.render {
+                snapshot.muted != self.original
+            } else {
+                match ownership.last_write {
+                    Some((written, _)) if written == snapshot.muted => {
+                        snapshot.muted != self.original
+                    }
+                    Some(_) => return Err(BackendError::OwnershipLost),
+                    None => false,
+                }
             }
         };
         if restore {
+            self.restore_write_attempted = true;
             self.write(self.original)?;
         }
         Ok(())
@@ -297,6 +407,131 @@ impl MuteGuard for LinuxMuteGuard {
 impl Drop for LinuxMuteGuard {
     fn drop(&mut self) {
         let _ = self.restore();
+    }
+}
+
+/// Source-only render mute, separate from microphone/PTT ownership.
+pub(crate) struct LinuxRenderGuard {
+    mute: LinuxMuteGuard,
+    effective: EffectiveMonitor,
+}
+impl LinuxRenderGuard {
+    pub(crate) fn acquire(
+        config: Arc<Config>,
+        state: Arc<State>,
+        key: Key,
+        entry: Entry,
+        admitted: &dyn Fn() -> bool,
+    ) -> Result<Self, BackendError> {
+        let serial = entry.serial.ok_or(BackendError::Unsupported)?;
+        let mut effective = EffectiveMonitor::connect(entry.device.id.as_str(), serial)?;
+        let generation = entry.generation;
+        let mut mute = LinuxMuteGuard::acquire_endpoint(config, state, key, entry, true)?;
+        mute.set_admitted(generation, true, admitted, Some(&mut effective))?;
+        Ok(Self { mute, effective })
+    }
+    fn check_policy(&mut self, running: &dyn Fn() -> bool) -> Result<(), BackendError> {
+        // Volume is never written: reassert only mute on the pinned sink while admitted.
+        if !self
+            .mute
+            .state
+            .valid(&self.mute.key, self.mute.entry.generation)
+        {
+            Err(BackendError::DeviceGone)
+        } else {
+            self.effective.check(running)?;
+            self.mute
+                .set_admitted(self.mute.entry.generation, true, running, None)
+        }
+    }
+    pub(crate) fn restore(&mut self) {
+        if let Err(error) = self.mute.restore_owned() {
+            // Restoration uncertainty is not a native callback-stop failure: do not
+            // turn a normal Source OFF/manual override into global P4 revocation.
+            tracing::warn!(
+                ?error,
+                write_attempted = self.mute.restore_write_attempted,
+                "Source local playback restoration forfeited or failed (best effort)"
+            );
+        }
+    }
+}
+impl Drop for LinuxRenderGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// One render-control I/O thread holds mute and handles explicit release.
+/// Snapshots read cached Signals only; native stop joins before final restoration.
+pub(crate) struct LinuxRenderObserver {
+    ownership: Arc<Mutex<Ownership>>,
+    worker: Option<JoinHandle<LinuxRenderGuard>>,
+}
+impl LinuxRenderObserver {
+    pub(crate) fn start(
+        mut guard: LinuxRenderGuard,
+        signals: Arc<crate::stream::Signals>,
+        admitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Self, BackendError> {
+        let ownership = guard
+            .mute
+            .ownership
+            .as_ref()
+            .ok_or(BackendError::Stopped)?
+            .clone();
+        let worker = thread::Builder::new()
+            .name("bfa-render-observe".into())
+            .spawn(move || {
+                let mut released = false;
+                while signals.is_running() {
+                    if !admitted() && !released {
+                        guard.restore();
+                        released = true;
+                    }
+                    if !released {
+                        if let Err(error) =
+                            guard.check_policy(&|| signals.is_running() && admitted())
+                        {
+                            if error != BackendError::Stopped && admitted() {
+                                tracing::warn!(
+                                    ?error,
+                                    "Source monitor policy or identity invalidated"
+                                );
+                                signals.fail();
+                            }
+                            if !admitted() {
+                                guard.restore();
+                                released = true;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    thread::park_timeout(Duration::from_millis(25));
+                }
+                guard
+            })
+            .map_err(|_| BackendError::ServerUnavailable)?;
+        Ok(Self {
+            ownership,
+            worker: Some(worker),
+        })
+    }
+    pub(crate) fn owns_mute(&self) -> bool {
+        let ownership = lock(&self.ownership);
+        ownership.owned && !ownership.checking
+    }
+    pub(crate) fn unexpectedly_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+    pub(crate) fn restore(&mut self) -> Result<(), BackendError> {
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let mut guard = worker.join().map_err(|_| BackendError::ServerUnavailable)?;
+            guard.restore();
+        }
+        Ok(())
     }
 }
 

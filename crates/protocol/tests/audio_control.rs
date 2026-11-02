@@ -740,6 +740,7 @@ fn microphone_and_media_append_only_tags_and_roundtrip() {
                 token: 1,
                 revision: 1,
                 command: wire::MediaCommandKind::Play as i32,
+                position_ms: None,
             }),
         ),
         (
@@ -912,6 +913,9 @@ fn media_metadata_bounds_clear_shape_and_nested_debug_are_private() {
         playback: wire::MediaPlayback::Playing as i32,
         commands: 31,
         allow_control: false,
+        can_seek: None,
+        seek_min_ms: None,
+        seek_max_ms: None,
     };
     assert_eq!(
         audio_control(&control(Body::MediaInfo(info.clone()))),
@@ -1048,6 +1052,7 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
             token: 1,
             revision: 1,
             command: 1,
+            position_ms: None,
         }),
         Body::MediaCommand(wire::MediaCommand {
             request_id: vec![1; 15],
@@ -1055,6 +1060,7 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
             token: 1,
             revision: 1,
             command: 1,
+            position_ms: None,
         }),
         Body::MediaCommand(wire::MediaCommand {
             request_id: vec![1; 16],
@@ -1062,6 +1068,7 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
             token: 0,
             revision: 1,
             command: 1,
+            position_ms: None,
         }),
         Body::MediaCommand(wire::MediaCommand {
             request_id: vec![1; 16],
@@ -1069,6 +1076,7 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
             token: 1,
             revision: 0,
             command: 1,
+            position_ms: None,
         }),
         Body::MediaCommand(wire::MediaCommand {
             request_id: vec![1; 16],
@@ -1076,6 +1084,7 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
             token: 1,
             revision: 1,
             command: 0,
+            position_ms: None,
         }),
         Body::MediaCommand(wire::MediaCommand {
             request_id: vec![1; 16],
@@ -1083,6 +1092,7 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
             token: 1,
             revision: 1,
             command: 99,
+            position_ms: None,
         }),
         Body::MediaAck(wire::MediaAck {
             request_id: vec![1; 16],
@@ -1125,6 +1135,7 @@ fn control_identifiers_results_and_media_command_enums_are_strict() {
                 token: 1,
                 revision: 1,
                 command,
+                position_ms: None,
             }))),
             Ok(())
         );
@@ -1149,4 +1160,101 @@ fn group_mismatch_is_a_typed_refusal_and_stop() {
         }))),
         Ok(())
     );
+}
+
+#[test]
+fn seek_payload_and_range_admission() {
+    let mut command = wire::MediaCommand {
+        request_id: vec![1; 16],
+        session_id: vec![2; 16],
+        token: 3,
+        revision: 4,
+        command: wire::MediaCommandKind::Seek as i32,
+        position_ms: Some(0),
+    };
+    assert!(audio_control(&control(Body::MediaCommand(command.clone()))).is_ok());
+    command.position_ms = None;
+    assert_eq!(
+        audio_control(&control(Body::MediaCommand(command.clone()))),
+        Err(AudioViolation::Shape)
+    );
+    command.position_ms = Some(0);
+    command.command = wire::MediaCommandKind::Play as i32;
+    assert_eq!(
+        audio_control(&control(Body::MediaCommand(command))),
+        Err(AudioViolation::Shape)
+    );
+    let mut info = wire::MediaInfo {
+        session_id: vec![2; 16],
+        present: true,
+        token: 3,
+        revision: 4,
+        position_ms: Some(20),
+        duration_ms: Some(100),
+        can_seek: Some(true),
+        seek_min_ms: Some(0),
+        seek_max_ms: Some(100),
+        ..Default::default()
+    };
+    assert!(audio_control(&control(Body::MediaInfo(info.clone()))).is_ok());
+    for (duration, min, max, position, enabled) in [
+        (Some(0), Some(0), Some(0), Some(0), Some(true)),
+        (Some(100), Some(90), Some(80), Some(20), Some(true)),
+        (Some(100), Some(0), Some(101), Some(20), Some(true)),
+        (Some(100), None, Some(100), Some(20), Some(true)),
+        (Some(100), Some(0), Some(100), None, Some(true)),
+        (Some(100), Some(0), Some(100), Some(20), Some(false)),
+    ] {
+        info.duration_ms = duration;
+        info.seek_min_ms = min;
+        info.seek_max_ms = max;
+        info.position_ms = position;
+        info.can_seek = enabled;
+        assert_eq!(
+            audio_control(&control(Body::MediaInfo(info.clone()))),
+            Err(AudioViolation::Metadata)
+        );
+    }
+}
+
+#[test]
+fn legacy_media_decoder_ignores_append_only_seek_fields() {
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyCommand {
+        #[prost(bytes = "vec", tag = "1")]
+        request_id: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        session_id: Vec<u8>,
+        #[prost(uint64, tag = "3")]
+        token: u64,
+        #[prost(uint64, tag = "4")]
+        revision: u64,
+        #[prost(int32, tag = "5")]
+        command: i32,
+    }
+    let current = wire::MediaCommand {
+        request_id: vec![1; 16],
+        session_id: vec![2; 16],
+        token: 3,
+        revision: 4,
+        command: wire::MediaCommandKind::Seek as i32,
+        position_ms: Some(0),
+    };
+    let bytes = current.encode_to_vec();
+    let legacy = LegacyCommand::decode(bytes.as_slice()).unwrap();
+    assert_eq!(legacy.token, 3);
+    assert_eq!(legacy.command, 6);
+    assert_eq!(
+        wire::MediaCommand::decode(bytes.as_slice())
+            .unwrap()
+            .position_ms,
+        Some(0)
+    );
+    let legacy = LegacyCommand {
+        command: 1,
+        ..legacy
+    };
+    let decoded = wire::MediaCommand::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.position_ms, None);
+    assert!(audio_control(&control(Body::MediaCommand(decoded))).is_ok());
 }

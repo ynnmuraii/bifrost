@@ -1,8 +1,8 @@
 use crate::{
-    mute::{LinuxMuteGuard, MuteWatches},
+    mute::{LinuxMuteGuard, MuteWatches, RenderMuteWatches},
     ptt::PortalPtt,
     raw::{self, Config, Connection},
-    stream::{LinuxStream, Signals},
+    stream::{LinuxStream, Signals, StreamTarget},
 };
 use audio_backend::*;
 use pulseaudio::{protocol as p, Client};
@@ -38,6 +38,7 @@ pub(crate) struct Entry {
     pub generation: u64,
     pub(crate) index: u32,
     pub monitor: Option<String>,
+    pub serial: Option<u64>,
 }
 pub(crate) type Key = (bool, String);
 #[derive(Default)]
@@ -54,6 +55,7 @@ pub(crate) struct State {
     pub alive: AtomicBool,
     pub clock: Instant,
     pub(crate) mutes: MuteWatches,
+    pub(crate) render_mutes: RenderMuteWatches,
 }
 pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
@@ -67,6 +69,7 @@ impl State {
             alive: AtomicBool::new(true),
             clock: Instant::now(),
             mutes: MuteWatches::default(),
+            render_mutes: RenderMuteWatches::default(),
         }
     }
     fn emit(catalog: &mut Catalog, event: Event) {
@@ -102,6 +105,7 @@ impl State {
     pub fn invalidate_all(&self) {
         self.alive.store(false, Ordering::Release);
         self.mutes.invalidate_all();
+        self.render_mutes.invalidate_all();
         let mut catalog = lock(&self.catalog);
         for (_, _, stream) in &catalog.streams {
             if let Some(signals) = stream.upgrade() {
@@ -170,11 +174,11 @@ impl State {
     fn replace(&self, mut entries: BTreeMap<Key, Entry>, defaults: Defaults, notify: bool) {
         let mut catalog = lock(&self.catalog);
         for (key, entry) in &mut entries {
-            if let Some(old) = catalog
-                .entries
-                .get(key)
-                .filter(|old| old.index == entry.index && old.device.format == entry.device.format)
-            {
+            if let Some(old) = catalog.entries.get(key).filter(|old| {
+                old.index == entry.index
+                    && old.device.format == entry.device.format
+                    && old.serial == entry.serial
+            }) {
                 entry.generation = old.generation;
             } else {
                 catalog.next_generation += 1;
@@ -277,6 +281,7 @@ impl LinuxBackend {
                     }
                     // Queries run on this control thread, never under the catalog/reactor lock.
                     let mute = watch_state.mutes.observe(event, &watch_client);
+                    watch_state.render_mutes.observe(event, &watch_client);
                     watch_state.removed(event);
                     match enumerate(&watch_client) {
                         Ok((entries, defaults)) => watch_state.replace(entries, defaults, true),
@@ -390,6 +395,7 @@ fn enumerate(client: &Client) -> Result<(BTreeMap<Key, Entry>, Defaults), Backen
                 device,
                 index: sink.index,
                 generation: 0,
+                serial: raw::object_serial(&sink.props),
                 monitor: sink
                     .monitor_source_name
                     .as_deref()
@@ -413,6 +419,7 @@ fn enumerate(client: &Client) -> Result<(BTreeMap<Key, Entry>, Defaults), Backen
                 device,
                 index: source.index,
                 generation: 0,
+                serial: raw::object_serial(&source.props),
                 monitor: None,
             },
         );
@@ -477,12 +484,14 @@ impl Backend for LinuxBackend {
         request: CaptureSpec,
         callback: CaptureCallback,
     ) -> Result<LinuxStream, BackendError> {
+        let mut monitor = None;
         let (key, entry, source, format) = match request {
             CaptureSpec::Monitor { sink, format } => {
-                let (_, sink) = self.resolve(&sink, false)?;
+                let (sink_key, sink) = self.resolve(&sink, false)?;
                 let source = sink.monitor.clone().ok_or(BackendError::Unsupported)?;
                 let (key, entry) =
                     self.resolve(&DeviceSelection::Explicit(DeviceId::new(&source)?), true)?;
+                monitor = Some((sink_key, sink));
                 (key, entry, source, format)
             }
             CaptureSpec::Microphone { endpoint, format } => {
@@ -494,9 +503,12 @@ impl Backend for LinuxBackend {
         };
         LinuxStream::capture(
             self.config.clone(),
-            self.state.clone(),
-            key,
-            entry,
+            StreamTarget {
+                state: self.state.clone(),
+                key,
+                entry,
+            },
+            monitor,
             &source,
             format,
             callback,
@@ -607,6 +619,7 @@ mod tests {
             generation: 0,
             index,
             monitor: Some("TEST_SINK.monitor".into()),
+            serial: Some(u64::from(index) + 1),
         }
     }
     #[test]
@@ -626,6 +639,15 @@ mod tests {
         });
         state.replace(
             BTreeMap::from([(key.clone(), entry(1))]),
+            Defaults::default(),
+            true,
+        );
+        assert_ne!(lock(&state.catalog).entries[&key].generation, generation);
+        let generation = lock(&state.catalog).entries[&key].generation;
+        let mut changed = entry(1);
+        changed.serial = Some(9);
+        state.replace(
+            BTreeMap::from([(key.clone(), changed)]),
             Defaults::default(),
             true,
         );

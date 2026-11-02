@@ -110,3 +110,55 @@ fn malformed_metadata_is_not_retained() {
     bad.session_token = 0;
     assert!(!relay.update(s.view.parent, s.view.session, 2, Some(bad)));
 }
+
+#[test]
+fn seek_preserves_permission_identity_and_native_range_guards() {
+    let mut relay = Relay::default();
+    let scope = scope();
+    relay.scope(Some(scope));
+    let mut media = info();
+    media.commands.seek = true;
+    media.position_ms = Some(20);
+    media.duration_ms = Some(100);
+    media.seek_min_ms = Some(0);
+    media.seek_max_ms = Some(100);
+    assert!(relay.update(
+        scope.view.parent,
+        scope.view.session,
+        1,
+        Some(media.clone())
+    ));
+    for position_ms in [0, 100] {
+        let command = MediaCommand::SeekTo { position_ms };
+        assert_eq!(relay.authorize(true, 7, 8, command), Ok(()));
+        assert_eq!(
+            relay.authorize(false, 7, 8, command),
+            Err(Refusal::ConsentRequired)
+        );
+        assert_eq!(
+            relay.authorize(true, 0, 8, command),
+            Err(Refusal::StaleRevision)
+        );
+        assert_eq!(
+            relay.authorize(true, 7, 9, command),
+            Err(Refusal::StaleRevision)
+        );
+    }
+    assert_eq!(
+        relay.authorize(true, 7, 8, MediaCommand::SeekTo { position_ms: 101 }),
+        Err(Refusal::Unsupported)
+    );
+    media.seek_min_ms = Some(10);
+    assert!(relay.update(scope.view.parent, scope.view.session, 2, Some(media)));
+    assert_eq!(
+        relay.authorize(true, 7, 8, MediaCommand::SeekTo { position_ms: 0 }),
+        Err(Refusal::Unsupported)
+    );
+    let mut replacement = scope;
+    replacement.worker_generation = [9; 16];
+    relay.scope(Some(replacement));
+    assert_eq!(
+        relay.authorize(true, 7, 8, MediaCommand::SeekTo { position_ms: 20 }),
+        Err(Refusal::Inactive)
+    );
+}

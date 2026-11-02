@@ -3567,6 +3567,10 @@ impl Session {
             }
             _ => {}
         }
+        if matches!(&message, Msg::Emergency(_)) {
+            // The agent already returned input autonomously; audio cancellation never waits here.
+            self.release_source_local_sound();
+        }
         // The observation rides on the agent's capture, and these frames are the agent
         // saying that capture is gone: the emergency combination and a receiver takeover
         // release everything before reporting, and a capture failure or overflow ends it.
@@ -4828,8 +4832,16 @@ impl Session {
     ///
     /// Repetition is therefore safe: `--to local` while Local, or `--to <peer>` while already
     /// Remote to that peer, leave the lease alone instead of toggling it back.
+    fn release_source_local_sound(&self) {
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            audio.release_source_local_sound();
+        }
+    }
+
     async fn switch_direction(&mut self, peer: Option<&PeerRef>) -> ctl::Response {
         let Some(peer) = peer else {
+            self.release_source_local_sound();
             self.pending_target = None;
             let input = match self.router.lease() {
                 fr::LeaseSlot::Idle => None,
@@ -5302,9 +5314,9 @@ mod audio_focus_extraction_tests {
 
 #[cfg(any(feature = "audio", test))]
 fn merge_audio_capabilities(current: &mut Vec<i32>, audio: &[i32]) {
-    current.retain(|bit| !matches!(bit, 16 | 17 | 18 | 19 | 20 | 23));
+    current.retain(|bit| !matches!(bit, 16 | 17 | 18 | 19 | 20 | 23 | 24));
     for &bit in audio {
-        if matches!(bit, 16 | 17 | 18 | 19 | 20 | 23) && !current.contains(&bit) {
+        if matches!(bit, 16 | 17 | 18 | 19 | 20 | 23 | 24) && !current.contains(&bit) {
             current.push(bit);
         }
     }
@@ -5316,9 +5328,9 @@ mod audio_capability_tests {
 
     #[test]
     fn audio_publication_preserves_other_capabilities() {
-        let mut current = vec![1, 7, 16, 17, 18, 19, 20, 21, 23];
-        merge_audio_capabilities(&mut current, &[16, 18, 19, 20, 23, 20, 99]);
-        assert_eq!(current, vec![1, 7, 21, 16, 18, 19, 20, 23]);
+        let mut current = vec![1, 7, 16, 17, 18, 19, 20, 21, 23, 24];
+        merge_audio_capabilities(&mut current, &[16, 18, 19, 20, 23, 24, 20, 99]);
+        assert_eq!(current, vec![1, 7, 21, 16, 18, 19, 20, 23, 24]);
         merge_audio_capabilities(&mut current, &[]);
         assert_eq!(current, vec![1, 7, 21]);
     }

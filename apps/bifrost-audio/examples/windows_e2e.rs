@@ -239,6 +239,7 @@ mod windows {
             local_scope_id: 0,
             peer_scope_id: 0,
             initial_authorization_ms: 1000,
+            source_local_sound_released: false,
         })
     }
 

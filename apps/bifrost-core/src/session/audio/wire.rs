@@ -921,6 +921,8 @@ pub fn encode_status(
                     position_ms: m.position_ms,
                     session_token: m.session_token,
                     duration_ms: m.duration_ms,
+                    seek_min_ms: m.seek_min_ms,
+                    seek_max_ms: m.seek_max_ms,
                     playback: encode_playback(m.playback),
                     commands: Some(wire::AudioMediaCommands {
                         play: m.commands.play,
@@ -928,6 +930,7 @@ pub fn encode_status(
                         toggle: m.commands.toggle,
                         next: m.commands.next,
                         previous: m.commands.previous,
+                        seek: m.commands.seek,
                     }),
                     revision: m.revision,
                 }),
@@ -1570,6 +1573,8 @@ mod tests {
                     subtitle: "private-subtitle".into(),
                     position_ms: Some(0),
                     duration_ms: None,
+                    seek_min_ms: None,
+                    seek_max_ms: None,
                     session_token: 0,
                     playback: model::PlaybackState::Paused,
                     commands: model::MediaCommands {

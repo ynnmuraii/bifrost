@@ -57,7 +57,7 @@ pub(super) struct State {
     watch_generation: Option<[u8; 16]>,
     watch_dirty: bool,
     native: Option<(u64, Option<model::MediaInfo>)>,
-    sent: BTreeMap<NodeId, (fsm::SessionView, u64, bool)>,
+    sent: BTreeMap<NodeId, (fsm::SessionView, u64, bool, bool)>,
     permissions: BTreeMap<NodeId, (fsm::SessionView, bool)>,
     deferred: BTreeMap<NodeId, DeferredInfo>,
     received: u64,
@@ -76,6 +76,16 @@ impl Actor {
                 }
                 config::AudioRole::Off => false,
             }
+    }
+    fn media_seek_capable(&self, peer: NodeId) -> bool {
+        self.media_capable()
+            && self.peers.get(&peer).is_some_and(|p| p.media_seek_support)
+            && self
+                .links
+                .borrow()
+                .peers
+                .get(&peer)
+                .is_some_and(|p| p.media_seek_support)
     }
     fn media_scope(&self, peer: NodeId) -> Option<Scope> {
         self.media_candidate_scope(peer)
@@ -109,12 +119,19 @@ impl Actor {
     }
     pub(super) fn media_info(&self, peer: NodeId) -> Option<model::MediaInfo> {
         let scope = self.media_scope(peer)?;
-        self.media
+        let mut info = self
+            .media
             .relays
             .get(&peer)
             .filter(|r| r.view() == Some(scope.view))?
-            .info()
-            .cloned()
+            .info()?
+            .clone();
+        if !self.media_seek_capable(peer) || info.seek_range().is_none() {
+            info.commands.seek = false;
+            info.seek_min_ms = None;
+            info.seek_max_ms = None;
+        }
+        Some(info)
     }
     pub(super) fn media_allowed(&self, peer: NodeId) -> bool {
         self.media_scope(peer)
@@ -267,8 +284,10 @@ impl Actor {
                     .peers
                     .iter()
                     .any(|p| p.node_id.0 == *peer.as_bytes() && p.allow_media_control);
+                let seek_capable = self.media_seek_capable(peer);
                 if self.config.role != config::AudioRole::Source
-                    || self.media.sent.get(&peer) == Some(&(scope.view, *revision, allowed))
+                    || self.media.sent.get(&peer)
+                        == Some(&(scope.view, *revision, allowed, seek_capable))
                 {
                     continue;
                 }
@@ -280,7 +299,13 @@ impl Actor {
                         info.clone(),
                     );
                 }
-                let message = encode_info(scope.view.session, *revision, info.as_ref(), allowed);
+                let mut message =
+                    encode_info(scope.view.session, *revision, info.as_ref(), allowed);
+                if !self.media_seek_capable(peer) {
+                    message.can_seek = Some(false);
+                    message.seek_min_ms = None;
+                    message.seek_max_ms = None;
+                }
                 if self
                     .media_send(
                         scope.view.parent,
@@ -290,7 +315,7 @@ impl Actor {
                 {
                     self.media
                         .sent
-                        .insert(peer, (scope.view, *revision, allowed));
+                        .insert(peer, (scope.view, *revision, allowed, seek_capable));
                 }
             }
         }
@@ -342,10 +367,14 @@ impl Actor {
             reply(&request, Err(ipc::audio::codes::AUDIO_STALE_MEDIA)).await;
             return;
         }
-        let Some(kind) = gui_command(command.command) else {
+        let Some(kind) = gui_command(command.command, command.position_ms) else {
             reply(&request, Err(ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND)).await;
             return;
         };
+        if matches!(kind, model::MediaCommand::SeekTo { .. }) && !self.media_seek_capable(peer) {
+            reply(&request, Err(ipc::audio::codes::AUDIO_UNSUPPORTED_COMMAND)).await;
+            return;
+        }
         let result = self
             .media
             .relays
@@ -373,6 +402,7 @@ impl Actor {
             token: command.session_token,
             revision: command.media_revision,
             command: network_command(kind) as i32,
+            position_ms: command.position_ms,
         };
         if !self
             .media_send(
@@ -397,9 +427,16 @@ impl Actor {
         if !scope.live() || message.session_id.as_slice() != scope.view.session {
             return;
         }
-        let Ok(info) = decode_info(message) else {
+        let Ok(mut info) = decode_info(message) else {
             return;
         };
+        if !self.media_seek_capable(peer) {
+            if let Some(info) = info.as_mut() {
+                info.commands.seek = false;
+                info.seek_min_ms = None;
+                info.seek_max_ms = None;
+            }
+        }
         let relay = self.media.relays.entry(peer).or_default();
         relay.scope(Some(scope));
         if info.as_ref().zip(relay.info()).is_some_and(|(new, old)| {
@@ -510,7 +547,7 @@ impl Actor {
                         .await;
                     return;
                 }
-                let Some(kind) = decode_command(command.command) else {
+                let Some(kind) = decode_command(command.command, command.position_ms) else {
                     self.media_ack(scope.view, id, net::AudioControlResult::Invalid)
                         .await;
                     return;
@@ -519,6 +556,7 @@ impl Actor {
                     scope,
                     self.media.relays.get(&peer),
                     allowed,
+                    self.media_seek_capable(peer),
                     parent,
                     command,
                     kind,
@@ -551,7 +589,12 @@ impl Actor {
                 };
                 match worker
                     .handle
-                    .media_command(command.token, command.revision, native_command(kind))
+                    .media_command(
+                        command.token,
+                        command.revision,
+                        native_command(kind),
+                        command.position_ms,
+                    )
                     .await
                 {
                     Ok(request_id) => {
@@ -689,6 +732,7 @@ fn authorize_source(
     scope: Scope,
     relay: Option<&Relay>,
     allowed: bool,
+    seek_capable: bool,
     parent: fsm::Parent,
     command: &net::MediaCommand,
     kind: model::MediaCommand,
@@ -698,6 +742,9 @@ fn authorize_source(
         || command.session_id.as_slice() != scope.view.session
     {
         return Err(Refusal::Inactive);
+    }
+    if matches!(kind, model::MediaCommand::SeekTo { .. }) && !seek_capable {
+        return Err(Refusal::Unsupported);
     }
     relay
         .filter(|r| r.view() == Some(scope.view))
@@ -726,25 +773,37 @@ fn result_code(value: net::AudioControlResult) -> Result<(), Code> {
         _ => Err(c::AUDIO_UNAVAILABLE),
     }
 }
-fn gui_command(raw: i32) -> Option<model::MediaCommand> {
+fn gui_command(raw: i32, position_ms: Option<u64>) -> Option<model::MediaCommand> {
     use gui::AudioMediaCommand as G;
+    if (raw == G::Seek as i32) != position_ms.is_some() {
+        return None;
+    }
     Some(match G::try_from(raw).ok()? {
         G::Play => model::MediaCommand::Play,
         G::Pause => model::MediaCommand::Pause,
         G::Toggle => model::MediaCommand::Toggle,
         G::Next => model::MediaCommand::Next,
         G::Previous => model::MediaCommand::Previous,
+        G::Seek => model::MediaCommand::SeekTo {
+            position_ms: position_ms?,
+        },
         _ => return None,
     })
 }
-fn decode_command(raw: i32) -> Option<model::MediaCommand> {
+fn decode_command(raw: i32, position_ms: Option<u64>) -> Option<model::MediaCommand> {
     use net::MediaCommandKind as N;
+    if (raw == N::Seek as i32) != position_ms.is_some() {
+        return None;
+    }
     Some(match N::try_from(raw).ok()? {
         N::Play => model::MediaCommand::Play,
         N::Pause => model::MediaCommand::Pause,
         N::PlayPause => model::MediaCommand::Toggle,
         N::Next => model::MediaCommand::Next,
         N::Previous => model::MediaCommand::Previous,
+        N::Seek => model::MediaCommand::SeekTo {
+            position_ms: position_ms?,
+        },
         _ => return None,
     })
 }
@@ -756,6 +815,7 @@ fn network_command(command: model::MediaCommand) -> net::MediaCommandKind {
         M::Toggle => net::MediaCommandKind::PlayPause,
         M::Next => net::MediaCommandKind::Next,
         M::Previous => net::MediaCommandKind::Previous,
+        M::SeekTo { .. } => net::MediaCommandKind::Seek,
     }
 }
 fn native_command(command: model::MediaCommand) -> worker::MediaCommandKind {
@@ -766,6 +826,7 @@ fn native_command(command: model::MediaCommand) -> worker::MediaCommandKind {
         M::Toggle => worker::MediaCommandKind::Toggle,
         M::Next => worker::MediaCommandKind::Next,
         M::Previous => worker::MediaCommandKind::Previous,
+        M::SeekTo { .. } => worker::MediaCommandKind::Seek,
     }
 }
 fn native_result(raw: i32) -> net::AudioControlResult {
@@ -793,6 +854,7 @@ fn commands(bits: u32) -> model::MediaCommands {
         toggle: bits & 4 != 0,
         next: bits & 8 != 0,
         previous: bits & 16 != 0,
+        seek: false,
     }
 }
 fn current_native(sessions: &worker::MediaSessions) -> Result<Option<model::MediaInfo>, ()> {
@@ -821,6 +883,8 @@ fn current_native(sessions: &worker::MediaSessions) -> Result<Option<model::Medi
         revision: native.revision,
         position_ms: native.position_ms,
         duration_ms: native.duration_ms,
+        seek_min_ms: native.seek_min_ms,
+        seek_max_ms: native.seek_max_ms,
         playback: match worker::PlaybackState::try_from(native.state) {
             Ok(worker::PlaybackState::Playing) => model::PlaybackState::Playing,
             Ok(worker::PlaybackState::Paused) => model::PlaybackState::Paused,
@@ -828,7 +892,10 @@ fn current_native(sessions: &worker::MediaSessions) -> Result<Option<model::Medi
             Ok(worker::PlaybackState::Unknown) => model::PlaybackState::Unknown,
             _ => return Err(()),
         },
-        commands: commands(native.commands),
+        commands: model::MediaCommands {
+            seek: native.can_seek == Some(true),
+            ..commands(native.commands)
+        },
     };
     if info.session_token == 0
         || info.revision == 0
@@ -863,6 +930,9 @@ fn encode_info(
         subtitle: info.subtitle.clone(),
         position_ms: info.position_ms,
         duration_ms: info.duration_ms,
+        can_seek: Some(info.seek_range().is_some()),
+        seek_min_ms: info.seek_range().map(|(min, _)| min),
+        seek_max_ms: info.seek_range().map(|(_, max)| max),
         playback: match info.playback {
             model::PlaybackState::Playing => net::MediaPlayback::Playing,
             model::PlaybackState::Paused => net::MediaPlayback::Paused,
@@ -888,6 +958,8 @@ fn decode_info(info: &net::MediaInfo) -> Result<Option<model::MediaInfo>, ()> {
         revision: info.revision,
         position_ms: info.position_ms,
         duration_ms: info.duration_ms,
+        seek_min_ms: info.seek_min_ms,
+        seek_max_ms: info.seek_max_ms,
         playback: match net::MediaPlayback::try_from(info.playback) {
             Ok(net::MediaPlayback::Playing) => model::PlaybackState::Playing,
             Ok(net::MediaPlayback::Paused) => model::PlaybackState::Paused,
@@ -895,7 +967,10 @@ fn decode_info(info: &net::MediaInfo) -> Result<Option<model::MediaInfo>, ()> {
             Ok(net::MediaPlayback::Unknown) => model::PlaybackState::Unknown,
             _ => return Err(()),
         },
-        commands: commands(info.commands),
+        commands: model::MediaCommands {
+            seek: info.can_seek == Some(true),
+            ..commands(info.commands)
+        },
     };
     value.validate().map_err(|_| ())?;
     Ok(Some(value))
@@ -1047,6 +1122,7 @@ mod tests {
                 s,
                 Some(&relay),
                 allowed,
+                true,
                 parent,
                 command,
                 model::MediaCommand::Play,
@@ -1090,6 +1166,61 @@ mod tests {
             authorize(scope, true, scope.view.parent, &stale),
             Err(Refusal::StaleRevision)
         );
+    }
+
+    #[test]
+    fn seek_source_admission_requires_negotiation_range_permission_and_exact_revision() {
+        let scope = live_scope();
+        let mut native = native(1);
+        native.can_seek = Some(true);
+        native.position_ms = Some(20);
+        native.duration_ms = Some(100);
+        native.seek_min_ms = Some(0);
+        native.seek_max_ms = Some(100);
+        let info = current_native(&worker::MediaSessions {
+            sessions: vec![native],
+            current_token: Some(1),
+            revision: 1,
+        })
+        .unwrap()
+        .unwrap();
+        let mut relay = Relay::default();
+        relay.scope(Some(scope));
+        assert!(relay.update(scope.view.parent, scope.view.session, 1, Some(info.clone())));
+        let mut command = net::MediaCommand {
+            session_id: scope.view.session.to_vec(),
+            token: 1,
+            revision: info.revision,
+            command: net::MediaCommandKind::Seek as i32,
+            position_ms: Some(0),
+            ..Default::default()
+        };
+        let authorize = |command: &net::MediaCommand, cap, allowed| {
+            let kind = decode_command(command.command, command.position_ms).unwrap();
+            authorize_source(
+                scope,
+                Some(&relay),
+                allowed,
+                cap,
+                scope.view.parent,
+                command,
+                kind,
+            )
+        };
+        assert_eq!(authorize(&command, true, true), Ok(()));
+        assert_eq!(authorize(&command, false, true), Err(Refusal::Unsupported));
+        assert_eq!(
+            authorize(&command, true, false),
+            Err(Refusal::ConsentRequired)
+        );
+        command.position_ms = Some(101);
+        assert_eq!(authorize(&command, true, true), Err(Refusal::Unsupported));
+        command.position_ms = Some(0);
+        command.revision += 1;
+        assert_eq!(authorize(&command, true, true), Err(Refusal::StaleRevision));
+        command.revision = info.revision;
+        command.token = 0;
+        assert_eq!(authorize(&command, true, true), Err(Refusal::StaleRevision));
     }
 
     fn native(token: u64) -> worker::MediaInfo {
@@ -1176,7 +1307,7 @@ mod tests {
             result_code(net::AudioControlResult::StaleRevision),
             Err(ipc::audio::codes::AUDIO_STALE_MEDIA)
         );
-        assert!(decode_command(0).is_none());
+        assert!(decode_command(0, None).is_none());
         for command in [
             model::MediaCommand::Play,
             model::MediaCommand::Pause,
@@ -1185,7 +1316,7 @@ mod tests {
             model::MediaCommand::Previous,
         ] {
             assert_eq!(
-                decode_command(network_command(command) as i32),
+                decode_command(network_command(command) as i32, None),
                 Some(command)
             );
         }

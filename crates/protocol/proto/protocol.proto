@@ -91,6 +91,7 @@ enum Capability {
   CAPABILITY_AUDIO_LISTENER = 20;
   // Future: 21 mic-stream, 22 virtual-mic.
   CAPABILITY_MEDIA_CONTROL_V1 = 23;
+  CAPABILITY_MEDIA_SEEK_V1 = 24;
 }
 
 enum SessionKind {
@@ -416,6 +417,7 @@ enum MediaCommandKind {
   MEDIA_COMMAND_KIND_PLAY_PAUSE = 3;
   MEDIA_COMMAND_KIND_NEXT = 4;
   MEDIA_COMMAND_KIND_PREVIOUS = 5;
+  MEDIA_COMMAND_KIND_SEEK = 6;
 }
 message MediaInfo {
   bytes session_id = 1;
@@ -430,6 +432,9 @@ message MediaInfo {
   MediaPlayback playback = 10;
   uint32 commands = 11; // Play, Pause, PlayPause, Next, Previous: bits0..4
   bool allow_control = 12; // Source-authoritative peer permission, not inferred from OS commands.
+  optional bool can_seek = 13;
+  optional uint64 seek_min_ms = 14;
+  optional uint64 seek_max_ms = 15;
 }
 message MediaCommand {
   bytes request_id = 1;
@@ -437,6 +442,7 @@ message MediaCommand {
   uint64 token = 3;
   uint64 revision = 4;
   MediaCommandKind command = 5;
+  optional uint64 position_ms = 6;
 }
 message MediaAck {
   bytes request_id = 1;

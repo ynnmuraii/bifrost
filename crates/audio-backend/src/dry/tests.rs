@@ -61,6 +61,170 @@ fn backend() -> DryBackend {
     backend
 }
 
+#[test]
+fn source_volume_unmute_retains_hold_without_stopping_capture() {
+    let mut backend = backend();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::Monitor {
+                sink: selection("speaker"),
+                format: format(),
+            },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    stream.suppress_local_playback(Arc::new(|| true)).unwrap();
+    backend
+        .apply(ScriptEvent::SetMute {
+            device: id("speaker"),
+            muted: false,
+        })
+        .unwrap();
+    stream.pump(64).unwrap();
+    assert!(
+        lock(&backend.state).devices[&id("speaker")].muted,
+        "volume/unmute must not forfeit Source silence"
+    );
+    assert_eq!(stream.snapshot().status, StreamStatus::Running);
+    stream.stop().unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+}
+
+#[test]
+fn source_silence_never_restores_a_replaced_output_generation() {
+    let mut backend = backend();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::Monitor {
+                sink: selection("speaker"),
+                format: format(),
+            },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    stream.suppress_local_playback(Arc::new(|| true)).unwrap();
+    backend
+        .apply(ScriptEvent::RemoveDevice(id("speaker")))
+        .unwrap();
+    backend
+        .apply(ScriptEvent::UpsertDevice(device(
+            "speaker",
+            Direction::Render,
+        )))
+        .unwrap();
+    backend
+        .apply(ScriptEvent::SetMute {
+            device: id("speaker"),
+            muted: true,
+        })
+        .unwrap();
+    let revision = lock(&backend.state).devices[&id("speaker")].mute_revision;
+    stream.stop().unwrap();
+    assert!(lock(&backend.state).devices[&id("speaker")].muted);
+    assert_eq!(
+        lock(&backend.state).devices[&id("speaker")].mute_revision,
+        revision
+    );
+}
+
+#[test]
+fn source_monitor_silence_is_explicit_and_restored_on_stop() {
+    let mut backend = backend();
+    let original = lock(&backend.state).devices[&id("speaker")].muted;
+    let original_mic = lock(&backend.state).devices[&id("mic")].muted;
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let captured = samples.clone();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::Monitor {
+                sink: selection("speaker"),
+                format: format(),
+            },
+            Box::new(move |block| captured.lock().unwrap().extend_from_slice(block.samples)),
+        )
+        .unwrap();
+    assert_eq!(lock(&backend.state).devices[&id("speaker")].muted, original);
+    assert_eq!(lock(&backend.state).devices[&id("mic")].muted, original_mic);
+    let admitted = Arc::new(|| true);
+    stream.suppress_local_playback(admitted.clone()).unwrap();
+    stream.suppress_local_playback(admitted).unwrap();
+    assert!(lock(&backend.state).devices[&id("speaker")].muted);
+    assert_eq!(lock(&backend.state).devices[&id("mic")].muted, original_mic);
+    stream.pump(64).unwrap();
+    assert!(samples.lock().unwrap().iter().any(|sample| *sample != 0.0));
+    stream.stop().unwrap();
+    assert_eq!(lock(&backend.state).devices[&id("speaker")].muted, original);
+    assert_eq!(lock(&backend.state).devices[&id("mic")].muted, original_mic);
+
+    // An independent microphone/PTT lease survives Source OFF and manual render changes.
+    let mut mic = backend.acquire_mute(&selection("mic")).unwrap();
+    let mic_generation = mic.snapshot().unwrap().generation;
+    mic.set_capture_mute(mic_generation, true).unwrap();
+    let captured = samples.clone();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::Monitor {
+                sink: selection("speaker"),
+                format: format(),
+            },
+            Box::new(move |block| captured.lock().unwrap().extend_from_slice(block.samples)),
+        )
+        .unwrap();
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let admission = hold.clone();
+    stream
+        .suppress_local_playback(Arc::new(move || {
+            admission.load(std::sync::atomic::Ordering::Acquire)
+        }))
+        .unwrap();
+    backend
+        .apply(ScriptEvent::SetMute {
+            device: id("speaker"),
+            muted: false,
+        })
+        .unwrap();
+    assert_eq!(stream.snapshot().status, StreamStatus::Running);
+    let before = samples.lock().unwrap().len();
+    stream.pump(64).unwrap();
+    assert!(samples.lock().unwrap()[before..]
+        .iter()
+        .any(|sample| *sample != 0.0));
+    assert!(lock(&backend.state).devices[&id("speaker")].muted);
+    hold.store(false, std::sync::atomic::Ordering::Release);
+    stream.pump(64).unwrap();
+    stream.pump(64).unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    stream.stop().unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    assert!(mic.snapshot().unwrap().muted);
+    mic.set_capture_mute(mic_generation, false).unwrap();
+
+    // A pre-existing render mute is never cleared or claimed as our own write.
+    backend
+        .apply(ScriptEvent::SetMute {
+            device: id("speaker"),
+            muted: true,
+        })
+        .unwrap();
+    let revision = lock(&backend.state).devices[&id("speaker")].mute_revision;
+    let mut prior = backend
+        .start_capture(
+            CaptureSpec::Monitor {
+                sink: selection("speaker"),
+                format: format(),
+            },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    prior.suppress_local_playback(Arc::new(|| true)).unwrap();
+    prior.stop().unwrap();
+    assert!(lock(&backend.state).devices[&id("speaker")].muted);
+    assert_eq!(
+        lock(&backend.state).devices[&id("speaker")].mute_revision,
+        revision
+    );
+}
+
 fn drain(backend: &mut DryBackend) {
     while backend.poll_event().is_some() {}
 }
@@ -93,6 +257,7 @@ fn info(token: u64, revision: u64) -> MediaInfo {
             toggle: true,
             next: true,
             previous: true,
+            seek: false,
         },
     )
     .unwrap()
@@ -1397,4 +1562,43 @@ fn unknown_playback_is_preserved_and_current_queries_report_availability() {
         backend.apply(ScriptEvent::SetCurrentMediaSession { session: None }),
         Err(BackendError::Unsupported)
     );
+}
+
+#[test]
+fn seek_moves_only_with_native_capability_timeline_and_in_range() {
+    let mut backend = DryBackend::new(Capabilities {
+        media: true,
+        ..Capabilities::default()
+    });
+    let mut media = info(1, 1);
+    media.commands.seek = true;
+    media.position_ms = Some(20);
+    media.duration_ms = Some(100);
+    media.seek_min_ms = Some(0);
+    media.seek_max_ms = Some(100);
+    backend
+        .apply(ScriptEvent::SetMedia {
+            session: media.session,
+            info: Some(media),
+        })
+        .unwrap();
+    drain(&mut backend);
+    backend
+        .media_command(request(1, 1, 1, MediaCommand::SeekTo { position_ms: 0 }))
+        .unwrap();
+    backend.pump_control();
+    assert_eq!(backend.media_sessions().unwrap()[0].position_ms, Some(0));
+    drain(&mut backend);
+    backend
+        .media_command(request(2, 1, 2, MediaCommand::SeekTo { position_ms: 101 }))
+        .unwrap();
+    backend.pump_control();
+    assert_eq!(backend.media_sessions().unwrap()[0].position_ms, Some(0));
+    assert!(matches!(
+        backend.poll_event(),
+        Some(Event::MediaCommandCompleted {
+            request_id: 2,
+            result: Err(BackendError::InvalidArgument)
+        })
+    ));
 }

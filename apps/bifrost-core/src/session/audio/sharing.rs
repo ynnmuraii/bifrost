@@ -88,6 +88,7 @@ impl Actor {
         }
         self.applied_system_off = epoch;
         self.system_requested = false;
+        self.source_sound_released = false;
         self.system_start = None;
         self.system_session = None;
         self.system_error = None;
@@ -532,6 +533,7 @@ mod tests {
                 focus_support: false,
                 mic_support: false,
                 media_support: false,
+                media_seek_support: false,
                 focus_sent_revision: 0,
                 focus_request_at: None,
                 focus_reply_at: None,

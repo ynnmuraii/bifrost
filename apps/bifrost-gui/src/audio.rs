@@ -1,5 +1,7 @@
 //! Authoritative audio IPC adapter. Pending intents never change playback or privacy state.
-use crate::audio_player::{AppKind, AudioPlayerAction, AudioPlayerCard, StreamState};
+use crate::audio_player::{
+    AppKind, AudioPlayerAction, AudioPlayerCard, AudioSeekTarget, StreamState,
+};
 use crate::view_model::{Modal, Request, ViewModel};
 use audio_model::status as model;
 use protocol::ipc::{self, gui_frame::Msg};
@@ -639,6 +641,28 @@ pub fn stream_id(id: &[u8]) -> String {
     }
     out
 }
+fn seek_target(session: &model::SessionStatus) -> Option<AudioSeekTarget> {
+    if !media_allowed(session) {
+        return None;
+    }
+    let media = session.media_info.as_ref()?;
+    if !media.commands.seek {
+        return None;
+    }
+    let position = media.position_ms?;
+    let duration = media.duration_ms?;
+    let (min_ms, max_ms) = media.seek_min_ms.zip(media.seek_max_ms)?;
+    if duration == 0 || position > duration || min_ms > max_ms || max_ms > duration {
+        return None;
+    }
+    Some(AudioSeekTarget {
+        session_token: media.session_token,
+        media_revision: media.revision,
+        min_ms,
+        max_ms,
+    })
+}
+
 pub fn map_cards(
     status: &model::AudioStatus,
     members: &[ipc::MemberStatus],
@@ -673,6 +697,7 @@ pub fn map_cards(
                 app: AppKind::System,
                 position_ms: media.and_then(|m| m.position_ms),
                 duration_ms: media.and_then(|m| m.duration_ms),
+                seek: seek_target(s),
                 playing,
                 can_prev: allowed && media.is_some_and(|m| m.commands.previous),
                 can_next: allowed && media.is_some_and(|m| m.commands.next),
@@ -740,7 +765,8 @@ pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> 
         | AudioPlayerAction::PlayPause(id)
         | AudioPlayerAction::Stop(id) => id,
         AudioPlayerAction::SetMuted { stream_id, .. }
-        | AudioPlayerAction::SetGain { stream_id, .. } => stream_id,
+        | AudioPlayerAction::SetGain { stream_id, .. }
+        | AudioPlayerAction::Seek { stream_id, .. } => stream_id,
         _ => return None,
     };
     let model = crate::audio_wire::decode_status(status).ok()?;
@@ -771,6 +797,22 @@ pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> 
                 gain_percent: u32::from(*percent),
                 muted: s.muted,
                 expected_revision: status.revision,
+            }))
+        }
+        AudioPlayerAction::Seek {
+            target,
+            position_ms,
+            ..
+        } if seek_target(s) == Some(*target)
+            && (target.min_ms..=target.max_ms).contains(position_ms) =>
+        {
+            Some(Msg::SendMediaCommand(ipc::SendMediaCommand {
+                peer_node_id: s.peer.to_vec(),
+                session_id: s.session_id.to_vec(),
+                session_token: target.session_token,
+                media_revision: target.media_revision,
+                command: ipc::AudioMediaCommand::Seek as i32,
+                position_ms: Some(*position_ms),
             }))
         }
         AudioPlayerAction::Previous(_)
@@ -805,6 +847,7 @@ pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> 
                 session_token: m.session_token,
                 media_revision: m.revision,
                 command: command as i32,
+                position_ms: None,
             }))
         }
         _ => None,

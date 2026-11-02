@@ -338,6 +338,7 @@ fn devices_and_commands_are_bounded() {
         session_token: 0,
         media_revision: 0,
         command: wire::AudioMediaCommand::Toggle as i32,
+        position_ms: None,
     };
     // Semantic unavailability returns AUDIO_STALE_MEDIA without closing the GUI link.
     for (token, revision) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
@@ -346,6 +347,25 @@ fn devices_and_commands_are_bounded() {
         assert!(validate_frame(&frame(Msg::SendMediaCommand(command.clone()))).is_ok());
     }
     command.command = 0;
+    assert!(validate_frame(&frame(Msg::SendMediaCommand(command))).is_err());
+}
+
+#[test]
+fn seek_payload_presence_is_strict_but_zero_is_valid() {
+    use wire::gui_frame::Msg;
+    let mut command = wire::SendMediaCommand {
+        peer_node_id: vec![1; 32],
+        session_id: vec![2; 16],
+        session_token: 1,
+        media_revision: 1,
+        command: wire::AudioMediaCommand::Seek as i32,
+        position_ms: Some(0),
+    };
+    assert!(validate_frame(&frame(Msg::SendMediaCommand(command.clone()))).is_ok());
+    command.position_ms = None;
+    assert!(validate_frame(&frame(Msg::SendMediaCommand(command.clone()))).is_err());
+    command.position_ms = Some(0);
+    command.command = wire::AudioMediaCommand::Play as i32;
     assert!(validate_frame(&frame(Msg::SendMediaCommand(command))).is_err());
 }
 #[tokio::test]

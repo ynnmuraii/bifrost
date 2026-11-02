@@ -1,5 +1,6 @@
 use crate::{
     backend::{Entry, Key, State},
+    mute::{LinuxRenderGuard, LinuxRenderObserver},
     raw::{self, Config, Connection},
 };
 use audio_backend::*;
@@ -44,6 +45,13 @@ impl Signals {
         self.invalidated.store(true, Ordering::Release);
         self.running.store(false, Ordering::Release);
     }
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.running.store(false, Ordering::Release);
+    }
 }
 #[derive(Clone)]
 enum Native {
@@ -68,6 +76,12 @@ impl Native {
         }
     }
 }
+pub(crate) struct StreamTarget {
+    pub(crate) state: Arc<State>,
+    pub(crate) key: Key,
+    pub(crate) entry: Entry,
+}
+
 /// Independent native connection per stream: forced socket shutdown on stop/error cannot
 /// interrupt another stream, and releases reactor-owned callback captures even if delete fails.
 pub struct LinuxStream {
@@ -78,17 +92,21 @@ pub struct LinuxStream {
     state: Arc<State>,
     device: DeviceId,
     format: AudioFormat,
+    config: Arc<Config>,
+    monitor: Option<(Key, Entry)>,
+    source_silence: Option<LinuxRenderObserver>,
 }
 impl LinuxStream {
     fn finish(
+        config: Arc<Config>,
         native: Native,
         link: Connection,
-        state: Arc<State>,
-        key: Key,
-        entry: Entry,
+        target: StreamTarget,
+        monitor: Option<(Key, Entry)>,
         format: AudioFormat,
         signals: Arc<Signals>,
     ) -> Result<Self, BackendError> {
+        let StreamTarget { state, key, entry } = target;
         state.register(key, entry.generation, &signals)?;
         let worker_native = native.clone();
         let worker_signals = signals.clone();
@@ -145,13 +163,15 @@ impl LinuxStream {
             state,
             device: entry.device.id,
             format,
+            config,
+            monitor,
+            source_silence: None,
         })
     }
     pub(crate) fn capture(
         config: Arc<Config>,
-        state: Arc<State>,
-        key: Key,
-        entry: Entry,
+        target: StreamTarget,
+        monitor: Option<(Key, Entry)>,
         source: &str,
         format: AudioFormat,
         callback: CaptureCallback,
@@ -159,7 +179,7 @@ impl LinuxStream {
         validate_format(format)?;
         let link = config.client()?;
         let signals = Arc::new(Signals::new());
-        let adapter = CaptureAdapter::new(callback, signals.clone(), state.clone(), format);
+        let adapter = CaptureAdapter::new(callback, signals.clone(), target.state.clone(), format);
         let params = p::RecordStreamParams {
             source_name: Some(raw::name(source)?),
             sample_spec: sample_spec(format),
@@ -186,11 +206,11 @@ impl LinuxStream {
             return Err(BackendError::Unsupported);
         }
         Self::finish(
+            config,
             Native::Capture(native),
             link,
-            state,
-            key,
-            entry,
+            target,
+            monitor,
             format,
             signals,
         )
@@ -240,11 +260,11 @@ impl LinuxStream {
             return Err(BackendError::Unsupported);
         }
         Self::finish(
+            config,
             Native::Render(native),
             link,
-            state,
-            key,
-            entry,
+            StreamTarget { state, key, entry },
+            None,
             format,
             signals,
         )
@@ -261,6 +281,15 @@ impl Stream for LinuxStream {
         FeedbackGuarantee::None
     }
     fn snapshot(&self) -> StreamSnapshot {
+        // Cached, bounded and nonblocking: native Props I/O belongs to the observer.
+        if self.signals.is_running()
+            && self
+                .source_silence
+                .as_ref()
+                .is_some_and(LinuxRenderObserver::unexpectedly_finished)
+        {
+            self.signals.fail();
+        }
         let status = if self.signals.invalidated.load(Ordering::Acquire) {
             StreamStatus::DeviceInvalidated
         } else if self.signals.failed.load(Ordering::Acquire)
@@ -282,9 +311,43 @@ impl Stream for LinuxStream {
             dropped_capture_frames: 0,
         }
     }
+    fn suppress_local_playback(
+        &mut self,
+        admitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), BackendError> {
+        if !self.signals.running.load(Ordering::Acquire) {
+            return Err(BackendError::Stopped);
+        }
+        let (key, entry) = self.monitor.as_ref().ok_or(BackendError::Unsupported)?;
+        if let Some(guard) = self.source_silence.as_ref() {
+            return if guard.owns_mute() {
+                Ok(())
+            } else {
+                Err(BackendError::OwnershipLost)
+            };
+        }
+        let guard = LinuxRenderGuard::acquire(
+            self.config.clone(),
+            self.state.clone(),
+            key.clone(),
+            entry.clone(),
+            &|| admitted() && self.signals.running.load(Ordering::Acquire),
+        )?;
+        self.source_silence = Some(LinuxRenderObserver::start(
+            guard,
+            self.signals.clone(),
+            admitted,
+        )?);
+        Ok(())
+    }
     fn stop(&mut self) -> Result<(), BackendError> {
         self.signals.running.store(false, Ordering::Release);
-        let mut result = Ok(());
+        // Always release before any native-stop timeout/early return. A forfeit or
+        // failed restore write is diagnosed separately, never a global P4 stop failure.
+        let mut result = self
+            .source_silence
+            .take()
+            .map_or(Ok(()), |mut guard| guard.restore());
         if let Some(timing) = self.timing.take() {
             timing.thread().unpark();
             if timing.join().is_err() {

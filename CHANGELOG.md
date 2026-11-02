@@ -13,13 +13,17 @@ Each release is described in English and Russian. / Каждый выпуск о
 - **Mix All** combines Sources; **Follow Focus** makes the computer with committed input focus primary and quietens the others.
 - A popup mini-player shows now-playing information and playback timing where the Source's player supports it.
 - Play/pause, next and previous buttons require a separate permission on each Source; sharing sound alone does not grant media control.
+- Seek supported Source players from the track timeline with session/revision/range checks; unsupported media stays read-only, without inventing rewind for live system audio.
 - Listener-local per-source volume and mute, output-device selection, and Ethernet/Wi-Fi buffering profiles.
 - Turn on **Receive system audio** on the headset computer; on each Source, choose **Destination** and turn on **Share system audio**. The group is automatic: no separate Apply, Start or per-computer system-audio grant is required. Devices, profiles and explicit denies remain in Advanced.
+- Qualified PipeWire Linux Sources silence their selected captured output only after an authorized stream starts, without stopping monitor capture. Normal stop restores prior mute best-effort; pre-muted outputs stay muted, volume changes retain the mute hold without rewriting volume, and crash restoration is not guaranteed. Local Return here / Emergency releases only this automatic silence until the next sharing OFF→ON, including while input is already local; capture/transmission and microphone/PTT are unchanged. Mic/PTT and Windows Listener playback remain separate; Windows Source-local silence is not implemented.
 - Optional system-wide microphone mute/PTT controls the Listener's physical microphone for all apps using it. Enable and permit it separately; no microphone audio is streamed.
 
 **Fixes**
 
 - Audio settings use responsive, inset RU/EN task controls; the independent native mini-player is opaque, correctly sized and free of nested hide panels or unnecessary single-card scrolling.
+- Settings On/Off controls keep independent widget identities. Player volume stays inside the card; a separate Hide action preserves audio and tray reopening, and header dragging does not steal playback or volume controls.
+- A last-selected, still-live paused/stopped media session remains eligible when the platform reports no current player; removed or unknown sessions are never cached as a replacement.
 - Sharing intent, connection progress, startup failures and observed running audio remain distinct. System-audio OFF cancels a pending start without changing mic/PTT or media-control settings; with resume disabled, restarting a Source leaves sharing stopped until a fresh ON.
 - System-audio OFF preserves matching native stop completion instead of reporting intentional worker retirement or expected peer-capability withdrawal as a crash/revocation failure. Genuine worker losses and security revocations remain failures, including when stopping is delayed.
 - Audio settings and popup warnings show observed path-failure reasons and local/peer UDP ports, with conditional role-scoped guidance rather than unproven firewall blame.
@@ -55,13 +59,17 @@ Each release is described in English and Russian. / Каждый выпуск о
 - **Mix All** смешивает источники; **Follow Focus** выделяет компьютер с подтверждённым фокусом ввода и приглушает остальные.
 - Всплывающий мини-плеер показывает текущий трек и время воспроизведения, если плеер источника это поддерживает.
 - Кнопки воспроизведения/паузы, следующего и предыдущего трека требуют отдельного разрешения на каждом источнике; передача звука сама по себе его не даёт.
+- Перемотка поддерживаемых плееров источника через шкалу трека проверяет сеанс, ревизию и диапазон; недоступная шкала остаётся только для чтения, без вымышленной перемотки системного звука.
 - Местные громкость и заглушение каждого источника на Listener, выбор выхода и профили буферизации Ethernet/Wi-Fi.
 - На компьютере с гарнитурой включается «Принимать системный звук»; на каждом источнике выбирается «Куда передавать» и включается «Передавать системный звук». Группа автоматическая: отдельные «Применить», запуск и разрешения системного звука для каждого компьютера не нужны. Устройства, профили и явные запреты остаются в «Дополнительно».
+- Источник Linux с проверенным нативным свойством PipeWire заглушает выбранный захватываемый выход только после запуска разрешённой передачи, не останавливая monitor. Штатная остановка восстанавливает прежний mute best-effort; уже заглушённый выход не включается, изменение громкости сохраняет тишину без перезаписи громкости, после сбоя гарантий нет. Местные «Вернуться сюда» / аварийная комбинация снимают только автоматическую тишину до следующего OFF→ON передачи, в том числе при уже местном вводе; захват, передача и микрофон/PTT не меняются. Микрофон/PTT и приёмник Windows независимы; местная тишина источника Windows не реализована.
 - Необязательные системные mute/PTT управляют физическим микрофоном Listener во всех использующих его приложениях. Включение и разрешения задаются отдельно; звук микрофона не передаётся.
 
 **Исправления**
 
 - Элементы аудионастроек адаптируются к узкому окну в RU/EN и сохраняют отступы; отдельный нативный мини-плеер непрозрачен, правильно рассчитан по содержимому, без вложенной панели скрытия и лишней прокрутки одной карточки.
+- Переключатели «Вкл/Выкл» в настройках больше не используют общие идентификаторы. Громкость помещается внутри карточки плеера; отдельное скрытие сохраняет звук и открытие из трея, а перетаскивание за заголовок не захватывает кнопки и ползунок.
+- Последний выбранный существующий медиасеанс на паузе или остановке остаётся доступным, когда платформа не сообщает текущий плеер; удалённые и неизвестные сеансы не подменяются кэшем.
 - Намерение передачи, подключение, ошибка запуска и наблюдаемый работающий звук не выдаются друг за друга. Выключение системного звука отменяет ожидающий запуск, не меняя микрофон/PTT и медиакоманды; при выключенном возобновлении после перезапуска источника требуется новое включение передачи.
 - При выключении системного звука сохраняется подтверждение остановки нативного потока: штатное завершение аудиопроцесса и ожидаемое снятие аудиовозможности пира больше не выдаются за сбой или отзыв доверия. Настоящие потери процесса и отзывы разрешений безопасности остаются ошибками, в том числе при задержке остановки.
 - Настройки и предупреждения плеера показывают наблюдаемую причину отказа аудиопути и местный/удалённый UDP-порты; подсказки учитывают роль и не объявляют брандмауэр виновным без доказательств.

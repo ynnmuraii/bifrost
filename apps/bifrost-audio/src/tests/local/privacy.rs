@@ -290,6 +290,7 @@ async fn watched_metadata_is_closed_while_native_control_is_blocked() {
                 token: 1,
                 expected_revision: 1,
                 command: 1,
+                position_ms: None,
             }),
         )
         .await

@@ -125,7 +125,7 @@ required_enum!(
 required_enum!(
     decode_command,
     AudioMediaCommand,
-    [Play, Pause, Toggle, Next, Previous]
+    [Play, Pause, Toggle, Next, Previous, Seek]
 );
 fn device_kind(value: i32) -> Result<()> {
     require(
@@ -377,6 +377,24 @@ pub fn validate_status(status: &wire::AudioStatus) -> Result<()> {
                 media.commands.is_some(),
                 "missing media command availability",
             )?;
+            require(
+                !matches!((media.position_ms, media.duration_ms),
+                    (Some(position), Some(duration)) if position > duration)
+                    && if media
+                        .commands
+                        .as_ref()
+                        .is_some_and(|commands| commands.seek)
+                    {
+                        matches!(
+                            (media.position_ms, media.duration_ms, media.seek_min_ms, media.seek_max_ms),
+                            (Some(_), Some(duration), Some(min), Some(max))
+                                if duration > 0 && min <= max && max <= duration
+                        )
+                    } else {
+                        media.seek_min_ms.is_none() && media.seek_max_ms.is_none()
+                    },
+                "invalid media seek range",
+            )?;
             let consented = match decode_role(session.local_role)? {
                 wire::AudioRole::Source => local.allow_system_send && remote.allow_system_receive,
                 wire::AudioRole::Listener => local.allow_system_receive && remote.allow_system_send,
@@ -475,6 +493,11 @@ pub fn validate_frame(frame: &wire::GuiFrame) -> Result<()> {
             id(&request.peer_node_id, 32, false)?;
             id(&request.session_id, 16, false)?;
             decode_command(request.command)?;
+            require(
+                (request.command == wire::AudioMediaCommand::Seek as i32)
+                    == request.position_ms.is_some(),
+                "media position must be present exactly for seek",
+            )?;
         }
         _ => return Ok(()),
     }

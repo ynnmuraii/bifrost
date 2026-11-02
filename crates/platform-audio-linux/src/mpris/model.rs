@@ -9,6 +9,7 @@ struct Controls {
     pause: bool,
     next: bool,
     previous: bool,
+    seek: bool,
 }
 pub(super) struct Player {
     pub owner: String,
@@ -111,6 +112,11 @@ impl Player {
             toggle: control && self.controls.pause,
             next: control && self.controls.next,
             previous: control && self.controls.previous,
+            seek: control
+                && self.controls.seek
+                && matches!((self.position, self.duration),
+                    (Some(position), Some(duration)) if duration > 0 && position <= duration)
+                && self.track.is_some(),
         }
     }
     pub fn info(&self, now: Instant) -> MediaInfo {
@@ -130,6 +136,10 @@ impl Player {
         .expect("metadata bounded at ingestion");
         info.position_ms = self.position(now);
         info.duration_ms = self.duration;
+        if info.commands.seek {
+            info.seek_min_ms = Some(0);
+            info.seek_max_ms = self.duration;
+        }
         info
     }
     pub fn apply(&mut self, interface: &str, mut properties: Properties, now: Instant) -> bool {
@@ -180,6 +190,7 @@ impl Player {
                 ("CanPause", &mut self.controls.pause),
                 ("CanGoNext", &mut self.controls.next),
                 ("CanGoPrevious", &mut self.controls.previous),
+                ("CanSeek", &mut self.controls.seek),
             ] {
                 if let Some(value) = properties.remove(name) {
                     changed |= replace(slot, bool::try_from(value).unwrap_or(false));
@@ -216,7 +227,11 @@ impl Player {
                 let track = metadata
                     .remove("mpris:trackid")
                     .and_then(|value| OwnedObjectPath::try_from(value).ok())
-                    .filter(|track| track.as_str().len() <= 1024)
+                    .filter(|track| {
+                        track.as_str().len() <= 1024
+                            && track.as_str() != "/"
+                            && track.as_str() != "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+                    })
                     .map(|track| track.as_str().to_owned());
                 // Oversized/missing track identity is uncertain: discard, never extrapolate a prior track.
                 let uncertain = track.is_none();
@@ -241,6 +256,33 @@ impl Player {
     }
     pub fn seek(&mut self, microseconds: i64, now: Instant) -> bool {
         self.correct_position(milliseconds(microseconds), now)
+    }
+    pub fn seek_position(&self, position_ms: u64) -> Result<i64, audio_backend::BackendError> {
+        use audio_backend::BackendError;
+        if !self.commands().seek {
+            return Err(BackendError::Unsupported);
+        }
+        if !self
+            .duration
+            .is_some_and(|duration| position_ms <= duration)
+        {
+            return Err(BackendError::InvalidArgument);
+        }
+        position_ms
+            .checked_mul(1000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(BackendError::InvalidArgument)
+    }
+    pub fn seek_target(
+        &self,
+        position_ms: u64,
+    ) -> Result<(OwnedObjectPath, i64), audio_backend::BackendError> {
+        use audio_backend::BackendError;
+        let position = self.seek_position(position_ms)?;
+        let track =
+            OwnedObjectPath::try_from(self.track.as_deref().ok_or(BackendError::Unsupported)?)
+                .map_err(|_| BackendError::Unsupported)?;
+        Ok((track, position))
     }
     pub fn advance_revision(&mut self) -> bool {
         if let Some(next) = self.revision.checked_add(1) {
@@ -314,5 +356,38 @@ mod tests {
         assert_eq!(player.position(now + Duration::from_secs(10)), Some(3000));
         player.seek(-1, now);
         assert_eq!(player.position(now), None);
+    }
+    #[test]
+    fn seek_requires_private_track_and_true_native_timeline_and_checked_units() {
+        use audio_backend::BackendError;
+        let now = Instant::now();
+        let mut player = Player::new(":owned".into(), MediaSessionToken(1), now);
+        player.controls.control = true;
+        player.controls.seek = true;
+        player.duration = Some(600_000);
+        player.position = Some(20);
+        assert!(!player.commands().seek);
+        player.track = Some("/owned/track".into());
+        assert!(player.commands().seek);
+        assert_eq!(player.info(now).seek_range(), Some((0, 600_000)));
+        let (track, position) = player.seek_target(123_456).unwrap();
+        assert_eq!(track.as_str(), "/owned/track");
+        assert_eq!(position, 123_456_000);
+        assert_eq!(
+            player.seek_target(600_001),
+            Err(BackendError::InvalidArgument)
+        );
+        player.position = None;
+        assert!(!player.commands().seek);
+        player.position = Some(0);
+        player.duration = Some(0);
+        assert!(!player.commands().seek);
+        player.duration = Some(u64::MAX);
+        assert_eq!(
+            player.seek_target(u64::MAX),
+            Err(BackendError::InvalidArgument)
+        );
+        player.controls.control = false;
+        assert_eq!(player.seek_target(0), Err(BackendError::Unsupported));
     }
 }

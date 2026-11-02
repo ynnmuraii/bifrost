@@ -187,6 +187,13 @@ impl State {
                     info.position_ms = Some(0);
                 }
             }
+            MediaCommand::SeekTo { position_ms } => {
+                let (min, max) = info.seek_range().ok_or(BackendError::Unsupported)?;
+                if !(min..=max).contains(&position_ms) {
+                    return Err(BackendError::InvalidArgument);
+                }
+                info.position_ms = Some(position_ms);
+            }
         }
         info.revision = revision;
         let info = info.clone();
@@ -308,15 +315,14 @@ impl DryBackend {
             }
             ScriptEvent::SetDefaults(defaults) => set_defaults(&mut state, defaults)?,
             ScriptEvent::SetMute { device, muted } => {
-                if !self.capabilities.endpoint_mute {
-                    return Err(BackendError::Unsupported);
-                }
                 let endpoint = state
                     .devices
                     .get_mut(&device)
                     .ok_or(BackendError::DeviceGone)?;
-                if endpoint.device.direction != Direction::Capture {
-                    return Err(BackendError::InvalidArgument);
+                if endpoint.device.direction == Direction::Capture
+                    && !self.capabilities.endpoint_mute
+                {
+                    return Err(BackendError::Unsupported);
                 }
                 endpoint.mute_revision = endpoint
                     .mute_revision
@@ -324,7 +330,9 @@ impl DryBackend {
                     .ok_or(BackendError::Busy)?;
                 endpoint.muted = muted;
                 let snapshot = mute_snapshot(endpoint);
-                state.emit(Event::MuteChanged(snapshot));
+                if endpoint.device.direction == Direction::Capture {
+                    state.emit(Event::MuteChanged(snapshot));
+                }
             }
             ScriptEvent::SetMedia { session, info } => {
                 if !self.capabilities.media {
@@ -592,6 +600,7 @@ impl Backend for DryBackend {
     ) -> Result<DryStream, BackendError> {
         let state = lock(&self.state);
         state.available()?;
+        let monitor = matches!(&request, CaptureSpec::Monitor { .. });
         let (endpoint, format, feedback, microphone) = match request {
             CaptureSpec::SystemExcludingOwnProcessTree { format } => {
                 if !self.capabilities.system_capture || !self.capabilities.exclude_own_process_tree
@@ -642,14 +651,16 @@ impl Backend for DryBackend {
             }
         };
         drop(state);
-        Ok(DryStream::new(
+        let mut stream = DryStream::new(
             self.state.clone(),
             endpoint,
             format,
             feedback,
             microphone,
             Callback::Capture(callback),
-        ))
+        );
+        stream.monitor = monitor;
+        Ok(stream)
     }
 
     fn start_render(
@@ -810,6 +821,9 @@ pub struct DryStream {
     format: AudioFormat,
     feedback: FeedbackGuarantee,
     microphone: bool,
+    monitor: bool,
+    source_silence: Option<DryMuteGuard>,
+    source_admitted: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     callback: Option<Callback>,
     buffer: Vec<f32>,
     frames: u64,
@@ -833,6 +847,9 @@ impl DryStream {
             format,
             feedback,
             microphone,
+            monitor: false,
+            source_silence: None,
+            source_admitted: None,
             callback: Some(callback),
             buffer: vec![0.0; samples],
             frames: 0,
@@ -847,6 +864,36 @@ impl DryStream {
     /// replacement and server errors stop the stream and release its callback before returning.
     /// Both 480-frame/48 kHz and 441-frame/44.1 kHz native blocks fit the bounded scratch buffer.
     pub fn pump(&mut self, frames: usize) -> Result<(), BackendError> {
+        if let Some(guard) = self.source_silence.as_mut() {
+            if self
+                .source_admitted
+                .as_ref()
+                .is_some_and(|admitted| admitted())
+            {
+                let mut state = lock(&guard.state);
+                let endpoint = state
+                    .devices
+                    .get_mut(&guard.device)
+                    .filter(|endpoint| endpoint.generation == guard.generation)
+                    .ok_or(BackendError::DeviceGone)?;
+                if !endpoint.muted {
+                    endpoint.muted = true;
+                    endpoint.mute_revision += 1;
+                    guard.owned = true;
+                }
+                guard.revision = endpoint.mute_revision;
+            } else {
+                // Refresh the render-only lease; microphone ownership remains unchanged.
+                {
+                    let state = lock(&guard.state);
+                    guard.revision = state
+                        .endpoint(&guard.device, guard.generation)?
+                        .mute_revision;
+                }
+                guard.restore()?;
+                self.source_silence = None;
+            }
+        }
         if self.callback.is_none() {
             return Err(BackendError::Stopped);
         }
@@ -956,12 +1003,90 @@ impl Stream for DryStream {
         }
     }
 
+    fn suppress_local_playback(
+        &mut self,
+        admitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), BackendError> {
+        if self.status != StreamStatus::Running {
+            return Err(BackendError::Stopped);
+        }
+        if !self.monitor {
+            return Err(BackendError::Unsupported);
+        }
+        let (device, generation) = self.endpoint.as_ref().ok_or(BackendError::Unsupported)?;
+        let (original, observed_revision) = {
+            let state = lock(&self.state);
+            let endpoint = state.endpoint(device, *generation)?;
+            (endpoint.muted, endpoint.mute_revision)
+        };
+        // Admission is arbitrary caller code: never run it under the Dry state lock.
+        if !admitted() {
+            return Err(BackendError::PermissionDenied);
+        }
+        // Never block after admission; revalidate the pinned state before any write.
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(BackendError::Busy),
+        };
+        let endpoint = state.endpoint(device, *generation)?;
+        if endpoint.mute_revision != observed_revision || endpoint.muted != original {
+            return Err(BackendError::OwnershipLost);
+        }
+        if let Some(guard) = &self.source_silence {
+            return if guard.active
+                && endpoint.leased
+                && endpoint.muted
+                && endpoint.mute_revision == guard.revision
+            {
+                Ok(())
+            } else {
+                Err(BackendError::OwnershipLost)
+            };
+        }
+        if endpoint.leased {
+            return Err(BackendError::Busy);
+        }
+        let revision = if original {
+            observed_revision
+        } else {
+            observed_revision.checked_add(1).ok_or(BackendError::Busy)?
+        };
+        let endpoint = state
+            .devices
+            .get_mut(device)
+            .ok_or(BackendError::DeviceGone)?;
+        endpoint.leased = true;
+        endpoint.muted = true;
+        endpoint.mute_revision = revision;
+        self.source_admitted = Some(admitted);
+        self.source_silence = Some(DryMuteGuard {
+            state: self.state.clone(),
+            device: device.clone(),
+            generation: *generation,
+            original,
+            revision,
+            owned: true,
+            active: true,
+        });
+        Ok(())
+    }
+
     fn stop(&mut self) -> Result<(), BackendError> {
+        let restored = self.source_silence.take().map_or(Ok(()), |mut guard| {
+            if let Ok(endpoint) = lock(&guard.state).endpoint(&guard.device, guard.generation) {
+                guard.revision = endpoint.mute_revision;
+            }
+            match guard.restore() {
+                Err(BackendError::OwnershipLost | BackendError::DeviceGone) => Ok(()),
+                result => result,
+            }
+        });
         self.callback = None;
         if self.status == StreamStatus::Running {
             self.status = StreamStatus::Stopped;
         }
-        Ok(())
+        restored
     }
 }
 
@@ -1065,7 +1190,9 @@ impl MuteGuard for DryMuteGuard {
                 .ok_or(BackendError::Busy)?;
             endpoint.muted = self.original;
             let snapshot = mute_snapshot(endpoint);
-            state.emit(Event::MuteChanged(snapshot));
+            if endpoint.device.direction == Direction::Capture {
+                state.emit(Event::MuteChanged(snapshot));
+            }
         }
         Ok(())
     }

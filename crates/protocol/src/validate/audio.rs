@@ -353,6 +353,15 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
                 || wire::MediaPlayback::try_from(info.playback).is_err()
                 || info.commands & !31 != 0
                 || matches!((info.position_ms, info.duration_ms), (Some(p), Some(d)) if p > d)
+                || if info.can_seek == Some(true) {
+                    !matches!(
+                        (info.position_ms, info.duration_ms, info.seek_min_ms, info.seek_max_ms),
+                        (Some(_), Some(duration), Some(min), Some(max))
+                            if duration > 0 && min <= max && max <= duration
+                    )
+                } else {
+                    info.seek_min_ms.is_some() || info.seek_max_ms.is_some()
+                }
             {
                 return Err(AudioViolation::Metadata);
             }
@@ -369,6 +378,9 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
                 || info.playback != wire::MediaPlayback::Stopped as i32
                 || info.commands != 0
                 || info.allow_control
+                || info.can_seek == Some(true)
+                || info.seek_min_ms.is_some()
+                || info.seek_max_ms.is_some()
             {
                 return Err(AudioViolation::Shape);
             }
@@ -384,6 +396,11 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
                     return Err(AudioViolation::Shape)
                 }
                 Ok(_) => {}
+            }
+            if (command.command == wire::MediaCommandKind::Seek as i32)
+                != command.position_ms.is_some()
+            {
+                return Err(AudioViolation::Shape);
             }
         }
         Body::MediaAck(ack) => {

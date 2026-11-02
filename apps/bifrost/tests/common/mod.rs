@@ -1846,15 +1846,20 @@ pub struct Unpaired {
 impl Unpaired {
     /// Starts the two cores, each with its own `--root`.
     pub fn start(label: &str) -> Unpaired {
-        Self::start_with_audio(label, false)
+        Self::start_with_audio(label, false, false)
     }
 
     /// An unpaired GUI fixture with the explicit isolated-root Dry-audio launch flag.
     pub fn start_audio(label: &str) -> Unpaired {
-        Self::start_with_audio(label, true)
+        Self::start_with_audio(label, true, false)
     }
 
-    fn start_with_audio(label: &str, dry_audio: bool) -> Unpaired {
+    /// Dry media without generated input events, for media-control-only assertions.
+    pub fn start_audio_no_input(label: &str) -> Unpaired {
+        Self::start_with_audio(label, true, true)
+    }
+
+    fn start_with_audio(label: &str, dry_audio: bool, no_input_events: bool) -> Unpaired {
         let dir = unique_dir(label);
         let a_root = dir.join("a");
         let b_root = dir.join("b");
@@ -1862,6 +1867,10 @@ impl Unpaired {
             std::fs::create_dir_all(root.join("config")).expect("config directory");
             if dry_audio {
                 audio::mark_dry(root);
+                if no_input_events {
+                    std::fs::write(root.join("run/no-input-events-dry"), [])
+                        .expect("zero Dry input events marker");
+                }
             }
         }
         // Paired with nobody, so the identity has to be created before the id can be read:

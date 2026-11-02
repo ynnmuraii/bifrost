@@ -200,6 +200,7 @@ pub struct MediaCommands {
     pub toggle: bool,
     pub next: bool,
     pub previous: bool,
+    pub seek: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +210,7 @@ pub enum MediaCommand {
     Toggle,
     Next,
     Previous,
+    SeekTo { position_ms: u64 },
 }
 
 /// A bounded, transient now-playing snapshot, sent only for a consented live stream.
@@ -224,6 +226,8 @@ pub struct MediaInfo {
     /// Opaque token scoped to the Source's audio worker generation / active audio session.
     pub session_token: u64,
     pub duration_ms: Option<u64>,
+    pub seek_min_ms: Option<u64>,
+    pub seek_max_ms: Option<u64>,
     pub playback: PlaybackState,
     pub commands: MediaCommands,
     pub revision: u64,
@@ -250,7 +254,34 @@ impl MediaInfo {
         if self.subtitle.len() > MAX_MEDIA_SUBTITLE_BYTES {
             return Err(StatusError::SubtitleTooLong);
         }
+        if matches!((self.position_ms, self.duration_ms),
+            (Some(position), Some(duration)) if position > duration)
+            || if self.commands.seek {
+                self.seek_range().is_none()
+            } else {
+                self.seek_min_ms.is_some() || self.seek_max_ms.is_some()
+            }
+        {
+            return Err(StatusError::InvalidMediaTimeline);
+        }
         Ok(())
+    }
+
+    pub fn seek_range(&self) -> Option<(u64, u64)> {
+        match (
+            self.commands.seek,
+            self.position_ms,
+            self.duration_ms,
+            self.seek_min_ms,
+            self.seek_max_ms,
+        ) {
+            (true, Some(position), Some(duration), Some(min), Some(max))
+                if duration > 0 && position <= duration && min <= max && max <= duration =>
+            {
+                Some((min, max))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -313,6 +344,7 @@ pub enum StatusError {
     InvalidUdpPort,
     LatencyOutOfRange,
     InvalidSystemSharingError,
+    InvalidMediaTimeline,
 }
 
 impl AudioStatus {

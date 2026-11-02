@@ -131,6 +131,135 @@ fn revisions_selection_and_queue_overflow_are_explicit() {
     assert!(mpris.current().unwrap().is_none());
     assert_eq!(mpris.poll_changed(), Some(Event::ResyncRequired));
 }
+
+#[test]
+fn selected_live_player_remains_current_when_paused_or_stopped() {
+    let mpris = fixture();
+    let now = Instant::now();
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("owned").unwrap().state = PlaybackState::Playing;
+        data.publish("owned", true, false, now);
+    }
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(1)));
+    for (index, state) in [
+        PlaybackState::Paused,
+        PlaybackState::Stopped,
+        PlaybackState::Playing,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        {
+            let mut data = lock(&mpris.shared.data);
+            let player = data.players.get_mut("owned").unwrap();
+            let was_playing = player.state == PlaybackState::Playing;
+            player.state = state;
+            data.publish("owned", true, was_playing, now);
+        }
+        assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(1)));
+        let info = mpris.sessions().unwrap().into_iter().next().unwrap();
+        assert_eq!(info.state, state);
+        mpris
+            .command(MediaCommandRequest {
+                request_id: 100 + index as u64,
+                session: info.session,
+                expected_revision: info.revision,
+                command: MediaCommand::Play,
+            })
+            .unwrap();
+        mpris.cancel();
+    }
+}
+
+#[test]
+fn only_last_selected_player_is_a_fallback_and_new_playing_precedes_it() {
+    let mpris = fixture();
+    let now = Instant::now();
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("owned").unwrap().state = PlaybackState::Paused;
+    }
+    assert_eq!(mpris.current().unwrap(), None);
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("owned").unwrap().state = PlaybackState::Playing;
+        data.publish("owned", true, false, now);
+    }
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(1)));
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("owned").unwrap().state = PlaybackState::Paused;
+        let mut second = Player::new(":second".into(), MediaSessionToken(2), now);
+        second.state = PlaybackState::Playing;
+        data.players.insert("second".into(), second);
+        data.publish("second", true, false, now);
+        // This player played and paused between consumer selections.
+        data.players.get_mut("second").unwrap().state = PlaybackState::Paused;
+    }
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(1)));
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("second").unwrap().state = PlaybackState::Playing;
+        data.publish("second", true, false, now);
+    }
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(2)));
+    lock(&mpris.shared.data)
+        .players
+        .get_mut("second")
+        .unwrap()
+        .state = PlaybackState::Stopped;
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(2)));
+}
+
+#[test]
+fn selected_player_unknown_owner_loss_and_unavailability_do_not_revive_old_tokens() {
+    let mpris = fixture();
+    let now = Instant::now();
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("owned").unwrap().state = PlaybackState::Playing;
+        data.publish("owned", true, false, now);
+    }
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(1)));
+    lock(&mpris.shared.data)
+        .players
+        .get_mut("owned")
+        .unwrap()
+        .state = PlaybackState::Unknown;
+    assert_eq!(mpris.current().unwrap(), None);
+    lock(&mpris.shared.data)
+        .players
+        .get_mut("owned")
+        .unwrap()
+        .state = PlaybackState::Paused;
+    assert_eq!(mpris.current().unwrap(), None);
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("owned").unwrap().state = PlaybackState::Playing;
+        data.publish("owned", true, false, now);
+    }
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(1)));
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.remove("owned");
+        let mut replacement = Player::new(":replacement".into(), MediaSessionToken(2), now);
+        replacement.state = PlaybackState::Paused;
+        data.players.insert("owned".into(), replacement);
+    }
+    assert_eq!(mpris.current().unwrap(), None);
+    assert_eq!(mpris.command(request(200)), Err(BackendError::DeviceGone));
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players.get_mut("owned").unwrap().state = PlaybackState::Playing;
+        data.publish("owned", true, false, now);
+    }
+    assert_eq!(mpris.current().unwrap(), Some(MediaSessionToken(2)));
+    lock(&mpris.shared.data).unavailable();
+    assert_eq!(mpris.current(), Err(BackendError::ServerUnavailable));
+    lock(&mpris.shared.data).available = true;
+    assert_eq!(mpris.current().unwrap(), None);
+}
 struct Root {
     app: String,
 }
@@ -151,6 +280,7 @@ struct Fake {
     commands: AtomicUsize,
     position: AtomicI64,
     slow_pause: AtomicBool,
+    track: AtomicUsize,
 }
 struct FakePlayer {
     data: Arc<Fake>,
@@ -181,6 +311,26 @@ impl FakePlayer {
     fn previous(&self) {
         self.data.commands.fetch_add(1, Ordering::SeqCst);
     }
+    async fn set_position(
+        &self,
+        track_id: ObjectPath<'_>,
+        position: i64,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let expected_track = if self.data.track.load(Ordering::SeqCst) == 0 {
+            "/owned/track"
+        } else {
+            "/owned/next"
+        };
+        if track_id.as_str() != expected_track || !(0..=600_000_000).contains(&position) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "invalid track or position".into(),
+            ));
+        }
+        self.data.position.store(position, Ordering::SeqCst);
+        Self::seeked(&emitter, position).await?;
+        Ok(())
+    }
     #[zbus(property)]
     fn playback_status(&self) -> &str {
         match self.data.state.load(Ordering::SeqCst) {
@@ -200,8 +350,15 @@ impl FakePlayer {
         metadata.insert("mpris:length".into(), 600_000_000i64.into());
         metadata.insert(
             "mpris:trackid".into(),
-            OwnedValue::try_from(Value::from(ObjectPath::try_from("/owned/track").unwrap()))
+            OwnedValue::try_from(Value::from(
+                ObjectPath::try_from(if self.data.track.load(Ordering::SeqCst) == 0 {
+                    "/owned/track"
+                } else {
+                    "/owned/next"
+                })
                 .unwrap(),
+            ))
+            .unwrap(),
         );
         metadata
     }
@@ -231,6 +388,10 @@ impl FakePlayer {
     }
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
+        true
+    }
+    #[zbus(property)]
+    fn can_seek(&self) -> bool {
         true
     }
     #[zbus(signal)]
@@ -334,6 +495,105 @@ fn live_owned_mpris_player_discovery_commands_seek_and_removal() {
             .is_some_and(|position| (3000..4000).contains(&position))
     });
     let changed = own_info(&mpris, &app).unwrap();
+    assert!(changed.commands.seek);
+    mpris
+        .command(MediaCommandRequest {
+            request_id: 20,
+            session: token,
+            expected_revision: changed.revision,
+            command: MediaCommand::SeekTo {
+                position_ms: 123_456,
+            },
+        })
+        .unwrap();
+    assert_eq!(completion(&mpris, 20), Ok(()));
+    assert_eq!(data.position.load(Ordering::SeqCst), 123_456_000);
+    wait_until(|| {
+        own_info(&mpris, &app)
+            .unwrap()
+            .position_ms
+            .is_some_and(|position| (123_456..124_456).contains(&position))
+    });
+    let changed = own_info(&mpris, &app).unwrap();
+    data.track.store(1, Ordering::SeqCst);
+    futures::executor::block_on(async {
+        let interface = connection
+            .object_server()
+            .interface::<_, FakePlayer>(PATH)
+            .await
+            .unwrap();
+        let player = interface.get().await;
+        player
+            .metadata_changed(interface.signal_emitter())
+            .await
+            .unwrap();
+        player
+            .position_changed(interface.signal_emitter())
+            .await
+            .unwrap();
+    });
+    wait_until(|| {
+        own_info(&mpris, &app).unwrap().revision > changed.revision
+            && own_info(&mpris, &app).unwrap().commands.seek
+    });
+    assert_eq!(
+        mpris.command(MediaCommandRequest {
+            request_id: 21,
+            session: token,
+            expected_revision: changed.revision,
+            command: MediaCommand::SeekTo { position_ms: 1 },
+        }),
+        Err(BackendError::StaleRevision)
+    );
+    let changed = own_info(&mpris, &app).unwrap();
+    mpris
+        .command(MediaCommandRequest {
+            request_id: 22,
+            session: token,
+            expected_revision: changed.revision,
+            command: MediaCommand::SeekTo { position_ms: 0 },
+        })
+        .unwrap();
+    assert_eq!(completion(&mpris, 22), Ok(()));
+    assert_eq!(data.position.load(Ordering::SeqCst), 0);
+    wait_until(|| own_info(&mpris, &app).unwrap().revision > changed.revision);
+    let changed = own_info(&mpris, &app).unwrap();
+    mpris
+        .command(MediaCommandRequest {
+            request_id: 23,
+            session: token,
+            expected_revision: changed.revision,
+            command: MediaCommand::Pause,
+        })
+        .unwrap();
+    assert_eq!(completion(&mpris, 23), Ok(()));
+    wait_until(|| own_info(&mpris, &app).unwrap().state == PlaybackState::Paused);
+    assert_eq!(mpris.current().unwrap(), Some(token));
+    let paused = own_info(&mpris, &app).unwrap();
+    mpris
+        .command(MediaCommandRequest {
+            request_id: 24,
+            session: token,
+            expected_revision: paused.revision,
+            command: MediaCommand::SeekTo { position_ms: 42 },
+        })
+        .unwrap();
+    assert_eq!(completion(&mpris, 24), Ok(()));
+    assert_eq!(data.position.load(Ordering::SeqCst), 42_000);
+    wait_until(|| own_info(&mpris, &app).unwrap().position_ms == Some(42));
+    let paused = own_info(&mpris, &app).unwrap();
+    assert_eq!(paused.state, PlaybackState::Paused);
+    mpris
+        .command(MediaCommandRequest {
+            request_id: 25,
+            session: token,
+            expected_revision: paused.revision,
+            command: MediaCommand::Play,
+        })
+        .unwrap();
+    assert_eq!(completion(&mpris, 25), Ok(()));
+    wait_until(|| own_info(&mpris, &app).unwrap().state == PlaybackState::Playing);
+    let changed = own_info(&mpris, &app).unwrap();
     assert!(changed.revision > info.revision);
     assert_eq!(
         mpris.command(MediaCommandRequest {
@@ -356,7 +616,7 @@ fn live_owned_mpris_player_discovery_commands_seek_and_removal() {
     assert_eq!(completion(&mpris, 3), Err(BackendError::Timeout));
     thread::sleep(Duration::from_millis(650));
     assert!(mpris.poll_completion().is_none());
-    assert_eq!(data.commands.load(Ordering::SeqCst), 2);
+    assert_eq!(data.commands.load(Ordering::SeqCst), 4);
     let current = own_info(&mpris, &app).unwrap();
     mpris
         .command(MediaCommandRequest {
@@ -385,12 +645,12 @@ fn live_owned_mpris_player_discovery_commands_seek_and_removal() {
             command: MediaCommand::Next,
         })
         .unwrap();
-    wait_until(|| data.commands.load(Ordering::SeqCst) == 4);
+    wait_until(|| data.commands.load(Ordering::SeqCst) == 6);
     mpris.cancel();
     assert_eq!(completion(&mpris, 11), Err(BackendError::Cancelled));
     assert_eq!(completion(&mpris, 12), Err(BackendError::Cancelled));
     thread::sleep(Duration::from_millis(1600));
-    assert_eq!(data.commands.load(Ordering::SeqCst), 4);
+    assert_eq!(data.commands.load(Ordering::SeqCst), 6);
     assert!(mpris.poll_completion().is_none());
     futures::executor::block_on(connection.release_name(name.as_str())).unwrap();
     wait_until(|| own_info(&mpris, &app).is_none());

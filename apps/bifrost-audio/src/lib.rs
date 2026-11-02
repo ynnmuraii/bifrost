@@ -78,6 +78,7 @@ struct Permit {
     id: [u8; 16],
     role: i32,
     authorized: Arc<AtomicBool>,
+    local_sound: Arc<AtomicBool>,
     deadline: Instant,
     stop_reason: i32,
 }
@@ -105,6 +106,24 @@ impl Shared {
         lock(&self.permits).iter().any(|permit| {
             permit.role == 1 && now < permit.deadline && permit.authorized.load(Ordering::Acquire)
         })
+    }
+    fn release_source_local_sound(&self, id: &[u8]) {
+        for permit in lock(&self.permits)
+            .iter()
+            .filter(|permit| permit.role == 1 && permit.id == id)
+        {
+            permit.local_sound.store(false, Ordering::Release);
+        }
+    }
+    fn source_local_sound(&self, id: &[u8]) -> bool {
+        self.source_local_sound_permit(id)
+            .is_some_and(|allowed| allowed.load(Ordering::Acquire))
+    }
+    fn source_local_sound_permit(&self, id: &[u8]) -> Option<Arc<AtomicBool>> {
+        lock(&self.permits)
+            .iter()
+            .find(|permit| permit.role == 1 && permit.id == id)
+            .map(|permit| permit.local_sound.clone())
     }
     fn stop_all(&self) {
         self.stopping.store(true, Ordering::Release);
@@ -226,23 +245,29 @@ fn dry_backend() -> Result<DryBackend, BackendError> {
         communications: defaults,
     }))?;
     let token = audio_backend::MediaSessionToken(1);
+    let mut media = audio_backend::MediaInfo::new(
+        "bifrost-dry".into(),
+        "Dry media".into(),
+        "Harness only".into(),
+        token,
+        1,
+        audio_backend::PlaybackState::Paused,
+        audio_backend::MediaCommands {
+            play: true,
+            pause: true,
+            toggle: true,
+            next: true,
+            previous: true,
+            seek: true,
+        },
+    )?;
+    media.position_ms = Some(10_000);
+    media.duration_ms = Some(180_000);
+    media.seek_min_ms = Some(0);
+    media.seek_max_ms = Some(180_000);
     backend.apply(ScriptEvent::SetMedia {
         session: token,
-        info: Some(audio_backend::MediaInfo::new(
-            "bifrost-dry".into(),
-            "Dry media".into(),
-            "Harness only".into(),
-            token,
-            1,
-            audio_backend::PlaybackState::Paused,
-            audio_backend::MediaCommands {
-                play: true,
-                pause: true,
-                toggle: true,
-                next: true,
-                previous: true,
-            },
-        )?),
+        info: Some(media),
     })?;
     backend.apply(ScriptEvent::SetCurrentMediaSession {
         session: Some(token),
@@ -451,6 +476,7 @@ where
                 match message {
                     Msg::Ping(ping)=>{if send(&mut link,0,Msg::Pong(w::Pong {serial:ping.serial})).await.is_err(){break;}},
                     Msg::Shutdown(_)=>{reason=ExitReason::Shutdown;break;},
+                    Msg::ReleaseSourceLocalSound(release)=>{shared.release_source_local_sound(&release.session_id);},
                     Msg::RenewSession(renew)=>{
                         if !shared.renew(&renew.session_id,renew.ttl_ms,Instant::now())
                             && send(&mut link,request_id,Msg::Error(w::Error {code:6,session_id:renew.session_id})).await.is_err(){break;}
@@ -480,7 +506,7 @@ where
                         if let Msg::StartSession(start)=&message {
                             let id:[u8;16]=start.session_id.as_slice().try_into().expect("AudioLink validated session id");
                             let deadline=Instant::now()+Duration::from_millis(u64::from(start.initial_authorization_ms));
-                            let admitted={let mut permits=lock(&shared.permits);if permits.len()>=contract::MAX_SESSIONS||permits.iter().any(|permit|permit.id==id){false}else{let authorized=Arc::new(AtomicBool::new(true));permits.push(Permit {id,role:start.role,authorized:authorized.clone(),deadline,stop_reason:1});permit=Some(authorized);true}};
+                            let admitted={let mut permits=lock(&shared.permits);if permits.len()>=contract::MAX_SESSIONS||permits.iter().any(|permit|permit.id==id){false}else{let authorized=Arc::new(AtomicBool::new(true));permits.push(Permit {id,role:start.role,authorized:authorized.clone(),local_sound:Arc::new(AtomicBool::new(!start.source_local_sound_released)),deadline,stop_reason:1});permit=Some(authorized);true}};
                             if !admitted {if send(&mut link,request_id,Msg::Error(w::Error {code:3,session_id:id.to_vec()})).await.is_err(){break;}continue;}
                         }
                         let id=if let Msg::StartSession(start)=&message{Some(start.session_id.clone())}else{None};

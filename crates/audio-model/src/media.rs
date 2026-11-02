@@ -97,6 +97,9 @@ impl Relay {
             MediaCommand::Toggle => info.commands.toggle,
             MediaCommand::Next => info.commands.next,
             MediaCommand::Previous => info.commands.previous,
+            MediaCommand::SeekTo { position_ms } => info
+                .seek_range()
+                .is_some_and(|(min, max)| (min..=max).contains(&position_ms)),
         };
         if supported {
             Ok(())

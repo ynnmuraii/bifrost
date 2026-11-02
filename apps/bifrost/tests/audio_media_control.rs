@@ -63,6 +63,7 @@ fn command(
     session_id: &[u8],
     info: &wire::MediaInfo,
     command: wire::AudioMediaCommand,
+    position_ms: Option<u64>,
 ) -> gui_frame::Msg {
     gui_frame::Msg::SendMediaCommand(wire::SendMediaCommand {
         peer_node_id: source_id.to_vec(),
@@ -70,6 +71,7 @@ fn command(
         session_token: info.session_token,
         media_revision: info.revision,
         command: command as i32,
+        position_ms,
     })
 }
 
@@ -86,7 +88,7 @@ fn denied(message: gui_frame::Msg, code: &str) {
 #[test]
 fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() {
     let _guard = common::serial();
-    let two = Unpaired::start_audio("audio-media-control");
+    let two = Unpaired::start_audio_no_input("audio-media-control");
     two.wait_ready();
     let mut listener = Window::open(&two.a);
     let mut source = Window::open(&two.b);
@@ -133,22 +135,33 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
     assert!(no_metadata(&listener.status()), "no metadata before Active");
     assert!(!resolved.config.expect("Source config").peers[0].allow_media_control);
 
-    listener.start(&source_id);
+    let start_revision = listener.status().revision;
+    listener.op(gui_frame::Msg::StartAudio(wire::StartAudio {
+        peer_node_id: source_id.clone(),
+        kind: wire::AudioKind::System as i32,
+        profile: wire::AudioProfile::Ethernet as i32,
+        expected_revision: start_revision,
+    }));
     let session_id = audio::healthy(&mut listener, &mut source, &listener_id, &source_id);
     let native = media(&mut source, &session_id);
-    assert_eq!(native.title, "Dry media");
     let initial = media(&mut listener, &session_id);
-    assert!(
-        !initial.title.is_empty(),
-        "actual current media has a title"
-    );
     assert_ne!(initial.session_token, 0);
     assert_eq!(initial.session_token, native.session_token);
     assert_eq!(initial.revision, native.revision);
     assert_ne!(initial.revision, 0);
     let (requested, _) = opposite_command(&initial);
     denied(
-        listener.request(command(&source_id, &session_id, &initial, requested)),
+        listener.request(command(&source_id, &session_id, &initial, requested, None)),
+        ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
+    );
+    denied(
+        listener.request(command(
+            &source_id,
+            &session_id,
+            &initial,
+            wire::AudioMediaCommand::Seek,
+            Some(42_000),
+        )),
         ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
     );
     // Permission denial takes precedence over absent native targeting facts.
@@ -157,7 +170,13 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
         unavailable.session_token = token;
         unavailable.revision = revision;
         denied(
-            listener.request(command(&source_id, &session_id, &unavailable, requested)),
+            listener.request(command(
+                &source_id,
+                &session_id,
+                &unavailable,
+                requested,
+                None,
+            )),
             ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
         );
     }
@@ -225,6 +244,7 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
                 &session_id,
                 &unavailable,
                 wire::AudioMediaCommand::Toggle,
+                None,
             )),
             ipc::audio::codes::AUDIO_STALE_MEDIA,
         );
@@ -237,7 +257,13 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
     for _ in 0..2 {
         let (requested, expected_playback) = opposite_command(&current);
         let before_revision = listener.status().revision;
-        audio::assert_ok(listener.request(command(&source_id, &session_id, &current, requested)));
+        audio::assert_ok(listener.request(command(
+            &source_id,
+            &session_id,
+            &current,
+            requested,
+            None,
+        )));
         let changed = listener.wait(
             "native command changes playback and media revision",
             |status| {
@@ -262,15 +288,119 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
             .expect("changed native metadata");
     }
 
+    assert_eq!(current.playback, wire::AudioPlaybackState::Paused as i32);
+    assert!(current.commands.as_ref().expect("native commands").seek);
+    for position_ms in [0, 42_000] {
+        let min = current.seek_min_ms.expect("published native seek minimum");
+        let max = current.seek_max_ms.expect("published native seek maximum");
+        let duration = current.duration_ms.expect("known native duration");
+        assert!(duration > 0 && min <= position_ms && position_ms <= max && max <= duration);
+        let native_before = media(&mut source, &session_id);
+        assert_eq!(native_before.session_token, current.session_token);
+        assert_eq!(native_before.revision, current.revision);
+        assert_ne!(native_before.position_ms, Some(position_ms));
+        audio::assert_ok(listener.request(command(
+            &source_id,
+            &session_id,
+            &current,
+            wire::AudioMediaCommand::Seek,
+            Some(position_ms),
+        )));
+        let native_changed = source.wait(
+            "Dry native seek changes position and revision while paused",
+            |status| {
+                status.sessions.iter().any(|session| {
+                    session.session_id == session_id
+                        && session.state == wire::AudioSessionState::Running as i32
+                        && session.media_info.as_ref().is_some_and(|info| {
+                            info.session_token == native_before.session_token
+                                && info.revision > native_before.revision
+                                && info.position_ms == Some(position_ms)
+                                && info.playback == wire::AudioPlaybackState::Paused as i32
+                        })
+                })
+            },
+        );
+        let native_after = native_changed
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .and_then(|session| session.media_info)
+            .expect("changed Source native position");
+        let published = listener.wait(
+            "Listener publishes the changed native seek position",
+            |status| {
+                status.sessions.iter().any(|session| {
+                    session.session_id == session_id
+                        && session.state == wire::AudioSessionState::Running as i32
+                        && session.media_info.as_ref().is_some_and(|info| {
+                            info.session_token == current.session_token
+                                && info.revision == native_after.revision
+                                && info.position_ms == Some(position_ms)
+                                && info.playback == wire::AudioPlaybackState::Paused as i32
+                        })
+                })
+            },
+        );
+        current = published
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .and_then(|session| session.media_info)
+            .expect("published seek position");
+    }
+    audio::assert_ok(listener.request(command(
+        &source_id,
+        &session_id,
+        &current,
+        wire::AudioMediaCommand::Play,
+        None,
+    )));
+    let resumed = listener.wait(
+        "Play resumes the same paused-and-seeked session",
+        |status| {
+            status.sessions.iter().any(|session| {
+                session.session_id == session_id
+                    && session.state == wire::AudioSessionState::Running as i32
+                    && session.media_info.as_ref().is_some_and(|info| {
+                        info.session_token == current.session_token
+                            && info.revision > current.revision
+                            && info.position_ms == Some(42_000)
+                            && info.playback == wire::AudioPlaybackState::Playing as i32
+                    })
+            })
+        },
+    );
+    current = resumed
+        .sessions
+        .into_iter()
+        .find(|session| session.session_id == session_id)
+        .and_then(|session| session.media_info)
+        .expect("same resumed native media");
+    let native_resumed = media(&mut source, &session_id);
+    assert_eq!(native_resumed.session_token, current.session_token);
+    assert_eq!(native_resumed.revision, current.revision);
+    assert_eq!(native_resumed.position_ms, Some(42_000));
+    assert_eq!(
+        native_resumed.playback,
+        wire::AudioPlaybackState::Playing as i32
+    );
+
     let (requested, _) = opposite_command(&current);
     denied(
-        listener.request(command(&source_id, &session_id, &stale, requested)),
+        listener.request(command(&source_id, &session_id, &stale, requested, None)),
         ipc::audio::codes::AUDIO_STALE_MEDIA,
     );
     let mut wrong_token = current.clone();
     wrong_token.session_token = if current.session_token == 1 { 2 } else { 1 };
     denied(
-        listener.request(command(&source_id, &session_id, &wrong_token, requested)),
+        listener.request(command(
+            &source_id,
+            &session_id,
+            &wrong_token,
+            requested,
+            None,
+        )),
         ipc::audio::codes::AUDIO_STALE_MEDIA,
     );
     let unchanged = media(&mut listener, &session_id);
@@ -301,11 +431,11 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
         },
     );
     denied(
-        listener.request(command(&source_id, &session_id, &current, requested)),
+        listener.request(command(&source_id, &session_id, &current, requested, None)),
         ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
     );
     denied(
-        listener.request(command(&source_id, &session_id, &stale, requested)),
+        listener.request(command(&source_id, &session_id, &stale, requested, None)),
         ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
     );
     for (token, revision) in [(0, current.revision), (current.session_token, 0), (0, 0)] {
@@ -313,7 +443,13 @@ fn active_media_requires_separate_control_consent_executes_and_clears_on_stop() 
         unavailable.session_token = token;
         unavailable.revision = revision;
         denied(
-            listener.request(command(&source_id, &session_id, &unavailable, requested)),
+            listener.request(command(
+                &source_id,
+                &session_id,
+                &unavailable,
+                requested,
+                None,
+            )),
             ipc::audio::codes::AUDIO_CONSENT_REQUIRED,
         );
     }

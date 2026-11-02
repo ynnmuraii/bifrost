@@ -273,6 +273,7 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
                 token: 1,
                 expected_revision: 1,
                 command: 1,
+                position_ms: None,
             }),
         )
         .await
@@ -289,6 +290,7 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
                 token: 1,
                 expected_revision: 99,
                 command: 1,
+                position_ms: None,
             }),
         )
         .await
@@ -302,6 +304,7 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
                 token: 1,
                 expected_revision: 2,
                 command: 4,
+                position_ms: None,
             }),
         )
         .await
@@ -329,6 +332,7 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
                     token: 1,
                     expected_revision: 2,
                     command: 1,
+                    position_ms: None,
                 }),
             )
             .await
@@ -344,6 +348,7 @@ async fn media_consent_commands_and_source_lease_over_real_audio_link() {
                 token: 1,
                 expected_revision: 2,
                 command: 1,
+                position_ms: None,
             }),
         )
         .await

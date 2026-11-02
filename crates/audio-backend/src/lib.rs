@@ -247,6 +247,15 @@ pub trait Stream: Send {
     fn device(&self) -> Option<&DeviceId>;
     fn feedback_guarantee(&self) -> FeedbackGuarantee;
     fn snapshot(&self) -> StreamSnapshot;
+    /// Explicit Source-only control operation; constructors and probes remain read-only.
+    /// Hold only the exact selected output silent while admission remains true; volume is
+    /// untouched. False permanently releases this hold without stopping capture. Stop/Drop
+    /// restores the original mute on the same generation. Admission must be nonblocking.
+    /// Inapplicable capture/render returns Unsupported; constructors/probes never write mute.
+    fn suppress_local_playback(
+        &mut self,
+        admitted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), BackendError>;
     fn stop(&mut self) -> Result<(), BackendError>;
 }
 
@@ -338,6 +347,12 @@ pub enum MediaCommand {
     Toggle,
     Next,
     Previous,
+    /// Absolute displayed offset in milliseconds from the published timeline start,
+    /// in the same normalized domain as duration and seek bounds, not native ticks.
+    /// Reject unsupported or out-of-range requests; never clamp at the Source.
+    SeekTo {
+        position_ms: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -347,6 +362,7 @@ pub struct MediaCommands {
     pub toggle: bool,
     pub next: bool,
     pub previous: bool,
+    pub seek: bool,
 }
 
 impl MediaCommands {
@@ -357,6 +373,7 @@ impl MediaCommands {
             MediaCommand::Toggle => self.toggle,
             MediaCommand::Next => self.next,
             MediaCommand::Previous => self.previous,
+            MediaCommand::SeekTo { .. } => self.seek,
         }
     }
 }
@@ -374,6 +391,8 @@ pub struct MediaInfo {
     /// None when the native session does not expose a timeline; never invent a zero position.
     pub position_ms: Option<u64>,
     pub duration_ms: Option<u64>,
+    pub seek_min_ms: Option<u64>,
+    pub seek_max_ms: Option<u64>,
     pub state: PlaybackState,
     pub commands: MediaCommands,
 }
@@ -399,9 +418,29 @@ impl MediaInfo {
             revision,
             position_ms: None,
             duration_ms: None,
+            seek_min_ms: None,
+            seek_max_ms: None,
             state,
             commands,
         })
+    }
+
+    /// Seek requires a native timeline and bounds within a positive duration.
+    pub fn seek_range(&self) -> Option<(u64, u64)> {
+        match (
+            self.commands.seek,
+            self.position_ms,
+            self.duration_ms,
+            self.seek_min_ms,
+            self.seek_max_ms,
+        ) {
+            (true, Some(position), Some(duration), Some(min), Some(max))
+                if duration > 0 && position <= duration && min <= max && max <= duration =>
+            {
+                Some((min, max))
+            }
+            _ => None,
+        }
     }
 
     pub fn app(&self) -> &str {

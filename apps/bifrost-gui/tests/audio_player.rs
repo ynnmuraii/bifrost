@@ -1,5 +1,4 @@
-//! Display/GPU-free player coverage. Set BIFROST_PLAYER_SHOTS to an external directory
-//! to additionally render fixture PNGs through the existing offscreen wgpu harness.
+//! Display/GPU-free player behavior and production viewport bounds coverage.
 use bifrost_gui::audio_player::{
     AppKind, AudioPlayer, AudioPlayerAction, AudioPlayerCard, StreamState,
 };
@@ -18,6 +17,7 @@ fn card(id: &str) -> AudioPlayerCard {
         app: AppKind::YouTube,
         position_ms: Some(5_000),
         duration_ms: Some(869_000),
+        seek: None,
         playing: true,
         can_prev: true,
         can_play_pause: true,
@@ -73,12 +73,23 @@ fn draw_frame(
     lang: Lang,
     events: Vec<egui::Event>,
 ) -> (egui::FullOutput, Vec<AudioPlayerAction>) {
+    draw_frame_at_width(ctx, cards, theme, lang, 240.0, events)
+}
+
+fn draw_frame_at_width(
+    ctx: &egui::Context,
+    cards: &[AudioPlayerCard],
+    theme: Theme,
+    lang: Lang,
+    width: f32,
+    events: Vec<egui::Event>,
+) -> (egui::FullOutput, Vec<AudioPlayerAction>) {
     let mut actions = Vec::new();
     let mut output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(240.0, audio_player::height(cards)),
+                egui::vec2(width, audio_player::height(cards)),
             )),
             events,
             ..Default::default()
@@ -89,6 +100,238 @@ fn draw_frame(
     );
     output.textures_delta.clear();
     (output, actions)
+}
+
+#[test]
+fn player_volume_is_visible_bounded_and_operable_without_a_hover_popup() {
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for width in [225.0, 240.0, 400.0] {
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                ctx.enable_accesskit();
+                let cards = fixtures("system");
+                let client = egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, audio_player::height(&cards)),
+                );
+                let frame = |events| {
+                    let mut actions = Vec::new();
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(client),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| actions = audio_player::draw(ui, &cards, theme, lang),
+                    );
+                    (output, actions)
+                };
+                frame(Vec::new()).0.drop_without_applying_deltas();
+                let (output, actions) = frame(Vec::new());
+                assert!(actions.is_empty());
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let slider = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Slider
+                            && node.label() == Some(text(lang, Key::AudioGain))
+                    })
+                    .expect("volume slider must be available without hovering");
+                let bounds = slider.1.bounds().expect("volume hit target");
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                    egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+                );
+                assert!(
+                    client.shrink(8.0).contains_rect(rect),
+                    "{rect:?} {client:?}"
+                );
+                assert!(rect.width() >= 48.0 && rect.height() >= 20.0, "{rect:?}");
+                let (percent, clip) =
+                    text_geometry(&output.shapes, "75%").expect("visible numeric volume");
+                assert!(client.shrink(8.0).contains_rect(percent), "{percent:?}");
+                assert!(
+                    clip.contains_rect(percent),
+                    "clipped percentage: {percent:?} {clip:?}"
+                );
+                assert!(
+                    rect.right() <= percent.left(),
+                    "slider and percentage overlap"
+                );
+                output.drop_without_applying_deltas();
+                let at = egui::pos2(rect.right() - 1.0, rect.center().y);
+                let (_, actions) = frame(vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ]);
+                assert_eq!(
+                    actions,
+                    vec![AudioPlayerAction::SetGain {
+                        stream_id: "stream-1".into(),
+                        percent: 100,
+                    }]
+                );
+                frame(vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }])
+                .0
+                .drop_without_applying_deltas();
+            }
+        }
+    }
+}
+
+#[test]
+fn active_player_has_a_distinct_hide_action_without_stopping_the_stream() {
+    for lang in [Lang::En, Lang::Ru] {
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let cards = fixtures("system");
+        draw_frame(&ctx, &cards, Theme::Dark, lang, Vec::new());
+        let (output, _) = draw_frame(&ctx, &cards, Theme::Dark, lang, Vec::new());
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        let hide = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some(text(lang, Key::AudioHide))
+            })
+            .expect("an active player needs a separate hide control");
+        let bounds = hide.1.bounds().unwrap();
+        let at = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        output.drop_without_applying_deltas();
+        let (_, actions) = draw_frame(
+            &ctx,
+            &cards,
+            Theme::Dark,
+            lang,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(actions, vec![AudioPlayerAction::HidePlayer]);
+    }
+}
+
+#[test]
+fn player_header_press_starts_native_drag_without_stealing_controls() {
+    for width in [225.0, 240.0] {
+        for lang in [Lang::En, Lang::Ru] {
+            for theme in [Theme::Dark, Theme::Light] {
+                for target in [
+                    "header-edge",
+                    "header-text",
+                    "settings",
+                    "hide",
+                    "stop",
+                    "gain",
+                ] {
+                    let ctx = egui::Context::default();
+                    ui::install_fonts(&ctx);
+                    ctx.enable_accesskit();
+                    let cards = fixtures("system");
+                    let draw =
+                        |events| draw_frame_at_width(&ctx, &cards, theme, lang, width, events);
+                    draw(Vec::new());
+                    let (output, _) = draw(Vec::new());
+                    let at = if target == "header-edge" {
+                        egui::pos2(50.0, 4.0)
+                    } else if target == "header-text" {
+                        visible_text_rect(&output.shapes, "WORKSTATION")
+                            .expect("visible source title")
+                            .center()
+                    } else {
+                        let key = match target {
+                            "settings" => Key::AudioSettings,
+                            "hide" => Key::AudioHide,
+                            "stop" => Key::AudioStop,
+                            _ => Key::AudioGain,
+                        };
+                        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                        let bounds = tree
+                            .nodes
+                            .iter()
+                            .find(|(_, node)| node.label() == Some(text(lang, key)))
+                            .unwrap()
+                            .1
+                            .bounds()
+                            .unwrap();
+                        egui::pos2(
+                            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                        )
+                    };
+                    output.drop_without_applying_deltas();
+                    let (pressed, mut actions) = draw(vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                    ]);
+                    let native_drag = pressed.viewport_output.values().any(|viewport| {
+                        viewport
+                            .commands
+                            .iter()
+                            .any(|command| matches!(command, egui::ViewportCommand::StartDrag))
+                    });
+                    assert_eq!(
+                        native_drag,
+                        target.starts_with("header"),
+                        "{target} {lang:?} {width}"
+                    );
+                    pressed.drop_without_applying_deltas();
+                    let (_, released) = draw(vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    }]);
+                    actions.extend(released);
+                    match target {
+                        "header-edge" | "header-text" => assert!(actions.is_empty()),
+                        "settings" => assert_eq!(actions, vec![AudioPlayerAction::OpenSettings]),
+                        "hide" => assert_eq!(actions, vec![AudioPlayerAction::HidePlayer]),
+                        "stop" => {
+                            assert_eq!(actions, vec![AudioPlayerAction::Stop("stream-1".into())])
+                        }
+                        _ => assert!(!actions.is_empty() && actions.iter().all(|action|
+                            matches!(action, AudioPlayerAction::SetGain { stream_id, .. }
+                                if stream_id == "stream-1")), "{actions:?}"),
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
@@ -257,7 +500,7 @@ fn zero_or_unknown_duration_hides_progress_without_hiding_session_controls() {
         assert!(!texts(&output.shapes)
             .iter()
             .any(|value| value == "0:05" || value == "0:00"));
-        assert_eq!(audio_player::height(&cards), 128.0);
+        assert!(audio_player::height(&cards) < audio_player::height(&fixtures("single")));
         assert!(output
             .platform_output
             .accesskit_update
@@ -265,38 +508,6 @@ fn zero_or_unknown_duration_hides_progress_without_hiding_session_controls() {
             .nodes
             .iter()
             .any(|(_, node)| node.label() == Some(text(Lang::En, Key::AudioPause))));
-    }
-}
-
-#[test]
-fn optional_offscreen_fixture_pngs() {
-    let Some(dir) = std::env::var_os("BIFROST_PLAYER_SHOTS") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    for (lang, lang_tag) in [(Lang::En, "en"), (Lang::Ru, "ru")] {
-        for (theme, theme_tag) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
-            for scene in ["single", "stacked", "system", "disabled", "wide"] {
-                let cards = fixtures(scene);
-                let size = egui::vec2(
-                    if scene == "wide" { 500.0 } else { 240.0 },
-                    audio_player::height(&cards),
-                );
-                let mut harness = egui_kittest::Harness::builder()
-                    .with_size(size)
-                    .wgpu()
-                    .build_ui(move |ui| {
-                        audio_player::draw(ui, &cards, theme, lang);
-                    });
-                harness.run_steps(3);
-                harness
-                    .render()
-                    .unwrap()
-                    .save(dir.join(format!("player-{scene}-{lang_tag}-{theme_tag}.png")))
-                    .unwrap();
-            }
-        }
     }
 }
 
@@ -407,5 +618,608 @@ fn production_viewport_keeps_empty_and_three_cards_inside_opaque_client_at_nativ
                 }
             }
         }
+    }
+}
+
+#[test]
+fn empty_player_message_drags_and_close_only_hides() {
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Dark, Theme::Light] {
+            for hide in [false, true] {
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                ctx.enable_accesskit();
+                draw_frame(&ctx, &[], theme, lang, Vec::new());
+                let (output, _) = draw_frame(&ctx, &[], theme, lang, Vec::new());
+                let at = if hide {
+                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                    let bounds = tree
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(text(lang, Key::AudioHide)))
+                        .unwrap()
+                        .1
+                        .bounds()
+                        .unwrap();
+                    egui::pos2(
+                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                    )
+                } else {
+                    visible_text_rect(&output.shapes, text(lang, Key::AudioEmpty))
+                        .expect("visible empty-state message")
+                        .center()
+                };
+                output.drop_without_applying_deltas();
+                let (pressed, mut actions) = draw_frame(
+                    &ctx,
+                    &[],
+                    theme,
+                    lang,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                assert_eq!(
+                    pressed.viewport_output.values().any(|viewport| viewport
+                        .commands
+                        .iter()
+                        .any(|command| matches!(command, egui::ViewportCommand::StartDrag))),
+                    !hide,
+                    "empty message must not select text instead of dragging"
+                );
+                pressed.drop_without_applying_deltas();
+                let (_, released) = draw_frame(
+                    &ctx,
+                    &[],
+                    theme,
+                    lang,
+                    vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    }],
+                );
+                actions.extend(released);
+                assert_eq!(
+                    actions,
+                    if hide {
+                        vec![AudioPlayerAction::HidePlayer]
+                    } else {
+                        Vec::new()
+                    }
+                );
+            }
+        }
+    }
+}
+
+fn visible_text_rect(shapes: &[egui::epaint::ClippedShape], value: &str) -> Option<egui::Rect> {
+    text_geometry(shapes, value).map(|(bounds, clip)| bounds.intersect(clip))
+}
+
+fn text_geometry(
+    shapes: &[egui::epaint::ClippedShape],
+    value: &str,
+) -> Option<(egui::Rect, egui::Rect)> {
+    fn find(shape: &Shape, value: &str) -> Option<egui::Rect> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == value => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, value)),
+            _ => None,
+        }
+    }
+    shapes
+        .iter()
+        .find_map(|shape| find(&shape.shape, value).map(|bounds| (bounds, shape.clip_rect)))
+}
+
+#[test]
+fn player_volume_track_has_control_contrast_in_the_production_theme() {
+    fn luminance(color: egui::Color32) -> f64 {
+        let linear = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+    for theme in [Theme::Dark, Theme::Light] {
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ui::apply_theme(&ctx, &ui::Palette::of(theme));
+        ctx.enable_accesskit();
+        let cards = fixtures("system");
+        draw_frame(&ctx, &cards, theme, Lang::En, Vec::new());
+        let (output, _) = draw_frame(&ctx, &cards, theme, Lang::En, Vec::new());
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        let bounds = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(text(Lang::En, Key::AudioGain)))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        let slider = egui::Rect::from_min_max(
+            egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+            egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+        );
+        output.drop_without_applying_deltas();
+        for events in [
+            Vec::new(),
+            vec![egui::Event::PointerMoved(slider.center())],
+            vec![egui::Event::PointerButton {
+                pos: slider.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+        ] {
+            let (output, _) = draw_frame(&ctx, &cards, theme, Lang::En, events);
+            let card = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Rect(rect) if rect.rect.height() > 100.0 => Some(rect.fill),
+                    _ => None,
+                })
+                .expect("painted card surface");
+            let rail = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Rect(rect)
+                        if rect.rect.width() >= 48.0
+                            && rect.rect.height() <= 12.0
+                            && slider.contains_rect(rect.rect) =>
+                    {
+                        Some(rect.fill)
+                    }
+                    _ => None,
+                })
+                .expect("painted volume rail inside the actual slider");
+            let (a, b) = (luminance(card), luminance(rail));
+            let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(
+                contrast >= 3.0,
+                "{theme:?}: rail/card contrast {contrast}:1"
+            );
+            output.drop_without_applying_deltas();
+        }
+    }
+}
+
+#[test]
+fn track_click_seeks_once_on_release_and_cancels_changed_media() {
+    use bifrost_gui::audio_player::AudioSeekTarget;
+    let target = AudioSeekTarget {
+        session_token: 7,
+        media_revision: 3,
+        min_ms: 10_000,
+        max_ms: 90_000,
+    };
+    for change in [
+        "none",
+        "position-only",
+        "token",
+        "revision",
+        "minimum",
+        "maximum",
+        "stream",
+        "removed",
+        "removed-then-return",
+        "escape",
+        "focus-loss",
+        "capability",
+        "capability-then-return",
+    ] {
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut media = card("seek-source");
+        media.position_ms = Some(25_000);
+        media.duration_ms = Some(100_000);
+        media.seek = Some(target);
+        let mut cards = vec![media];
+        draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+        let (output, _) = draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        let bounds = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(text(Lang::En, Key::AudioSeek)))
+            .expect("a permitted native timeline must be clickable")
+            .1
+            .bounds()
+            .unwrap();
+        let at = egui::pos2(
+            bounds.x1 as f32 - 1.0,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        output.drop_without_applying_deltas();
+        let (output, pressed) = draw_frame(
+            &ctx,
+            &cards,
+            Theme::Dark,
+            Lang::En,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(pressed.is_empty(), "seek must not be emitted at press");
+        output.drop_without_applying_deltas();
+        let (output, held) = draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+        assert!(
+            held.is_empty(),
+            "holding a click must not queue media commands"
+        );
+        output.drop_without_applying_deltas();
+        match change {
+            "position-only" => cards[0].position_ms = Some(26_000),
+            "token" => cards[0].seek.as_mut().unwrap().session_token += 1,
+            "revision" => cards[0].seek.as_mut().unwrap().media_revision += 1,
+            "minimum" => cards[0].seek.as_mut().unwrap().min_ms += 1,
+            "maximum" => cards[0].seek.as_mut().unwrap().max_ms -= 1,
+            "stream" => cards[0].stream_id = "replacement".into(),
+            "removed" => cards.clear(),
+            "capability" => cards[0].seek = None,
+            "capability-then-return" => {
+                cards[0].seek = None;
+                let (output, actions) = draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+                assert!(actions.is_empty());
+                output.drop_without_applying_deltas();
+                cards[0].seek = Some(target);
+            }
+            "removed-then-return" => {
+                let (output, actions) = draw_frame(&ctx, &[], Theme::Dark, Lang::En, Vec::new());
+                assert!(actions.is_empty());
+                output.drop_without_applying_deltas();
+            }
+            "escape" => {
+                let (output, actions) = draw_frame(
+                    &ctx,
+                    &cards,
+                    Theme::Dark,
+                    Lang::En,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                );
+                assert!(actions.is_empty());
+                output.drop_without_applying_deltas();
+            }
+            "focus-loss" => {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(240.0, audio_player::height(&cards)),
+                        )),
+                        focused: false,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert!(audio_player::draw(ui, &cards, Theme::Dark, Lang::En).is_empty());
+                    },
+                );
+                output.drop_without_applying_deltas();
+            }
+            _ => {}
+        }
+        let (output, actions) = draw_frame(
+            &ctx,
+            &cards,
+            Theme::Dark,
+            Lang::En,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        output.drop_without_applying_deltas();
+        let expected = if matches!(change, "none" | "position-only") {
+            vec![AudioPlayerAction::Seek {
+                stream_id: "seek-source".into(),
+                target,
+                position_ms: 90_000,
+            }]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(actions, expected, "{change}");
+    }
+}
+
+#[test]
+fn seek_intent_debug_redacts_private_timeline_and_range() {
+    let action = AudioPlayerAction::Seek {
+        stream_id: "opaque-stream".into(),
+        target: bifrost_gui::audio_player::AudioSeekTarget {
+            session_token: 7,
+            media_revision: 3,
+            min_ms: 123_456,
+            max_ms: 987_654,
+        },
+        position_ms: 456_789,
+    };
+    let debug = format!("{action:?}");
+    assert!(debug.contains("Seek") && debug.contains("[REDACTED]"));
+    for private in ["123456", "987654", "456789"] {
+        assert!(
+            !debug.contains(private),
+            "private seek metadata must not enter Debug output"
+        );
+    }
+}
+
+#[test]
+fn read_only_timeline_explains_unavailability_without_seek_cursor_or_actions() {
+    for lang in [Lang::Ru, Lang::En] {
+        for theme in [Theme::Dark, Theme::Light] {
+            for width in [225.0, 240.0] {
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                ctx.enable_accesskit();
+                let mut media = card("read-only");
+                media.title = None;
+                media.position_ms = Some(25_000);
+                media.duration_ms = Some(100_000);
+                let cards = vec![media];
+                draw_frame_at_width(&ctx, &cards, theme, lang, width, Vec::new());
+                let (output, _) = draw_frame_at_width(&ctx, &cards, theme, lang, width, Vec::new());
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let node = &tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Label
+                            && node.supports_action(egui::accesskit::Action::Focus)
+                            && !node.supports_action(egui::accesskit::Action::Click)
+                    })
+                    .expect("progress is accessible without pretending to support seek")
+                    .1;
+                let bounds = node.bounds().unwrap();
+                let at = egui::pos2(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                );
+                output.drop_without_applying_deltas();
+                for events in [
+                    vec![egui::Event::PointerMoved(at)],
+                    vec![
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                ] {
+                    let (output, actions) =
+                        draw_frame_at_width(&ctx, &cards, theme, lang, width, events);
+                    assert!(
+                        actions.is_empty(),
+                        "read-only progress must not issue commands"
+                    );
+                    assert_ne!(
+                        output.platform_output.cursor_icon,
+                        egui::CursorIcon::PointingHand
+                    );
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn seek_keyboard_release_uses_the_same_captured_identity_and_cancels_capability_changes() {
+    use egui::accesskit::{Action, ActionRequest};
+    for change in ["none", "revision", "capability"] {
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let mut media = card("keyboard-seek");
+        media.position_ms = Some(25_000);
+        media.duration_ms = Some(100_000);
+        media.seek = Some(bifrost_gui::audio_player::AudioSeekTarget {
+            session_token: 7,
+            media_revision: 3,
+            min_ms: 10_000,
+            max_ms: 90_000,
+        });
+        let target = media.seek.unwrap();
+        let mut cards = vec![media];
+        draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+        let (output, _) = draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+        let node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(text(Lang::En, Key::AudioSeek)))
+            .unwrap()
+            .0;
+        output.drop_without_applying_deltas();
+        let (output, actions) = draw_frame(
+            &ctx,
+            &cards,
+            Theme::Dark,
+            Lang::En,
+            vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::Focus,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: node,
+                data: None,
+            })],
+        );
+        assert!(actions.is_empty());
+        output.drop_without_applying_deltas();
+        let (output, actions) = draw_frame(
+            &ctx,
+            &cards,
+            Theme::Dark,
+            Lang::En,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(
+            actions.is_empty(),
+            "keyboard seek is emitted only on release"
+        );
+        output.drop_without_applying_deltas();
+        match change {
+            "revision" => cards[0].seek.as_mut().unwrap().media_revision += 1,
+            "capability" => cards[0].seek = None,
+            _ => {}
+        }
+        let (output, actions) = draw_frame(
+            &ctx,
+            &cards,
+            Theme::Dark,
+            Lang::En,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        output.drop_without_applying_deltas();
+        let expected = if change == "none" {
+            vec![AudioPlayerAction::Seek {
+                stream_id: "keyboard-seek".into(),
+                target,
+                position_ms: 30_000,
+            }]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(actions, expected, "{change}");
+    }
+}
+
+#[test]
+fn seek_accessibility_actions_have_real_value_semantics_and_reject_nonfinite_values() {
+    use egui::accesskit::{Action, ActionData, ActionRequest};
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    ctx.enable_accesskit();
+    let mut media = card("accessible-seek");
+    media.position_ms = Some(25_000);
+    media.duration_ms = Some(100_000);
+    media.seek = Some(bifrost_gui::audio_player::AudioSeekTarget {
+        session_token: 7,
+        media_revision: 3,
+        min_ms: 10_000,
+        max_ms: 90_000,
+    });
+    let target = media.seek.unwrap();
+    let cards = vec![media];
+    draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+    let (output, _) = draw_frame(&ctx, &cards, Theme::Dark, Lang::En, Vec::new());
+    let (node_id, node) = output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some(text(Lang::En, Key::AudioSeek)))
+        .unwrap();
+    let node_id = *node_id;
+    assert_eq!(node.role(), egui::accesskit::Role::Slider);
+    assert_eq!(node.numeric_value(), Some(25.0));
+    assert!(node.supports_action(Action::SetValue));
+    assert!(
+        !node.supports_action(Action::Click),
+        "no unsupported button activation"
+    );
+    output.drop_without_applying_deltas();
+    for (action, data, expected) in [
+        (
+            Action::SetValue,
+            Some(ActionData::NumericValue(42.0)),
+            Some(42_000),
+        ),
+        (
+            Action::SetValue,
+            Some(ActionData::NumericValue(200.0)),
+            Some(90_000),
+        ),
+        (
+            Action::SetValue,
+            Some(ActionData::NumericValue(f64::NAN)),
+            None,
+        ),
+        (Action::Increment, None, Some(30_000)),
+        (Action::Decrement, None, Some(20_000)),
+    ] {
+        let (output, actions) = draw_frame(
+            &ctx,
+            &cards,
+            Theme::Dark,
+            Lang::En,
+            vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                action,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: node_id,
+                data,
+            })],
+        );
+        output.drop_without_applying_deltas();
+        let expected = expected
+            .map(|position_ms| AudioPlayerAction::Seek {
+                stream_id: "accessible-seek".into(),
+                target,
+                position_ms,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(actions, expected);
+        assert_eq!(
+            cards[0].position_ms,
+            Some(25_000),
+            "accessibility does not invent observed movement"
+        );
     }
 }

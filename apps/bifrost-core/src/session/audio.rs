@@ -84,6 +84,7 @@ struct Peer {
     focus_support: bool,
     mic_support: bool,
     media_support: bool,
+    media_seek_support: bool,
     focus_sent_revision: u64,
     focus_request_at: Option<u64>,
     focus_reply_at: Option<u64>,
@@ -108,6 +109,7 @@ struct Command {
 }
 
 pub(super) struct Coordinator {
+    source_sound: watch::Sender<Option<u64>>,
     commands: mpsc::Sender<Command>,
     gui_commands: mpsc::Sender<safety::Command>,
     gui_safety: watch::Sender<safety::Latch>,
@@ -121,6 +123,10 @@ pub(super) struct Coordinator {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 impl Coordinator {
+    pub(super) fn release_source_local_sound(&self) {
+        self.source_sound
+            .send_replace(Some(self.system_intents.borrow().off_epoch));
+    }
     fn prepare(
         config: config::AudioConfig,
         local: NodeId,
@@ -131,6 +137,7 @@ impl Coordinator {
         events: broadcast::Sender<Outgoing>,
     ) -> (Self, Actor) {
         let (commands, rx) = mpsc::channel(COMMANDS);
+        let (source_sound, source_sound_rx) = watch::channel(None);
         let (gui_commands, gui_rx) = mpsc::channel(16);
         let (gui_safety, safety_rx) = watch::channel(safety::Latch::default());
         let (system_intents, system_rx) = watch::channel(sharing::Intent::default());
@@ -150,6 +157,8 @@ impl Coordinator {
         );
         let optional_drops = Arc::new(AtomicU64::new(0));
         let actor = Actor {
+            source_sound: source_sound_rx,
+            source_sound_released: false,
             config,
             local,
             manager,
@@ -211,6 +220,7 @@ impl Coordinator {
         };
         (
             Self {
+                source_sound,
                 commands,
                 gui_commands,
                 gui_safety,
@@ -349,6 +359,7 @@ impl Coordinator {
                     focus_support: hello.audio_focus_report,
                     mic_support: hello.mic_control,
                     media_support: hello.media_control,
+                    media_seek_support: hello.media_seek,
                     focus_sent_revision: 0,
                     focus_request_at: None,
                     focus_reply_at: None,
@@ -377,6 +388,8 @@ impl Coordinator {
                 peer.mic_support = capabilities.contains(&(net::Capability::MicControlV1 as i32));
                 peer.media_support =
                     capabilities.contains(&(net::Capability::MediaControlV1 as i32));
+                peer.media_seek_support =
+                    capabilities.contains(&(net::Capability::MediaSeekV1 as i32));
             }
         });
     }
@@ -512,6 +525,8 @@ struct Pending {
     deadline: u64,
 }
 struct Actor {
+    source_sound: watch::Receiver<Option<u64>>,
+    source_sound_released: bool,
     config: config::AudioConfig,
     local: NodeId,
     manager: Arc<LinkManager>,
@@ -708,7 +723,7 @@ impl Actor {
         Ok(())
     }
     fn publish_caps(&self) {
-        let mut bits = [0; 6];
+        let mut bits = [0; 7];
         bits[0] = net::Capability::AudioFocusReportV1 as i32;
         let mut len = 1;
         if self.config.enabled {
@@ -740,6 +755,8 @@ impl Actor {
             }
             if self.media_capable() {
                 bits[len] = net::Capability::MediaControlV1 as i32;
+                len += 1;
+                bits[len] = net::Capability::MediaSeekV1 as i32;
                 len += 1;
             }
         }
@@ -776,6 +793,19 @@ impl Actor {
             let cause;
             tokio::select! {
                 _ = self.stopping.changed() => break,
+                changed = self.source_sound.changed() => {
+                    cause = "source_local_sound";
+                    if changed.is_err() { break; }
+                    let epoch = *self.source_sound.borrow_and_update();
+                    if epoch == Some(self.applied_system_off) && self.role() == model::AudioRole::Source && self.system_enabled() {
+                        self.source_sound_released = true;
+                        if let Some(worker) = self.worker.as_ref().filter(|worker| worker.alive) {
+                            for record in self.records.values().filter(|record| record.role == model::AudioRole::Source) {
+                                worker.handle.release_source_local_sound(record.view.session);
+                            }
+                        }
+                    }
+                }
                 changed = self.gui_safety.changed() => {
                     cause = "gui_safety";
                     if changed.is_err() { break; }
@@ -1385,6 +1415,8 @@ impl Actor {
             local_scope_id: scope(self.listen),
             peer_scope_id: scope(remote),
             initial_authorization_ms: fsm::CHILD_TTL_MS,
+            source_local_sound_released: role == model::AudioRole::Source
+                && self.source_sound_released,
         };
         let result = match &self.worker {
             Some(worker)
@@ -2589,6 +2621,7 @@ impl Actor {
         }
         self.config = next;
         if !self.config.system_enabled() {
+            self.source_sound_released = false;
             self.system_requested = false;
             self.system_start = None;
             self.system_session = None;
@@ -3666,6 +3699,7 @@ mod observation_tests {
                     focus_support: false,
                     mic_support: false,
                     media_support: false,
+                    media_seek_support: false,
                     focus_sent_revision: 0,
                     focus_request_at: None,
                     focus_reply_at: None,
@@ -3680,6 +3714,7 @@ mod observation_tests {
         let (_caps, caps) = watch::channel(Vec::new());
         let (stopping, _stopping) = watch::channel(false);
         let coordinator = Coordinator {
+            source_sound: watch::channel(None).0,
             commands,
             gui_commands,
             gui_safety: watch::channel(safety::Latch::default()).0,

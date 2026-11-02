@@ -671,13 +671,20 @@ fn keys_body(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec
     for (action, label, default) in ROWS {
         let binding = bindings.iter().find(|binding| binding.action == action);
         row(ui, pal, text(lang, label), action == 1, |ui| {
-            widgets::chord(
-                ui,
-                pal,
-                binding
-                    .map(|binding| binding.chord.as_str())
-                    .unwrap_or(default),
-            );
+            let chord = ui.scope(|ui| {
+                widgets::chord(
+                    ui,
+                    pal,
+                    binding
+                        .map(|binding| binding.chord.as_str())
+                        .unwrap_or(default),
+                );
+            });
+            if matches!(action, 1 | 3) {
+                chord
+                    .response
+                    .on_hover_text(text(lang, Key::SourceLocalSoundReleaseHint));
+            }
             ui.horizontal_wrapped(|ui| {
                 let connected = vm.connection.is_connected() && binding.is_some();
                 ui.add_enabled_ui(connected, |ui| {

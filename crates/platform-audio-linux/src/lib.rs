@@ -1,4 +1,4 @@
-//! Local Unix Pulse protocol backend. No native Pulse/PipeWire/ALSA libraries.
+//! Local Unix Pulse backend; optional Source playback control runtime-loads PipeWire.
 //!
 //! Portal PTT trusts live-session elapsed-millisecond compositor timestamps, not raw
 //! key-up. A pre-CreateSession anchor retains conservative lag; mapped events older
@@ -10,8 +10,10 @@
 //! Incompatible clocks, including seconds-style implementations, are unsupported;
 //! incompatible units are not universally distinguishable from delayed valid signals.
 #![cfg(target_os = "linux")]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 mod backend;
+#[allow(unsafe_code)]
+mod effective;
 mod mpris;
 mod mute;
 mod ptt;

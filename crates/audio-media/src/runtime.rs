@@ -366,6 +366,23 @@ impl Shared {
     }
 }
 
+// A failed OS spawn drops its closure on the calling thread. Keep native ownership
+// outside that closure until the new thread actually starts, and recover on error.
+fn handoff<T, R>(
+    value: T,
+    spawn: impl FnOnce(Arc<Mutex<Option<T>>>) -> io::Result<JoinHandle<R>>,
+) -> Result<JoinHandle<R>, (io::Error, T)> {
+    let slot = Arc::new(Mutex::new(Some(value)));
+    match spawn(slot.clone()) {
+        Ok(task) => Ok(task),
+        Err(error) => {
+            let value = lock(&slot)
+                .take()
+                .expect("failed spawn did not run its closure");
+            Err((error, value))
+        }
+    }
+}
 /// Owner-thread control handle. `poll_event`/`snapshot` refresh native device status; the role also
 /// forwards backend notifications through `on_backend_event`. Only native callbacks touch rings.
 /// Stop gives all engine/native-stop threads a shared 2 s deadline. A backend violating its stop
@@ -377,6 +394,9 @@ pub struct MediaSession<S: Stream + 'static> {
     event_tx: SyncSender<MediaEvent>,
     workers: Vec<JoinHandle<()>>,
     native_stop: Option<JoinHandle<Result<(), BackendError>>>,
+    source_silence_task: Option<JoinHandle<(S, Result<(), BackendError>)>>,
+    source_silence_started: bool,
+    native_stop_error: Option<BackendError>,
     render_timeline: RenderClock,
     last_native: StreamSnapshot,
     source: bool,
@@ -391,6 +411,75 @@ impl<S: Stream + 'static> MediaSession<S> {
             return group.stream_mut();
         }
         self.stream.as_mut()
+    }
+    /// Starts one off-control-thread operation; scheduling is NOT an applied ACK.
+    /// The owned authority is evaluated inside that task at the actual setter seam.
+    pub fn begin_source_silence(
+        &mut self,
+        authorized: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), EngineError> {
+        if !self.source
+            || self.source_silence_started
+            || self.shared.is_stopped()
+            || self.shared.sent_media_packets.load(Ordering::Acquire) == 0
+        {
+            return Err(EngineError::Backend(BackendError::PermissionDenied));
+        }
+        self.source_silence_started = true;
+        let stream = self
+            .stream
+            .take()
+            .ok_or(EngineError::Backend(BackendError::Stopped))?;
+        let shared = self.shared.clone();
+        let task = handoff(stream, |slot| {
+            thread::Builder::new()
+                .name("bfa-source-control".into())
+                .spawn(move || {
+                    let mut stream = { lock(&slot).take().expect("one native stream owner") };
+                    let admitted = Arc::new(move || {
+                        !shared.stopped.load(Ordering::Acquire)
+                            && shared.authorized.load(Ordering::Acquire)
+                            && shared.sent_media_packets.load(Ordering::Acquire) > 0
+                            && authorized()
+                    });
+                    let result = if admitted() {
+                        stream.suppress_local_playback(admitted)
+                    } else {
+                        Err(BackendError::PermissionDenied)
+                    };
+                    (stream, result)
+                })
+        });
+        match task {
+            Ok(task) => {
+                self.source_silence_task = Some(task);
+                Ok(())
+            }
+            Err((error, stream)) => {
+                self.stream = Some(stream);
+                self.shared.request_stop(StopReason::WorkerFailed);
+                Err(error.into())
+            }
+        }
+    }
+    pub fn poll_source_silence(&mut self) -> Option<Result<(), BackendError>> {
+        if !self
+            .source_silence_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return None;
+        }
+        match self.source_silence_task.take()?.join() {
+            Ok((stream, result)) => {
+                self.stream = Some(stream);
+                Some(result)
+            }
+            Err(_) => {
+                self.native_stop_error = Some(BackendError::ServerUnavailable);
+                Some(Err(BackendError::ServerUnavailable))
+            }
+        }
     }
     pub fn set_gain(&self, gain: f32) -> Result<(), EngineError> {
         if self.source || !gain.is_finite() || !(0.0..=2.0).contains(&gain) {
@@ -532,47 +621,90 @@ impl<S: Stream + 'static> MediaSession<S> {
             self.shared.invalidate(&self.event_tx);
         }
     }
-    pub fn stop(&mut self) -> Result<(), EngineError> {
-        self.stop_attempted = true;
+    /// Cancels immediately and schedules native release. Never joins on the caller.
+    pub fn begin_stop(&mut self) -> Result<(), EngineError> {
         self.shared.request_stop(StopReason::User);
+        if self.stop_attempted {
+            return Ok(());
+        }
+        self.stop_attempted = true;
         if let Some(group) = self.group_owner.as_mut() {
             group.stop()?;
         }
-        let deadline = Instant::now() + STOP_DEADLINE;
-        if let Some(mut stream) = self.stream.take() {
-            self.native_stop = Some(
+        let pending = self.source_silence_task.take();
+        let stream = self.stream.take();
+        if pending.is_some() || stream.is_some() {
+            let task = handoff((pending, stream), |slot| {
                 thread::Builder::new()
                     .name("bfa-stop".into())
-                    .spawn(move || stream.stop())?,
-            );
+                    .spawn(move || {
+                        let owned = { lock(&slot).take().expect("one native stop owner") };
+                        let mut stream = match owned {
+                            (Some(task), None) => {
+                                task.join().map_err(|_| BackendError::ServerUnavailable)?.0
+                            }
+                            (None, Some(stream)) => stream,
+                            _ => return Err(BackendError::ServerUnavailable),
+                        };
+                        stream.stop()
+                    })
+            });
+            match task {
+                Ok(task) => self.native_stop = Some(task),
+                Err((error, (pending, stream))) => {
+                    self.source_silence_task = pending;
+                    self.stream = stream;
+                    self.native_stop_error = Some(BackendError::ServerUnavailable);
+                    return Err(error.into());
+                }
+            }
         }
-        while self.workers.iter().any(|worker| !worker.is_finished())
+        Ok(())
+    }
+    /// Positive completion requires all real workers/native cleanup to have finished.
+    pub fn poll_stop(&mut self) -> Option<Result<(), EngineError>> {
+        if !self.stop_attempted || self.stream.is_some() || self.source_silence_task.is_some() {
+            return None;
+        }
+        if self.workers.iter().any(|worker| !worker.is_finished())
             || self
                 .native_stop
                 .as_ref()
                 .is_some_and(|worker| !worker.is_finished())
         {
-            if Instant::now() >= deadline {
-                return Err(EngineError::StopTimeout);
-            }
-            thread::sleep(Duration::from_millis(1));
+            return None;
         }
-        let mut result = Ok(());
         for worker in self.workers.drain(..) {
             if worker.join().is_err() {
-                result = Err(EngineError::WorkerPanicked);
+                self.native_stop_error = Some(BackendError::ServerUnavailable);
             }
         }
         if let Some(worker) = self.native_stop.take() {
             match worker.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => result = Err(EngineError::Backend(error)),
-                Err(_) => result = Err(EngineError::WorkerPanicked),
+                Ok(Err(error)) => self.native_stop_error = Some(error),
+                Err(_) => self.native_stop_error = Some(BackendError::ServerUnavailable),
             }
+        }
+        if let Some(error) = self.native_stop_error {
+            return Some(Err(EngineError::Backend(error)));
         }
         self.last_native.status = StreamStatus::Stopped;
         self.shared.finish(&self.event_tx);
-        result
+        Some(Ok(()))
+    }
+    pub fn stop(&mut self) -> Result<(), EngineError> {
+        self.begin_stop()?;
+        let deadline = Instant::now() + STOP_DEADLINE;
+        loop {
+            if let Some(result) = self.poll_stop() {
+                return result;
+            }
+            if Instant::now() >= deadline {
+                return Err(EngineError::StopTimeout);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 impl<S: Stream + 'static> Drop for MediaSession<S> {
@@ -601,6 +733,9 @@ fn make_session<S: Stream + 'static>(
         event_tx,
         workers: Vec::with_capacity(2),
         native_stop: None,
+        source_silence_task: None,
+        source_silence_started: false,
+        native_stop_error: None,
         render_timeline: RenderClock::default(),
         last_native: snapshot,
         source,
@@ -2057,5 +2192,321 @@ mod path_tests {
         assert!(!context.startup_refusal(&io::Error::from(io::ErrorKind::PermissionDenied)));
         context.shared.started.store(true, Ordering::Release);
         assert!(!context.startup_refusal(&io::Error::from(io::ErrorKind::ConnectionRefused)));
+    }
+}
+
+#[cfg(test)]
+mod source_control_tests {
+    use super::*;
+    use audio_backend::{
+        dry::{DryBackend, DryStream, ScriptEvent},
+        Capabilities, Device, DeviceId, DeviceSelection, Direction, FeedbackGuarantee, MuteGuard,
+    };
+    use std::sync::atomic::AtomicUsize;
+
+    struct DelayedControl {
+        stream: DryStream,
+        entered: mpsc::SyncSender<()>,
+        ready: Arc<AtomicBool>,
+        writes: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+        stop_ready: Arc<AtomicBool>,
+    }
+    impl Stream for DelayedControl {
+        fn format(&self) -> AudioFormat {
+            self.stream.format()
+        }
+        fn device(&self) -> Option<&DeviceId> {
+            self.stream.device()
+        }
+        fn feedback_guarantee(&self) -> FeedbackGuarantee {
+            self.stream.feedback_guarantee()
+        }
+        fn snapshot(&self) -> StreamSnapshot {
+            self.stream.snapshot()
+        }
+        fn suppress_local_playback(
+            &mut self,
+            admitted: Arc<dyn Fn() -> bool + Send + Sync>,
+        ) -> Result<(), BackendError> {
+            self.entered.send(()).unwrap();
+            // Simulated slow native I/O belongs to the actual pending operation thread.
+            while !self.ready.load(Ordering::Acquire) {
+                if !admitted() {
+                    return Err(BackendError::PermissionDenied);
+                }
+                thread::park_timeout(Duration::from_millis(1));
+            }
+            self.stream.suppress_local_playback(admitted)?;
+            self.writes.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), BackendError> {
+            self.stops.fetch_add(1, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !self.stop_ready.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    return Err(BackendError::Timeout);
+                }
+                thread::park_timeout(Duration::from_millis(1));
+            }
+            self.stream.stop()
+        }
+    }
+    fn session(
+        backend: &mut DryBackend,
+        ready: bool,
+        writes: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+        samples: Arc<AtomicUsize>,
+    ) -> (
+        MediaSession<DelayedControl>,
+        EventReceiver<()>,
+        Arc<AtomicBool>,
+    ) {
+        let stream = backend
+            .start_capture(
+                CaptureSpec::Monitor {
+                    sink: DeviceSelection::Explicit(DeviceId::new("SPEAKER").unwrap()),
+                    format: AudioFormat {
+                        sample_rate: 48_000,
+                        channels: 2,
+                    },
+                },
+                Box::new(move |block| {
+                    samples.fetch_add(
+                        block.samples.iter().filter(|value| **value != 0.0).count(),
+                        Ordering::Release,
+                    );
+                }),
+            )
+            .unwrap();
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (events, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+        let mut shared = Shared::new(Arc::new(AtomicBool::new(true)));
+        shared.clock = Instant::now() - Duration::from_millis(500);
+        let shared = Arc::new(shared);
+        let stop_ready = Arc::new(AtomicBool::new(true));
+        let session = make_session(
+            DelayedControl {
+                stream,
+                entered,
+                ready: Arc::new(AtomicBool::new(ready)),
+                writes,
+                stops,
+                stop_ready: stop_ready.clone(),
+            },
+            shared,
+            event_rx,
+            events,
+            true,
+        );
+        (session, entered_rx, stop_ready)
+    }
+    fn completed_stop(source: &mut MediaSession<DelayedControl>) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(result) = source.poll_stop() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+    #[test]
+    fn source_local_sound_override_cancels_pending_without_stopping_capture() {
+        let mut backend = DryBackend::new(Capabilities {
+            system_capture: true,
+            endpoint_mute: true,
+            ..Capabilities::default()
+        });
+        backend
+            .apply(ScriptEvent::UpsertDevice(Device {
+                id: DeviceId::new("SPEAKER").unwrap(),
+                label: "owned".into(),
+                direction: Direction::Render,
+                format: AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                },
+            }))
+            .unwrap();
+        for ready in [false, true] {
+            let writes = Arc::new(AtomicUsize::new(0));
+            let stops = Arc::new(AtomicUsize::new(0));
+            let samples = Arc::new(AtomicUsize::new(0));
+            let (mut source, entered, _) = session(
+                &mut backend,
+                ready,
+                writes.clone(),
+                stops.clone(),
+                samples.clone(),
+            );
+            source.shared.sent_media_packets.store(1, Ordering::Release);
+            let allowed = Arc::new(AtomicBool::new(true));
+            let admission = allowed.clone();
+            source
+                .begin_source_silence(Arc::new(move || admission.load(Ordering::Acquire)))
+                .unwrap();
+            entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            if ready {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while source.poll_source_silence().is_none() {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
+            allowed.store(false, Ordering::Release);
+            allowed.store(false, Ordering::Release);
+            if !ready {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    if let Some(result) = source.poll_source_silence() {
+                        assert_eq!(result, Err(BackendError::PermissionDenied));
+                        break;
+                    }
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
+            source.stream_mut().unwrap().stream.pump(64).unwrap();
+            assert!(!source.shared.stopped.load(Ordering::Acquire));
+            assert!(source.shared.authorized.load(Ordering::Acquire));
+            assert_eq!(source.snapshot().native.status, StreamStatus::Running);
+            assert!(samples.load(Ordering::Acquire) > 0);
+            assert_eq!(writes.load(Ordering::Acquire), usize::from(ready));
+            assert_eq!(stops.load(Ordering::Acquire), 0);
+            assert!(source.begin_source_silence(Arc::new(|| true)).is_err());
+            source.begin_stop().unwrap();
+            completed_stop(&mut source);
+        }
+    }
+
+    #[test]
+    fn source_silence_control_is_once_cancellable_and_off_loop() {
+        let mut backend = DryBackend::new(Capabilities {
+            system_capture: true,
+            endpoint_mute: true,
+            ..Capabilities::default()
+        });
+        for (name, direction) in [("SPEAKER", Direction::Render), ("MIC", Direction::Capture)] {
+            backend
+                .apply(ScriptEvent::UpsertDevice(Device {
+                    id: DeviceId::new(name).unwrap(),
+                    label: "Dry endpoint".into(),
+                    direction,
+                    format: AudioFormat {
+                        sample_rate: 48_000,
+                        channels: 2,
+                    },
+                }))
+                .unwrap();
+        }
+        let mut mic = backend
+            .acquire_mute(&DeviceSelection::Explicit(DeviceId::new("MIC").unwrap()))
+            .unwrap();
+        let generation = mic.snapshot().unwrap().generation;
+        mic.set_capture_mute(generation, true).unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let samples = Arc::new(AtomicUsize::new(0));
+        let (mut source, entered, stop_ready) = session(
+            &mut backend,
+            false,
+            writes.clone(),
+            stops.clone(),
+            samples.clone(),
+        );
+        stop_ready.store(false, Ordering::Release);
+        assert!(source.begin_source_silence(Arc::new(|| true)).is_err());
+        source.shared.sent_media_packets.store(1, Ordering::Release);
+        source.begin_source_silence(Arc::new(|| true)).unwrap();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        let control = Instant::now();
+        source.snapshot();
+        source.begin_stop().unwrap();
+        assert!(control.elapsed() < Duration::from_millis(125));
+        assert!(source.shared.stopped.load(Ordering::Acquire));
+        let waiting = Instant::now() + Duration::from_secs(1);
+        while stops.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < waiting);
+            thread::yield_now();
+        }
+        assert!(source.poll_stop().is_none());
+        assert_ne!(source.snapshot().native.status, StreamStatus::Stopped);
+        assert!(mic.snapshot().unwrap().muted);
+        stop_ready.store(true, Ordering::Release);
+        completed_stop(&mut source);
+        assert_eq!(writes.load(Ordering::Acquire), 0);
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        assert!(mic.snapshot().unwrap().muted);
+
+        let (mut source, entered, _) = session(
+            &mut backend,
+            true,
+            writes.clone(),
+            stops.clone(),
+            samples.clone(),
+        );
+        source.shared.sent_media_packets.store(1, Ordering::Release);
+        source.shared.last_send_ms.store(500, Ordering::Release);
+        source.begin_source_silence(Arc::new(|| true)).unwrap();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(result) = source.poll_source_silence() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        source.stream_mut().unwrap().stream.pump(64).unwrap();
+        assert!(samples.load(Ordering::Acquire) > 0);
+        source.shared.last_send_ms.store(0, Ordering::Release);
+        assert!(!source.snapshot().sending);
+        assert!(source.begin_source_silence(Arc::new(|| true)).is_err());
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+        source.begin_stop().unwrap();
+        completed_stop(&mut source);
+        assert!(mic.snapshot().unwrap().muted);
+
+        let (mut source, entered, _) =
+            session(&mut backend, false, writes.clone(), stops.clone(), samples);
+        source.shared.sent_media_packets.store(1, Ordering::Release);
+        source.begin_source_silence(Arc::new(|| true)).unwrap();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        source.shared.authorized.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(result) = source.poll_source_silence() {
+                assert_eq!(result, Err(BackendError::PermissionDenied));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+        source.begin_stop().unwrap();
+        completed_stop(&mut source);
+        assert!(mic.snapshot().unwrap().muted);
+
+        // The real handoff helper recovers ownership if OS spawning refuses.
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let failed: Result<JoinHandle<()>, _> = handoff(DropProbe(drops.clone()), |_slot| {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        });
+        let (_, recovered) = failed.unwrap_err();
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(recovered);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        mic.set_capture_mute(generation, false).unwrap();
     }
 }

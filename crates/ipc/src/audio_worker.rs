@@ -260,6 +260,7 @@ fn is_core(message: &w::audio_frame::Msg) -> bool {
         w::audio_frame::Msg::Attach(_)
             | w::audio_frame::Msg::ListDevices(_)
             | w::audio_frame::Msg::StartSession(_)
+            | w::audio_frame::Msg::ReleaseSourceLocalSound(_)
             | w::audio_frame::Msg::StopSession(_)
             | w::audio_frame::Msg::RenewSession(_)
             | w::audio_frame::Msg::SetGain(_)
@@ -320,7 +321,8 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
         );
     let pushed = matches!(
         message,
-        Msg::Ping(_)
+        Msg::ReleaseSourceLocalSound(_)
+            | Msg::Ping(_)
             | Msg::Pong(_)
             | Msg::SessionEvent(_)
             | Msg::Health(_)
@@ -401,7 +403,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                     }
                 }
                 2 => {
-                    if start.capture.is_some() {
+                    if start.capture.is_some() || start.source_local_sound_released {
                         return Err(invalid());
                     }
                     selection(start.render.as_ref().ok_or_else(invalid)?)?;
@@ -416,6 +418,7 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             }
         }
         Msg::StopSession(stop) => session_id(&stop.session_id)?,
+        Msg::ReleaseSourceLocalSound(release) => session_id(&release.session_id)?,
         Msg::RenewSession(renew) => {
             session_id(&renew.session_id)?;
             if !(1..=1000).contains(&renew.ttl_ms) {
@@ -634,7 +637,9 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
         Msg::MediaCommand(command) => {
             if command.token == 0
                 || command.expected_revision == 0
-                || !matches!(command.command, 1..=5)
+                || !matches!(command.command, 1..=6)
+                || (command.command == w::MediaCommandKind::Seek as i32)
+                    != command.position_ms.is_some()
             {
                 return Err(invalid());
             }
@@ -651,6 +656,17 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                     || session.revision == 0
                     || !matches!(session.state, 0..=3)
                     || session.commands & !31 != 0
+                    || matches!((session.position_ms, session.duration_ms),
+                        (Some(position), Some(duration)) if position > duration)
+                    || if session.can_seek == Some(true) {
+                        !matches!(
+                            (session.position_ms, session.duration_ms, session.seek_min_ms, session.seek_max_ms),
+                            (Some(_), Some(duration), Some(min), Some(max))
+                                if duration > 0 && min <= max && max <= duration
+                        )
+                    } else {
+                        session.seek_min_ms.is_some() || session.seek_max_ms.is_some()
+                    }
                     || snapshot.sessions[..index]
                         .iter()
                         .any(|other| other.token == session.token)

@@ -48,6 +48,12 @@ impl WindowsBackend {
         }
         f(media.as_mut().expect("initialized above"))
     }
+
+    /// Raw OS-selected media view, without the still-live paused-session fallback.
+    /// Tokens use the same namespace as this backend's media catalog and commands.
+    pub fn native_current_media_session(&self) -> Result<Option<MediaSessionToken>, BackendError> {
+        self.with_media(|media| media.native_current_session())
+    }
     fn poll_ptt(&mut self) -> Option<Event> {
         if self.pending_release {
             self.pending_release = false;
@@ -144,6 +150,13 @@ impl Stream for WindowsStream {
     }
     fn snapshot(&self) -> StreamSnapshot {
         stream_snapshot(self.native.snapshot())
+    }
+    fn suppress_local_playback(
+        &mut self,
+        _admitted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), BackendError> {
+        // Process-tree capture has no bound render endpoint; render muting is unqualified.
+        Err(BackendError::Unsupported)
     }
     fn stop(&mut self) -> Result<(), BackendError> {
         self.native.stop();

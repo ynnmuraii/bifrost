@@ -403,7 +403,7 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
         .collect();
     let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + 28.0).collect();
     let total = widths.iter().sum::<f32>() + 2.0 * (items.len().saturating_sub(1)) as f32 + 6.0;
-    let (outer, _) = ui.allocate_exact_size(Vec2::new(total, 44.0), Sense::hover());
+    let (outer, response) = ui.allocate_exact_size(Vec2::new(total, 44.0), Sense::hover());
     let rounding = pal.rad_btn(44.0 + 6.0);
     ui.painter()
         .rect(outer, rounding, pal.bg2, pal.hairline(), StrokeKind::Inside);
@@ -413,7 +413,7 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
     for width in &widths[..on] {
         target_x += width + 2.0;
     }
-    let id = ui.id().with(("seg-pill", items));
+    let id = response.id;
     let x = ui
         .ctx()
         .animate_value_with_time(id.with("x"), target_x, SEG_SLIDE);
@@ -441,7 +441,7 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
         let cell = Rect::from_min_size(Pos2::new(x, outer.min.y + 3.0), Vec2::new(widths[i], 38.0));
         x += widths[i] + 2.0;
         let response = ui
-            .interact(cell, ui.id().with(("seg", i, items[i])), Sense::click())
+            .interact(cell, id.with(i), Sense::click())
             .on_hover_cursor(CursorIcon::PointingHand);
         response.widget_info(|| {
             egui::WidgetInfo::selected(

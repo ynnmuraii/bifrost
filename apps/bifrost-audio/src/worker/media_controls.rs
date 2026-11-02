@@ -95,12 +95,21 @@ impl Controls {
                         return Ok(());
                     }
                 }
+                if (command.command == w::MediaCommandKind::Seek as i32)
+                    != command.position_ms.is_some()
+                {
+                    complete(request_id, w::MediaCommandStatus::Unsupported, emit);
+                    return Ok(());
+                }
                 let kind = match w::MediaCommandKind::try_from(command.command) {
                     Ok(w::MediaCommandKind::Play) => MediaCommand::Play,
                     Ok(w::MediaCommandKind::Pause) => MediaCommand::Pause,
                     Ok(w::MediaCommandKind::Toggle) => MediaCommand::Toggle,
                     Ok(w::MediaCommandKind::Next) => MediaCommand::Next,
                     Ok(w::MediaCommandKind::Previous) => MediaCommand::Previous,
+                    Ok(w::MediaCommandKind::Seek) => MediaCommand::SeekTo {
+                        position_ms: command.position_ms.expect("seek payload checked"),
+                    },
                     _ => {
                         complete(request_id, w::MediaCommandStatus::Unsupported, emit);
                         return Ok(());
@@ -303,6 +312,9 @@ impl Controls {
                 subtitle: bounded_text(info.subtitle(), 256),
                 position_ms: info.position_ms,
                 duration_ms: info.duration_ms,
+                can_seek: Some(info.seek_range().is_some()),
+                seek_min_ms: info.seek_range().map(|(min, _)| min),
+                seek_max_ms: info.seek_range().map(|(_, max)| max),
                 state: match info.state {
                     PlaybackState::Playing => w::PlaybackState::Playing,
                     PlaybackState::Paused => w::PlaybackState::Paused,
@@ -441,6 +453,7 @@ mod tests {
                     token: 1,
                     expected_revision: revision,
                     command: kind as i32,
+                    position_ms: None,
                 }),
                 true,
                 &mut |id, message| output.push((id, message)),
@@ -582,6 +595,56 @@ mod tests {
                 (9, w::MediaCommandStatus::Unsupported as i32),
             ]
         );
+    }
+
+    #[test]
+    fn seek_executes_position_and_preserves_current_token_revision_source_guards() {
+        let mut backend = backend();
+        let mut media = info(1, 1);
+        media.commands.seek = true;
+        media.duration_ms = Some(100);
+        media.seek_min_ms = Some(0);
+        media.seek_max_ms = Some(100);
+        backend
+            .apply(ScriptEvent::SetMedia {
+                session: media.session,
+                info: Some(media),
+            })
+            .unwrap();
+        backend
+            .apply(ScriptEvent::SetCurrentMediaSession {
+                session: Some(MediaSessionToken(1)),
+            })
+            .unwrap();
+        let mut controls = Controls::new();
+        let mut output = Vec::new();
+        watch(&mut controls, &mut backend, true, true, &mut output).unwrap();
+        for (id, token, revision, position, active, expected) in [
+            (1, 1, 1, 0, true, w::MediaCommandStatus::Ok),
+            (2, 0, 2, 10, true, w::MediaCommandStatus::StaleRevision),
+            (3, 1, 1, 10, true, w::MediaCommandStatus::StaleRevision),
+            (4, 1, 2, 101, true, w::MediaCommandStatus::Unsupported),
+            (5, 1, 2, 10, false, w::MediaCommandStatus::Cancelled),
+        ] {
+            controls
+                .command(
+                    &mut backend,
+                    id,
+                    Msg::MediaCommand(w::MediaCommand {
+                        token,
+                        expected_revision: revision,
+                        command: w::MediaCommandKind::Seek as i32,
+                        position_ms: Some(position),
+                    }),
+                    active,
+                    &mut |id, message| output.push((id, message)),
+                )
+                .unwrap();
+            backend.pump_control();
+            poll(&mut controls, &mut backend, &mut output);
+            assert!(results(&output).contains(&(id, expected as i32)));
+            assert_eq!(backend.media_sessions().unwrap()[0].position_ms, Some(0));
+        }
     }
 
     #[test]

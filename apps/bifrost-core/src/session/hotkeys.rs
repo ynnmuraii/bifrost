@@ -227,15 +227,11 @@ impl Session {
                 self.claim().await;
             }
             Ok(ipc::HotkeyAction::EmergencyRelease) => {
+                self.release_source_local_sound();
                 self.feed(fr::Input::Local(fr::LocalInput::Emergency)).await;
             }
-            Ok(ipc::HotkeyAction::ReturnLocal) if self.router.focus() == fr::FocusState::Remote => {
-                if let Some(peer) = self.router.lease().source().map(|lease| lease.peer) {
-                    self.switch_to(&crate::command::PeerRef::new(crate::command::node_id_hex(
-                        &peer,
-                    )))
-                    .await;
-                }
+            Ok(ipc::HotkeyAction::ReturnLocal) => {
+                self.switch_direction(None).await;
             }
             Ok(ipc::HotkeyAction::SwitchNext) if self.router.focus() == fr::FocusState::Local => {
                 let mut peers = self.manager.members().await;

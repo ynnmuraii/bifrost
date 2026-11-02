@@ -1,5 +1,6 @@
 //! MPRIS has no global current-player API. Prefer the most recently observed transition
-//! to Playing; initial discovery ties use sorted bus names. Never select a paused player.
+//! to Playing; initial discovery ties use sorted bus names. With none Playing, retain only
+//! the last selected still-live Paused/Stopped player so remote Play remains possible.
 mod model;
 use crate::backend::lock;
 use audio_backend::*;
@@ -43,6 +44,7 @@ struct Data {
     next_token: u64,
     next_ticket: u64,
     order: u64,
+    selected: Option<MediaSessionToken>,
     pending: VecDeque<Pending>,
     completed: VecDeque<Event>,
     changed: VecDeque<Event>,
@@ -60,6 +62,7 @@ impl Data {
             next_token: 0,
             next_ticket: 0,
             order: 0,
+            selected: None,
             pending: VecDeque::with_capacity(COMMAND_CAPACITY),
             completed: VecDeque::with_capacity(COMMAND_CAPACITY),
             changed: VecDeque::with_capacity(EVENT_CAPACITY),
@@ -111,6 +114,9 @@ impl Data {
     }
     fn remove(&mut self, name: &str) {
         if let Some(player) = self.players.remove(name) {
+            if self.selected == Some(player.token) {
+                self.selected = None;
+            }
             let mut index = 0;
             while index < self.pending.len() {
                 if self.pending[index].request.session == player.token {
@@ -130,6 +136,9 @@ impl Data {
         let Some(player) = self.players.get_mut(name) else {
             return;
         };
+        if self.selected == Some(player.token) && player.state == PlaybackState::Unknown {
+            self.selected = None;
+        }
         if player.state == PlaybackState::Playing && !was_playing {
             self.order = self.order.saturating_add(1);
             player.playing_order = self.order;
@@ -148,6 +157,7 @@ impl Data {
     }
     fn unavailable(&mut self) {
         self.available = false;
+        self.selected = None;
         self.cancel(BackendError::ServerUnavailable);
         while let Some((_, player)) = self.players.pop_first() {
             self.emit(Event::MediaChanged {
@@ -209,16 +219,31 @@ impl Mpris {
             .collect())
     }
     pub fn current(&self) -> Result<Option<MediaSessionToken>, BackendError> {
-        let data = lock(&self.shared.data);
+        let mut data = lock(&self.shared.data);
         if !data.available {
             return Err(BackendError::ServerUnavailable);
         }
-        Ok(data
+        let selected = data
             .players
             .values()
-            .filter(|player| player.state == PlaybackState::Playing)
+            .filter(|player| player.token.0 != 0 && player.state == PlaybackState::Playing)
             .max_by_key(|player| player.playing_order)
-            .map(|player| player.token))
+            .map(|player| player.token)
+            .or_else(|| {
+                data.players
+                    .values()
+                    .find(|player| {
+                        Some(player.token) == data.selected
+                            && player.token.0 != 0
+                            && matches!(
+                                player.state,
+                                PlaybackState::Paused | PlaybackState::Stopped
+                            )
+                    })
+                    .map(|player| player.token)
+            });
+        data.selected = selected;
+        Ok(selected)
     }
     pub fn command(&self, request: MediaCommandRequest) -> Result<(), BackendError> {
         let mut data = lock(&self.shared.data);
@@ -241,6 +266,9 @@ impl Mpris {
         }
         if !player.commands().contains(request.command) {
             return Err(BackendError::Unsupported);
+        }
+        if let MediaCommand::SeekTo { position_ms } = request.command {
+            player.seek_position(position_ms)?;
         }
         let ticket = data.next_ticket.checked_add(1).ok_or(BackendError::Busy)?;
         data.next_ticket = ticket;
@@ -429,9 +457,8 @@ async fn changed(connection: &Connection, shared: &Shared, message: Message) {
     if !invalidated.is_empty() {
         for name in invalidated {
             let value = match name.as_str() {
-                "CanControl" | "CanPlay" | "CanPause" | "CanGoNext" | "CanGoPrevious" => {
-                    OwnedValue::from(false)
-                }
+                "CanControl" | "CanPlay" | "CanPause" | "CanGoNext" | "CanGoPrevious"
+                | "CanSeek" => OwnedValue::from(false),
                 "Rate" => OwnedValue::from(0.0f64),
                 "Position" => OwnedValue::from(-1i64),
                 "Metadata" => Properties::new().into(),
@@ -536,7 +563,7 @@ fn dispatch(shared: &Arc<Shared>, connection: &Connection) -> Option<(u64, Comma
                 if owner(&connection, &name).await? != target {
                     return Err(BackendError::DeviceGone);
                 }
-                {
+                let seek_target = {
                     let mut data = lock(&shared.data);
                     data.expire(Instant::now());
                     if shared.stop.load(Ordering::Acquire)
@@ -555,6 +582,21 @@ fn dispatch(shared: &Arc<Shared>, connection: &Connection) -> Option<(u64, Comma
                     if !player.commands().contains(request.command) {
                         return Err(BackendError::Unsupported);
                     }
+                    match request.command {
+                        MediaCommand::SeekTo { position_ms } => {
+                            Some(player.seek_target(position_ms)?)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((track, position)) = seek_target {
+                    return bounded(deadline.saturating_duration_since(Instant::now()), async {
+                        Proxy::new(&connection, target.as_str(), PATH, PLAYER)
+                            .await?
+                            .call::<_, _, ()>("SetPosition", &(track, position))
+                            .await
+                    })
+                    .await;
                 }
                 let method = match request.command {
                     MediaCommand::Play => "Play",
@@ -562,6 +604,7 @@ fn dispatch(shared: &Arc<Shared>, connection: &Connection) -> Option<(u64, Comma
                     MediaCommand::Toggle => "PlayPause",
                     MediaCommand::Next => "Next",
                     MediaCommand::Previous => "Previous",
+                    MediaCommand::SeekTo { .. } => unreachable!("seek dispatched above"),
                 };
                 bounded(deadline.saturating_duration_since(Instant::now()), async {
                     Proxy::new(&connection, target.as_str(), PATH, PLAYER)

@@ -670,7 +670,7 @@ enum AudioUnavailableReason {
   AUDIO_UNAVAILABLE_REASON_WORKER_UNAVAILABLE = 10;
 }
 enum AudioPlaybackState { AUDIO_PLAYBACK_STATE_UNSPECIFIED = 0; AUDIO_PLAYBACK_STATE_UNKNOWN = 1; AUDIO_PLAYBACK_STATE_PLAYING = 2; AUDIO_PLAYBACK_STATE_PAUSED = 3; AUDIO_PLAYBACK_STATE_STOPPED = 4; }
-enum AudioMediaCommand { AUDIO_MEDIA_COMMAND_UNSPECIFIED = 0; AUDIO_MEDIA_COMMAND_PLAY = 1; AUDIO_MEDIA_COMMAND_PAUSE = 2; AUDIO_MEDIA_COMMAND_TOGGLE = 3; AUDIO_MEDIA_COMMAND_NEXT = 4; AUDIO_MEDIA_COMMAND_PREVIOUS = 5; }
+enum AudioMediaCommand { AUDIO_MEDIA_COMMAND_UNSPECIFIED = 0; AUDIO_MEDIA_COMMAND_PLAY = 1; AUDIO_MEDIA_COMMAND_PAUSE = 2; AUDIO_MEDIA_COMMAND_TOGGLE = 3; AUDIO_MEDIA_COMMAND_NEXT = 4; AUDIO_MEDIA_COMMAND_PREVIOUS = 5; AUDIO_MEDIA_COMMAND_SEEK = 6; }
 enum AudioDeviceKind { AUDIO_DEVICE_KIND_UNSPECIFIED = 0; AUDIO_DEVICE_KIND_OUTPUT = 1; AUDIO_DEVICE_KIND_CAPTURE = 2; AUDIO_DEVICE_KIND_MICROPHONE = 3; }
 message GetAudioStatus {}
 message SetAudio { AudioConfig config = 1; uint64 expected_revision = 2; }
@@ -688,7 +688,7 @@ message StopAudio { bytes peer_node_id = 1; bytes session_id = 2; bool stop_all 
 message SetMicrophoneMute { bool muted = 1; uint64 expected_revision = 2; }
 message SetPtt { bool pressed = 1; uint64 expected_revision = 2; }
 message SetAudioPeerGain { bytes peer_node_id = 1; uint32 gain_percent = 2; bool muted = 3; uint64 expected_revision = 4; }
-message SendMediaCommand { bytes peer_node_id = 1; bytes session_id = 2; uint64 session_token = 3; uint64 media_revision = 4; AudioMediaCommand command = 5; }
+message SendMediaCommand { bytes peer_node_id = 1; bytes session_id = 2; uint64 session_token = 3; uint64 media_revision = 4; AudioMediaCommand command = 5; optional uint64 position_ms = 6; }
 message AudioConfig {
   bool enabled = 1; AudioRole role = 2; bytes listener_node_id = 3; bytes group_id = 4;
   AudioMode mode = 5; uint32 udp_port = 6; AudioProfile profile = 7;
@@ -782,12 +782,13 @@ message AudioSessionStatus {
   AudioRemoteQuality remote_quality = 21;
   AudioLatencyDiagnostics latency_stages = 22;
 }
-message AudioMediaCommands { bool play = 1; bool pause = 2; bool toggle = 3; bool next = 4; bool previous = 5; }
+message AudioMediaCommands { bool play = 1; bool pause = 2; bool toggle = 3; bool next = 4; bool previous = 5; bool seek = 6; }
 // Private, transient user metadata. Debug output must remain redacted.
 message MediaInfo {
   string app_id = 1; string title = 2; string subtitle = 3;
   optional uint64 position_ms = 4; uint64 session_token = 5; optional uint64 duration_ms = 6;
   AudioPlaybackState playback = 7; AudioMediaCommands commands = 8; uint64 revision = 9;
+  optional uint64 seek_min_ms = 10; optional uint64 seek_max_ms = 11;
 }
 message ListAudioDevices { AudioDeviceKind kind = 1; }
 message AudioDevice { string id = 1; string name = 2; bool is_default = 3; bool available = 4; }

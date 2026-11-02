@@ -24,6 +24,8 @@ ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "
 tokio = { version = "1", features = ["rt", "time", "net"] }
 rustix = { version = "1", features = ["time"] }
 toml = "1"
+libloading = "=0.8.9"
+tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 audio-media = { path = "../audio-media" }

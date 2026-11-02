@@ -18,7 +18,7 @@ use std::{
 };
 use windows::{
     core::{IUnknown, Interface, HSTRING},
-    Foundation::TypedEventHandler,
+    Foundation::{TimeSpan, TypedEventHandler},
     Media::Control::*,
     Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED},
 };
@@ -105,11 +105,39 @@ pub struct MediaSnapshot {
     /// different views of a player from GetSessions and GetCurrentSession; metadata
     /// is never used to merge their identities.
     pub sessions: Vec<MediaSession>,
+    /// Actual OS choice first; absent that, only the last-selected still-live paused/stopped token.
     pub current: Option<SessionToken>,
+    /// Unmodified OS-selected view, in this manager's token namespace.
+    pub(crate) native_current: Option<SessionToken>,
+}
+
+impl MediaSnapshot {
+    fn select_current(&mut self, last_selected: &mut Option<SessionToken>) {
+        let os_current = self.native_current;
+        self.current = os_current.or(*last_selected).filter(|token| {
+            self.sessions.iter().any(|session| {
+                session.token == *token
+                    && token.0 != 0
+                    && session.revision != 0
+                    && session.revision != u64::MAX
+                    && (os_current.is_some() || matches!(session.playback_status, 3 | 5))
+            })
+        });
+        if self.current.is_some() {
+            *last_selected = self.current;
+        } else if !self
+            .sessions
+            .iter()
+            .any(|session| Some(session.token) == *last_selected)
+        {
+            *last_selected = None;
+        }
+    }
 }
 
 enum Request {
     Snapshot(SyncSender<Result<MediaSnapshot, Error>>),
+    NativeCurrent(SyncSender<Result<Option<SessionToken>, Error>>),
     Command(SessionToken, MediaCommand, SyncSender<Result<bool, Error>>),
     BackendCommand(Arc<Pending>),
 }
@@ -152,6 +180,9 @@ impl MediaManager {
                         match rx.recv_timeout(Duration::from_millis(50)) {
                             Ok(Request::Snapshot(reply)) => {
                                 let _ = reply.send(state.snapshot());
+                            }
+                            Ok(Request::NativeCurrent(reply)) => {
+                                let _ = reply.send(state.reconcile());
                             }
                             Ok(Request::Command(token, command, reply)) => {
                                 let _ = reply.send(state.command(token, command));
@@ -211,6 +242,15 @@ impl MediaManager {
         let (tx, rx) = mpsc::sync_channel(1);
         self.requests
             .send(Request::Snapshot(tx))
+            .map_err(|_| Error::WorkerStopped)?;
+        rx.recv().map_err(|_| Error::WorkerStopped)?
+    }
+
+    /// Observe the actual OS-selected view without reading metadata or changing fallback history.
+    pub fn native_current(&self) -> Result<Option<SessionToken>, Error> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.requests
+            .send(Request::NativeCurrent(tx))
             .map_err(|_| Error::WorkerStopped)?;
         rx.recv().map_err(|_| Error::WorkerStopped)?
     }
@@ -338,6 +378,7 @@ struct State {
     manager: Manager,
     entries: Vec<Entry>,
     next: u64,
+    last_selected: Option<SessionToken>,
     sessions_changed: Option<i64>,
     current_changed: Option<i64>,
     sink: EventSink,
@@ -369,6 +410,7 @@ impl State {
             manager,
             entries: Vec::new(),
             next: 1,
+            last_selected: None,
             sessions_changed: None,
             current_changed: None,
             sink,
@@ -509,7 +551,13 @@ impl State {
                 },
             });
         }
-        Ok(MediaSnapshot { sessions, current })
+        let mut snapshot = MediaSnapshot {
+            sessions,
+            current: None,
+            native_current: current,
+        };
+        snapshot.select_current(&mut self.last_selected);
+        Ok(snapshot)
     }
 
     fn command(&mut self, token: SessionToken, command: MediaCommand) -> Result<bool, Error> {
@@ -555,12 +603,19 @@ impl State {
         let session = entry.session.clone();
         let revision = entry.revision.clone();
         let available = controls(&session).map_err(map_error)?;
+        let target = match pending.request.command {
+            audio_backend::MediaCommand::SeekTo { position_ms } => {
+                Some(seek_target(&session, position_ms)?)
+            }
+            _ => None,
+        };
         let enabled = match pending.request.command {
             audio_backend::MediaCommand::Play => available.play,
             audio_backend::MediaCommand::Pause => available.pause,
             audio_backend::MediaCommand::Toggle => available.toggle,
             audio_backend::MediaCommand::Next => available.next,
             audio_backend::MediaCommand::Previous => available.previous,
+            audio_backend::MediaCommand::SeekTo { .. } => available.seek,
         };
         if !enabled {
             return Err(BackendError::Unsupported);
@@ -575,6 +630,8 @@ impl State {
                 audio_backend::MediaCommand::Toggle => session.TryTogglePlayPauseAsync(),
                 audio_backend::MediaCommand::Next => session.TrySkipNextAsync(),
                 audio_backend::MediaCommand::Previous => session.TrySkipPreviousAsync(),
+                audio_backend::MediaCommand::SeekTo { .. } => session
+                    .TryChangePlaybackPositionAsync(target.ok_or(BackendError::InvalidArgument)?),
             }
             .map_err(|error| map_error(Error::Windows(error)))
         }) {
@@ -631,6 +688,51 @@ impl Drop for State {
     }
 }
 
+fn span(result: windows::core::Result<TimeSpan>) -> Result<i64, BackendError> {
+    result
+        .map(|value| value.Duration)
+        .map_err(|error| map_error(Error::Windows(error)))
+}
+
+/// Convert an item-relative millisecond target to the provider's published timeline ticks.
+/// Reject anything outside the provider's current seek range; never clamp at the Source.
+fn seek_target(session: &Session, position_ms: u64) -> Result<i64, BackendError> {
+    let timeline = session
+        .GetTimelineProperties()
+        .map_err(|error| map_error(Error::Windows(error)))?;
+    let start = span(timeline.StartTime())?;
+    let end = span(timeline.EndTime())?;
+    let min = span(timeline.MinSeekTime())?;
+    let max = span(timeline.MaxSeekTime())?;
+    let duration = end
+        .checked_sub(start)
+        .filter(|duration| *duration > 0)
+        .ok_or(BackendError::Unsupported)?;
+    let position = i64::try_from(position_ms)
+        .ok()
+        .and_then(|position| position.checked_mul(10_000))
+        .ok_or(BackendError::InvalidArgument)?;
+    let min = min
+        .checked_sub(start)
+        .ok_or(BackendError::InvalidArgument)?;
+    let max = max
+        .checked_sub(start)
+        .ok_or(BackendError::InvalidArgument)?;
+    if position < 0
+        || position > duration
+        || min < 0
+        || max < min
+        || max > duration
+        || position < min
+        || position > max
+    {
+        return Err(BackendError::InvalidArgument);
+    }
+    start
+        .checked_add(position)
+        .ok_or(BackendError::InvalidArgument)
+}
+
 fn controls(session: &Session) -> Result<Controls, Error> {
     let c = session.GetPlaybackInfo()?.Controls()?;
     Ok(Controls {
@@ -679,6 +781,102 @@ fn revision_matches(revision: &AtomicU64, expected: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog_session(token: u64, playback_status: i32) -> MediaSession {
+        MediaSession {
+            token: SessionToken(token),
+            revision: 1,
+            app_id: String::new(),
+            title: String::new(),
+            artist: String::new(),
+            playback_status,
+            timeline: Timeline {
+                start: 0,
+                end: 0,
+                position: 0,
+                min_seek: 0,
+                max_seek: 0,
+                updated_at: 0,
+            },
+            controls: Controls {
+                play: true,
+                pause: true,
+                ..Controls::default()
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_only_last_selected_live_paused_media_resumable_without_os_current() {
+        let mut last = None;
+        let mut snapshot = MediaSnapshot {
+            sessions: vec![catalog_session(1, 4)],
+            current: None,
+            native_current: Some(SessionToken(1)),
+        };
+        snapshot.select_current(&mut last);
+        assert_eq!(snapshot.current, Some(SessionToken(1)));
+        assert_eq!(last, snapshot.current);
+        for playback in [5, 3] {
+            snapshot.native_current = None;
+            snapshot.sessions[0].playback_status = playback;
+            snapshot.select_current(&mut last);
+            assert_eq!(
+                snapshot.native_current, None,
+                "logical fallback is not an OS-current fact"
+            );
+            let selected = snapshot
+                .sessions
+                .iter()
+                .find(|session| Some(session.token) == snapshot.current)
+                .expect("still-live paused/stopped selection exposes its real Play control");
+            assert_eq!(selected.token, SessionToken(1));
+            assert!(selected.controls.play);
+        }
+        snapshot.sessions.push(catalog_session(2, 4));
+        snapshot.native_current = Some(SessionToken(2));
+        snapshot.select_current(&mut last);
+        assert_eq!(
+            snapshot.current,
+            Some(SessionToken(2)),
+            "real OS choice preempts fallback"
+        );
+        snapshot
+            .sessions
+            .retain(|session| session.token == SessionToken(1));
+        snapshot.native_current = None;
+        snapshot.select_current(&mut last);
+        assert_eq!(
+            snapshot.current, None,
+            "removed last selection cannot choose another paused app"
+        );
+        assert_eq!(last, None, "removed identity is not cached");
+    }
+
+    #[test]
+    fn snapshot_never_invents_a_selection_for_unknown_unavailable_or_never_selected_media() {
+        for (last, status, revision, token) in [
+            (None, 5, 1, 1),
+            (Some(SessionToken(1)), 0, 1, 1),
+            (Some(SessionToken(1)), 1, 1, 1),
+            (Some(SessionToken(1)), 2, 1, 1),
+            (Some(SessionToken(1)), 6, 1, 1),
+            (Some(SessionToken(1)), 5, 0, 1),
+            (Some(SessionToken(1)), 5, u64::MAX, 1),
+            (Some(SessionToken(0)), 5, 1, 0),
+        ] {
+            let mut previous = last;
+            let mut session = catalog_session(token, status);
+            session.revision = revision;
+            let mut snapshot = MediaSnapshot {
+                sessions: vec![session],
+                current: None,
+                native_current: None,
+            };
+            snapshot.select_current(&mut previous);
+            assert_eq!(snapshot.current, None);
+        }
+    }
     #[test]
     fn changes_invalidate_revision_and_exhaustion_fails_closed() {
         let revision = AtomicU64::new(1);
@@ -715,7 +913,8 @@ mod tests {
             "{:?}",
             MediaSnapshot {
                 sessions: vec![session],
-                current: None
+                current: None,
+                native_current: None,
             }
         );
         assert!(!debug.contains("private-"));

@@ -1,4 +1,4 @@
-//! Provisional presentation boundary for a future AudioStatus IPC adapter.
+//! Remote-audio presentation vocabulary and GUI-only popup lifecycle.
 //!
 //! Stream identities must be stable opaque core identities, never display names. The adapter
 //! supplies negotiated media permissions and command support; local gain/mute are Listener-only.
@@ -21,6 +21,25 @@ pub enum StreamState {
     Failed,
 }
 
+/// Current authorized media identity and native seek range.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AudioSeekTarget {
+    pub session_token: u64,
+    pub media_revision: u64,
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
+impl std::fmt::Debug for AudioSeekTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioSeekTarget")
+            .field("session_token", &self.session_token)
+            .field("media_revision", &self.media_revision)
+            .field("range", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// One Source stream or diagnosed failed Listener path, populated only from authoritative status.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AudioPlayerCard {
@@ -33,6 +52,7 @@ pub struct AudioPlayerCard {
     pub app: AppKind,
     pub position_ms: Option<u64>,
     pub duration_ms: Option<u64>,
+    pub seek: Option<AudioSeekTarget>,
     pub playing: bool,
     /// Permission AND session command support, not just application detection.
     pub can_prev: bool,
@@ -58,16 +78,58 @@ impl std::fmt::Debug for AudioPlayerCard {
 }
 
 /// Intent, not optimistic playback state. The IPC adapter must recheck permissions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AudioPlayerAction {
     Previous(String),
     PlayPause(String),
     Next(String),
-    SetMuted { stream_id: String, muted: bool },
-    SetGain { stream_id: String, percent: u8 },
+    Seek {
+        stream_id: String,
+        target: AudioSeekTarget,
+        position_ms: u64,
+    },
+    SetMuted {
+        stream_id: String,
+        muted: bool,
+    },
+    SetGain {
+        stream_id: String,
+        percent: u8,
+    },
     Stop(String),
     OpenSettings,
     HidePlayer,
+}
+
+impl std::fmt::Debug for AudioPlayerAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Previous(id) => f.debug_tuple("Previous").field(id).finish(),
+            Self::PlayPause(id) => f.debug_tuple("PlayPause").field(id).finish(),
+            Self::Next(id) => f.debug_tuple("Next").field(id).finish(),
+            Self::Seek {
+                stream_id, target, ..
+            } => f
+                .debug_struct("Seek")
+                .field("stream_id", stream_id)
+                .field("target", target)
+                .field("position", &"[REDACTED]")
+                .finish(),
+            Self::SetMuted { stream_id, muted } => f
+                .debug_struct("SetMuted")
+                .field("stream_id", stream_id)
+                .field("muted", muted)
+                .finish(),
+            Self::SetGain { stream_id, percent } => f
+                .debug_struct("SetGain")
+                .field("stream_id", stream_id)
+                .field("percent", percent)
+                .finish(),
+            Self::Stop(id) => f.debug_tuple("Stop").field(id).finish(),
+            Self::OpenSettings => f.write_str("OpenSettings"),
+            Self::HidePlayer => f.write_str("HidePlayer"),
+        }
+    }
 }
 
 /// GUI-only popup lifecycle. Positions intentionally are not persisted: gui.toml has no

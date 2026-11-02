@@ -462,6 +462,7 @@ fn gui_controls_use_authoritative_state_and_require_explicit_control_consent() {
         session_token,
         media_revision,
         command: wire::AudioMediaCommand::Play as i32,
+        position_ms: None,
     })) {
         gui_frame::Msg::OpResult(result) => {
             assert!(!result.ok);

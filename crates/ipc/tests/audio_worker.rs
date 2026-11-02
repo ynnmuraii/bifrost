@@ -49,6 +49,7 @@ fn start() -> w::StartSession {
         local_scope_id: 0,
         peer_scope_id: 0,
         initial_authorization_ms: 1000,
+        source_local_sound_released: false,
     }
 }
 fn frame(message: Msg) -> w::AudioFrame {
@@ -60,6 +61,32 @@ fn frame(message: Msg) -> w::AudioFrame {
         request_id: 1,
         msg: Some(message),
     }
+}
+#[test]
+fn source_local_sound_release_is_one_way_and_exact_session_scoped() {
+    let message = || {
+        Msg::ReleaseSourceLocalSound(w::ReleaseSourceLocalSound {
+            session_id: vec![3; 16],
+        })
+    };
+    let mut release = frame(message());
+    assert!(contract::validate_frame(&release).is_err());
+    release.request_id = 0;
+    assert!(contract::validate_frame(&release).is_ok());
+    let mut listener = start();
+    listener.role = 2;
+    listener.capture = None;
+    listener.render = Some(w::DeviceSelection {
+        selector: Some(w::device_selection::Selector::DeviceId(
+            "owned-output".into(),
+        )),
+    });
+    listener.source_local_sound_released = true;
+    assert!(contract::validate_frame(&frame(Msg::StartSession(listener))).is_err());
+    release.msg = Some(Msg::ReleaseSourceLocalSound(w::ReleaseSourceLocalSound {
+        session_id: vec![3; 15],
+    }));
+    assert!(contract::validate_frame(&release).is_err());
 }
 #[test]
 fn messages_and_nested_debug_never_expose_secrets() {
@@ -472,6 +499,9 @@ fn media_info(token: u64) -> w::MediaInfo {
         duration_ms: None,
         state: 0,
         commands: 31,
+        can_seek: None,
+        seek_min_ms: None,
+        seek_max_ms: None,
     }
 }
 
@@ -503,6 +533,7 @@ fn m5_m6_requests() -> Vec<Msg> {
             token: 1,
             expected_revision: 1,
             command: 1,
+            position_ms: None,
         }),
     ]
 }
@@ -844,7 +875,10 @@ fn media_snapshot_bounds_tokens_revisions_and_optional_times() {
                 session.duration_ms = duration_ms;
                 assert_eq!(
                     valid_media(snapshot),
-                    (0..=3).contains(&state) && commands <= 31
+                    (0..=3).contains(&state)
+                        && commands <= 31
+                        && !matches!((position_ms, duration_ms),
+                            (Some(position), Some(duration)) if position > duration)
                 );
             }
         }
@@ -885,6 +919,7 @@ fn media_command_enums_tokens_and_revisions_are_closed() {
                         token,
                         expected_revision,
                         command,
+                        position_ms: None,
                     })))
                     .is_ok(),
                     token != 0 && expected_revision != 0 && (1..=5).contains(&command)
@@ -1093,4 +1128,20 @@ fn restart_required_is_an_append_only_bounded_private_error() {
         );
     }
     assert_eq!(w::ErrorCode::RestartRequired as i32, 9);
+}
+
+#[test]
+fn seek_payload_is_present_exactly_for_seek_including_zero() {
+    let mut command = w::MediaCommand {
+        token: 7,
+        expected_revision: 8,
+        command: w::MediaCommandKind::Seek as i32,
+        position_ms: Some(0),
+    };
+    assert!(contract::validate_frame(&frame(Msg::MediaCommand(command))).is_ok());
+    command.position_ms = None;
+    assert!(contract::validate_frame(&frame(Msg::MediaCommand(command))).is_err());
+    command.position_ms = Some(0);
+    command.command = w::MediaCommandKind::Play as i32;
+    assert!(contract::validate_frame(&frame(Msg::MediaCommand(command))).is_err());
 }

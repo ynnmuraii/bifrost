@@ -113,6 +113,8 @@ pub enum Key {
     AudioPlay,
     AudioPause,
     AudioNext,
+    AudioSeek,
+    AudioSeekUnavailable,
     AudioMute,
     AudioUnmute,
     AudioGain,
@@ -921,6 +923,8 @@ pub enum Key {
     NextComputer,
     /// «Вернуться сюда»
     ReturnHere,
+    /// Release Source automatic local silence without stopping sharing.
+    SourceLocalSoundReleaseHint,
     /// «Забрать управление»
     ClaimOwnership,
     /// «Изменить»
@@ -1093,6 +1097,8 @@ const fn ru(key: Key) -> &'static str {
         Key::AudioPlay => "Воспроизвести",
         Key::AudioPause => "Приостановить",
         Key::AudioNext => "Следующий трек",
+        Key::AudioSeek => "Перейти к позиции трека",
+        Key::AudioSeekUnavailable => "Перемотка недоступна в текущем сеансе",
         Key::AudioMute => "Выключить звук этого компьютера",
         Key::AudioUnmute => "Включить звук этого компьютера",
         Key::AudioGain => "Громкость на этом компьютере",
@@ -1619,6 +1625,7 @@ const fn ru(key: Key) -> &'static str {
         Key::Pairing => "Сопряжение",
         Key::NextComputer => "Следующий компьютер",
         Key::ReturnHere => "Вернуться сюда",
+        Key::SourceLocalSoundReleaseHint => "«Вернуться сюда» и аварийная комбинация снимают автоматическую тишину выхода Source, не останавливая передачу. Действует и при местном вводе, до выключения и нового включения передачи. Заранее заглушённый выход остаётся заглушённым; микрофон не меняется.",
         Key::ClaimOwnership => "Забрать управление",
         Key::Change => "Изменить",
         Key::Reset => "По умолчанию",
@@ -1726,6 +1733,8 @@ const fn en(key: Key) -> &'static str {
         Key::AudioPlay => "Play",
         Key::AudioPause => "Pause",
         Key::AudioNext => "Next track",
+        Key::AudioSeek => "Seek in track",
+        Key::AudioSeekUnavailable => "Seeking is unavailable for this session",
         Key::AudioMute => "Mute this source locally",
         Key::AudioUnmute => "Unmute this source locally",
         Key::AudioGain => "Volume on this computer",
@@ -2254,6 +2263,7 @@ const fn en(key: Key) -> &'static str {
         Key::Pairing => "Pairing",
         Key::NextComputer => "Next computer",
         Key::ReturnHere => "Return here",
+        Key::SourceLocalSoundReleaseHint => "Return here and Emergency release automatic local silence on the Source without stopping sharing. Also works while input is local, until sharing is turned off and on. An initially muted output stays muted; the microphone is unchanged.",
         Key::ClaimOwnership => "Claim ownership",
         Key::Change => "Change",
         Key::Reset => "Reset",
@@ -2543,7 +2553,7 @@ mod tests {
     }
 
     /// Every key of the catalogue, for the tests that walk it.
-    pub const EVERY: [Key; 575] = [
+    pub const EVERY: [Key; 577] = [
         Key::AudioHide,
         Key::AudioPlayer,
         Key::AudioSettings,
@@ -2567,6 +2577,8 @@ mod tests {
         Key::AudioPlay,
         Key::AudioPause,
         Key::AudioNext,
+        Key::AudioSeek,
+        Key::AudioSeekUnavailable,
         Key::AudioMute,
         Key::AudioUnmute,
         Key::AudioGain,

@@ -54,6 +54,8 @@ fn snapshot(revision: u64) -> ipc::AudioStatus {
                 subtitle: String::new(),
                 position_ms: Some(0),
                 duration_ms: None,
+                seek_min_ms: None,
+                seek_max_ms: None,
                 session_token: 7,
                 playback: model::PlaybackState::Playing,
                 commands: model::MediaCommands {
@@ -80,6 +82,41 @@ fn snapshot(revision: u64) -> ipc::AudioStatus {
         },
     )
     .unwrap()
+}
+
+fn draw_audio_player(
+    ctx: &bifrost_gui::egui::Context,
+    vm: &bifrost_gui::view_model::ViewModel,
+    events: Vec<bifrost_gui::egui::Event>,
+) -> (bifrost_gui::egui::FullOutput, Vec<AudioPlayerAction>) {
+    use bifrost_gui::{egui, ui};
+    let mut actions = Vec::new();
+    let output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(240.0, ui::audio_player::height(&vm.audio_player.cards)),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            actions =
+                ui::audio_player::draw(ui, &vm.audio_player.cards, vm.look.theme, vm.look.language)
+        },
+    );
+    (output, actions)
+}
+
+fn seekable_snapshot(revision: u64) -> ipc::AudioStatus {
+    let mut status = snapshot(revision);
+    let media = status.sessions[0].media_info.as_mut().unwrap();
+    media.position_ms = Some(2_000);
+    media.duration_ms = Some(10_000);
+    media.seek_min_ms = Some(3_000);
+    media.seek_max_ms = Some(7_000);
+    media.commands.as_mut().unwrap().seek = true;
+    status
 }
 
 #[test]
@@ -983,5 +1020,326 @@ fn source_retarget_uses_one_sparse_request_and_reconciles_only_authoritative_tar
             vm.take_outgoing().is_empty(),
             "no implicit activation or retry of A"
         );
+    }
+}
+
+#[test]
+fn hiding_and_showing_player_preserve_running_audio_without_any_ipc() {
+    let mut vm = view();
+    vm.apply(event(Msg::AudioStatus(snapshot(5))));
+    assert!(vm.audio_player.open);
+    let before = vm.audio.status.clone();
+    vm.local(&bifrost_gui::view_model::Action::Audio(
+        AudioAction::Player(AudioPlayerAction::HidePlayer),
+    ));
+    assert!(!vm.audio_player.open);
+    assert_eq!(vm.audio.status, before);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "Hide must not stop or reconfigure audio"
+    );
+    vm.apply(event(Msg::AudioStatus(snapshot(6))));
+    assert!(
+        !vm.audio_player.open,
+        "an existing stream must respect Hide"
+    );
+    vm.local(&bifrost_gui::view_model::Action::OpenAudioPlayer);
+    assert!(vm.audio_player.open);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "Show is local presentation only"
+    );
+    assert_eq!(
+        vm.audio.status.as_ref().unwrap().sessions,
+        before.unwrap().sessions
+    );
+}
+
+#[test]
+fn paused_media_keeps_the_real_card_and_resumes_from_its_current_play_button() {
+    use bifrost_gui::{egui, ui};
+    use ui_text::{text, Key};
+
+    let mut vm = view();
+    let mut playing = snapshot(5);
+    let media = playing.sessions[0].media_info.as_mut().unwrap();
+    media.position_ms = Some(5_000);
+    media.duration_ms = Some(90_000);
+    media.commands.as_mut().unwrap().play = true;
+    vm.apply(event(Msg::AudioStatus(playing)));
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    ctx.enable_accesskit();
+    let draw =
+        |vm: &bifrost_gui::view_model::ViewModel, events| draw_audio_player(&ctx, vm, events);
+    draw(&vm, Vec::new()).0.drop_without_applying_deltas();
+    for (key, expected, revision) in [
+        (Key::AudioPause, ipc::AudioMediaCommand::Pause, 3),
+        (Key::AudioPlay, ipc::AudioMediaCommand::Play, 4),
+    ] {
+        let (output, _) = draw(&vm, Vec::new());
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        let bounds = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(text(vm.look.language, key)))
+            .expect("visible current playback control")
+            .1
+            .bounds()
+            .unwrap();
+        let at = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        output.drop_without_applying_deltas();
+        let (output, actions) = draw(
+            &vm,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        output.drop_without_applying_deltas();
+        assert_eq!(actions, vec![AudioPlayerAction::PlayPause("01".repeat(16))]);
+        vm.audio_action(
+            &AudioAction::Player(actions.into_iter().next().unwrap()),
+            Instant::now(),
+        );
+        let mut outgoing = vm.take_outgoing();
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "one media command, never StopAudio or system OFF"
+        );
+        let (id, message) = outgoing.remove(0);
+        assert!(matches!(message, Msg::SendMediaCommand(command)
+            if command.command == expected as i32 && command.session_token == 7
+                && command.media_revision == revision && command.session_id == vec![1; 16]
+                && command.peer_node_id == vec![2; 32] && command.position_ms.is_none()));
+        if key == Key::AudioPause {
+            vm.apply(support::answer(
+                id,
+                Msg::OpResult(ipc::OpResult {
+                    ok: true,
+                    error_code: String::new(),
+                }),
+            ));
+            let mut paused = snapshot(6);
+            let media = paused.sessions[0].media_info.as_mut().unwrap();
+            media.playback = ipc::AudioPlaybackState::Paused as i32;
+            media.revision = 4;
+            media.position_ms = Some(5_000);
+            media.duration_ms = Some(90_000);
+            media.commands.as_mut().unwrap().play = true;
+            let (read_id, message) = vm.take_outgoing().pop().expect("fresh status read");
+            assert!(matches!(message, Msg::GetAudioStatus(_)));
+            vm.apply(support::answer(read_id, Msg::AudioStatus(paused)));
+            assert_eq!(vm.audio_player.cards.len(), 1, "Pause is not a stream stop");
+            assert!(vm.audio_player.open && !vm.audio_player.cards[0].playing);
+            assert!(
+                vm.audio_player.cards[0].has_media_session
+                    && vm.audio_player.cards[0].can_play_pause
+            );
+            assert_eq!(
+                vm.audio_player.cards[0].title.as_deref(),
+                Some("Private title")
+            );
+        }
+    }
+}
+
+#[test]
+fn real_track_click_dispatches_one_guarded_seek_without_optimistic_playback_or_retry() {
+    use bifrost_gui::{egui, ui};
+    use ui_text::{text, Key};
+    let mut vm = view();
+    vm.apply(event(Msg::AudioStatus(seekable_snapshot(5))));
+    let before = vm.audio_player.cards.clone();
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    ctx.enable_accesskit();
+    draw_audio_player(&ctx, &vm, Vec::new())
+        .0
+        .drop_without_applying_deltas();
+    let (output, _) = draw_audio_player(&ctx, &vm, Vec::new());
+    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+    let bounds = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some(text(vm.look.language, Key::AudioSeek)))
+        .expect("authorized track seek hit target")
+        .1
+        .bounds()
+        .unwrap();
+    let at = egui::pos2(
+        bounds.x1 as f32 - 1.0,
+        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+    );
+    output.drop_without_applying_deltas();
+    let (output, actions) = draw_audio_player(
+        &ctx,
+        &vm,
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ],
+    );
+    output.drop_without_applying_deltas();
+    assert_eq!(actions.len(), 1);
+    let action = AudioAction::Player(actions[0].clone());
+    vm.audio_action(&action, Instant::now());
+    let outgoing = vm.take_outgoing();
+    assert_eq!(outgoing.len(), 1);
+    assert!(matches!(&outgoing[0].1, Msg::SendMediaCommand(command)
+        if command.command == ipc::AudioMediaCommand::Seek as i32
+            && command.position_ms == Some(7_000)
+            && command.session_token == 7 && command.media_revision == 3
+            && command.session_id == vec![1; 16] && command.peer_node_id == vec![2; 32]));
+    assert_eq!(
+        vm.audio_player.cards, before,
+        "ACK/intent must not invent playback movement"
+    );
+    assert!(vm.audio.pending);
+    vm.audio_action(&action, Instant::now());
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "reuse global pending, no seek queue/retry"
+    );
+    vm.apply(support::answer(
+        outgoing[0].0,
+        Msg::OpResult(ipc::OpResult {
+            ok: false,
+            error_code: "AUDIO_STALE_MEDIA".into(),
+        }),
+    ));
+    assert!(!vm.audio.pending);
+    assert!(vm.audio.error.is_some());
+    assert_eq!(vm.audio_player.cards, before);
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "failure does not rebase or retry"
+    );
+}
+
+#[test]
+fn queued_track_seek_rechecks_current_identity_range_and_permission_before_dispatch() {
+    use bifrost_gui::audio_player::AudioSeekTarget;
+    let action = AudioPlayerAction::Seek {
+        stream_id: "01".repeat(16),
+        target: AudioSeekTarget {
+            session_token: 7,
+            media_revision: 3,
+            min_ms: 3_000,
+            max_ms: 7_000,
+        },
+        position_ms: 5_000,
+    };
+    for change in [
+        "none",
+        "disabled",
+        "session",
+        "token",
+        "revision",
+        "media-grant",
+        "send-grant",
+        "receive-grant",
+        "capability",
+        "system-only",
+        "unknown-position",
+        "unknown-duration",
+        "minimum",
+        "maximum",
+        "range-unavailable",
+    ] {
+        let mut status = seekable_snapshot(5);
+        match change {
+            "disabled" => status.config.as_mut().unwrap().enabled = false,
+            "session" => status.sessions[0].session_id = vec![9; 16],
+            "media-grant" => {
+                status.sessions[0]
+                    .consent
+                    .as_mut()
+                    .unwrap()
+                    .remote
+                    .as_mut()
+                    .unwrap()
+                    .allow_media_control = false
+            }
+            "send-grant" => {
+                status.sessions[0]
+                    .consent
+                    .as_mut()
+                    .unwrap()
+                    .remote
+                    .as_mut()
+                    .unwrap()
+                    .allow_system_send = false
+            }
+            "receive-grant" => {
+                status.sessions[0]
+                    .consent
+                    .as_mut()
+                    .unwrap()
+                    .local
+                    .as_mut()
+                    .unwrap()
+                    .allow_system_receive = false
+            }
+            "system-only" => status.sessions[0].media_info = None,
+            _ => {
+                let media = status.sessions[0].media_info.as_mut().unwrap();
+                match change {
+                    "token" => media.session_token += 1,
+                    "revision" => media.revision += 1,
+                    "capability" => media.commands.as_mut().unwrap().seek = false,
+                    "unknown-position" => media.position_ms = None,
+                    "unknown-duration" => media.duration_ms = None,
+                    "minimum" => media.seek_min_ms = Some(3_001),
+                    "maximum" => media.seek_max_ms = Some(6_999),
+                    "range-unavailable" => {
+                        media.seek_min_ms = None;
+                        media.seek_max_ms = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            audio::player_request(&status, &action).is_some(),
+            change == "none",
+            "{change}"
+        );
+    }
+    for position_ms in [0, 2_999, 7_001, u64::MAX] {
+        let mut outside = action.clone();
+        if let AudioPlayerAction::Seek {
+            position_ms: value, ..
+        } = &mut outside
+        {
+            *value = position_ms;
+        }
+        assert!(audio::player_request(&seekable_snapshot(5), &outside).is_none());
     }
 }

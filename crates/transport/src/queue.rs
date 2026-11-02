@@ -244,6 +244,12 @@ pub(crate) fn audio_capability(
     }
 }
 
+fn is_seek(message: &protocol::wire::AudioControl) -> bool {
+    matches!(&message.body,
+        Some(protocol::wire::audio_control::Body::MediaCommand(command))
+            if command.command == protocol::wire::MediaCommandKind::Seek as i32)
+}
+
 #[derive(Debug)]
 struct QueueState {
     generation: u64,
@@ -274,6 +280,8 @@ struct QueueState {
     remote_mic: bool,
     local_media: bool,
     remote_media: bool,
+    local_seek: bool,
+    remote_seek: bool,
     urgent_run: u8,
     input_run: u8,
 }
@@ -284,6 +292,7 @@ impl QueueState {
             && !self.closed
             && !self.refusing
             && self.family_allowed(audio_capability(message))
+            && (!is_seek(message) || self.local_seek && self.remote_seek)
     }
 
     fn family_allowed(&self, capability: protocol::wire::Capability) -> bool {
@@ -297,11 +306,18 @@ impl QueueState {
     }
 
     fn purge_audio(&mut self) {
-        let allowed = |message: &protocol::wire::AudioControl| match audio_capability(message) {
-            protocol::wire::Capability::MicControlV1 => self.local_mic && self.remote_mic,
-            protocol::wire::Capability::MediaControlV1 => self.local_media && self.remote_media,
-            protocol::wire::Capability::AudioFocusReportV1 => self.local_focus && self.remote_focus,
-            _ => self.local_audio && self.remote_audio,
+        let allowed = |message: &protocol::wire::AudioControl| {
+            (!is_seek(message) || self.local_seek && self.remote_seek)
+                && match audio_capability(message) {
+                    protocol::wire::Capability::MicControlV1 => self.local_mic && self.remote_mic,
+                    protocol::wire::Capability::MediaControlV1 => {
+                        self.local_media && self.remote_media
+                    }
+                    protocol::wire::Capability::AudioFocusReportV1 => {
+                        self.local_focus && self.remote_focus
+                    }
+                    _ => self.local_audio && self.remote_audio,
+                }
         };
         self.auxiliary.retain(|(_, intent)| match intent {
             Intent::Outbound(Outbound::AudioControl(message)) => allowed(message),
@@ -363,6 +379,8 @@ impl InputQueue {
                 remote_mic: false,
                 local_media: false,
                 remote_media: false,
+                local_seek: false,
+                remote_seek: false,
                 urgent_run: 0,
                 input_run: 0,
             }),
@@ -380,6 +398,7 @@ impl InputQueue {
         state.local_mic = capabilities.contains(&(protocol::wire::Capability::MicControlV1 as i32));
         state.local_media =
             capabilities.contains(&(protocol::wire::Capability::MediaControlV1 as i32));
+        state.local_seek = capabilities.contains(&(protocol::wire::Capability::MediaSeekV1 as i32));
         state.purge_audio();
     }
 
@@ -391,6 +410,7 @@ impl InputQueue {
             protocol::wire::Capability::AudioFocusReportV1 as i32,
             protocol::wire::Capability::MicControlV1 as i32,
             protocol::wire::Capability::MediaControlV1 as i32,
+            protocol::wire::Capability::MediaSeekV1 as i32,
         ] {
             // A withdrawal admitted while this write was in flight wins immediately.
             if capabilities.contains(&cap)
@@ -405,6 +425,8 @@ impl InputQueue {
                     state.local_mic = true;
                 } else if cap == protocol::wire::Capability::MediaControlV1 as i32 {
                     state.local_media = true;
+                } else if cap == protocol::wire::Capability::MediaSeekV1 as i32 {
+                    state.local_seek = true;
                 } else {
                     state.local_focus = true;
                 }
@@ -422,6 +444,8 @@ impl InputQueue {
             capabilities.contains(&(protocol::wire::Capability::MicControlV1 as i32));
         state.remote_media =
             capabilities.contains(&(protocol::wire::Capability::MediaControlV1 as i32));
+        state.remote_seek =
+            capabilities.contains(&(protocol::wire::Capability::MediaSeekV1 as i32));
         state.purge_audio();
     }
 
@@ -802,6 +826,9 @@ impl InputQueue {
                 }
                 if !capabilities.contains(&(protocol::wire::Capability::MediaControlV1 as i32)) {
                     state.local_media = false;
+                }
+                if !capabilities.contains(&(protocol::wire::Capability::MediaSeekV1 as i32)) {
+                    state.local_seek = false;
                 }
                 state.purge_audio();
             }
@@ -1473,5 +1500,36 @@ mod tests {
             queue.local_capabilities_written(&caps);
             assert!(!queue.audio_allowed(&audio));
         }
+    }
+    #[test]
+    fn seek_requires_both_peers_capability_and_withdrawal_purges_pending_seek() {
+        let queue = InputQueue::new(16);
+        let media = wire::Capability::MediaControlV1 as i32;
+        let seek = wire::Capability::MediaSeekV1 as i32;
+        let command = wire::AudioControl {
+            control_version: 1,
+            body: Some(wire::audio_control::Body::MediaCommand(
+                wire::MediaCommand {
+                    command: wire::MediaCommandKind::Seek as i32,
+                    position_ms: Some(0),
+                    ..Default::default()
+                },
+            )),
+        };
+        queue.ready(false);
+        queue.set_local_audio(&[media, seek]);
+        queue.set_remote_audio(&[media]);
+        assert!(!queue.audio_allowed(&command));
+        queue.set_local_audio(&[media]);
+        queue.set_remote_audio(&[media, seek]);
+        assert!(!queue.audio_allowed(&command));
+        queue.set_local_audio(&[media, seek]);
+        assert!(queue.audio_allowed(&command));
+        queue.push(Outbound::AudioControl(command.clone())).unwrap();
+        queue.set_remote_audio(&[media]);
+        assert!(!queue.audio_allowed(&command));
+        assert!(queue.pop().is_none());
+        let metadata = family_message(wire::Capability::MediaControlV1);
+        assert!(queue.audio_allowed(&metadata));
     }
 }
