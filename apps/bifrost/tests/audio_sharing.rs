@@ -781,11 +781,20 @@ foreach ($rootId in @({a}, {b})) {{
     $core = Get-CimInstance Win32_Process -Filter "ProcessId = $rootId"
     if ($null -eq $core) {{ throw 'owned fixture core exited' }}
     foreach ($process in @($core) + @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $rootId")) {{
+        if (![string]::Equals($process.ExecutablePath, $expected, [StringComparison]::OrdinalIgnoreCase)) {{
+            throw "[DEBUG-rel050-owned-child] fixture role did not use Cargo-selected binary: pid=$($process.ProcessId) parent=$($process.ParentProcessId) image=$($process.ExecutablePath)"
+        }}
         if ($process.ProcessId -eq $rootId) {{ $role = 'core' }}
         elseif ($process.CommandLine -match '\s(audio|agent)(?:\s|$)') {{ $role = $Matches[1] }}
-        else {{ throw 'unexpected child of owned fixture core' }}
-        if (![string]::Equals($process.ExecutablePath, $expected, [StringComparison]::OrdinalIgnoreCase)) {{
-            throw 'fixture role did not use Cargo-selected binary'
+        else {{
+            $commandLinePresent = ![string]::IsNullOrEmpty([string]$process.CommandLine)
+            $firstArgument = '<unavailable>'
+            if ($process.CommandLine -match '^(?:"[^"]*"|\S+)\s+("[^"]*"|\S+)') {{
+                $firstArgument = $Matches[1]
+                if ($firstArgument -notmatch '^"?[A-Za-z-][A-Za-z0-9_-]{{0,31}}"?$') {{ $firstArgument = '<redacted>' }}
+            }}
+            [Console]::Error.WriteLine("[DEBUG-rel050-owned-child] pid=$($process.ProcessId) parent=$($process.ParentProcessId) image=$($process.ExecutablePath) commandLinePresent=$commandLinePresent firstArgument=$firstArgument")
+            throw 'unexpected child of owned fixture core'
         }}
         if (!$hashes.ContainsKey($process.ExecutablePath)) {{
             $sha = [Security.Cryptography.SHA256]::Create()
@@ -812,7 +821,8 @@ foreach ($rootId in @({a}, {b})) {{
         .expect("inspect only fixture core/agent/audio process images");
     assert!(
         output.status.success(),
-        "{}",
+        "owned fixture inspection failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let text = std::str::from_utf8(&output.stdout).expect("owned process receipt");
