@@ -149,7 +149,7 @@ async fn more_than_256_handoffs_keep_native_media_and_initial_key_reuse_guard() 
                 if let Msg::Error(error) = message {
                     assert!(
                         received.frame.request_id == 100
-                            && error.session_id.as_slice() == &[13; 16]
+                            && error.session_id.as_slice() == [13; 16]
                             && error.code == 6,
                         "unexpected uncorrelated error: request={} session={:?} code={}",
                         received.frame.request_id,
