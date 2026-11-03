@@ -161,13 +161,13 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bifrost-roots" | Out-Null
 
-      - name: Test (diagnostic only; NOT release acceptance)
+      - name: Test (full-context diagnostic; NOT release acceptance)
         env:
           BIFROST_KEEP_ROOTS: "1"
           TMP: ${{ runner.temp }}\bifrost-roots
           TEMP: ${{ runner.temp }}\bifrost-roots
-        # Diagnostic branch only: final release still requires the full workspace suite.
-        run: cargo test --locked -p bifrost --test audio_sharing windows_process_source_reverses_roles_and_mode_change_keeps_owned_media_running -- --exact --nocapture
+        # Diagnostic branch only: preserve the full failing-suite context.
+        run: cargo test --locked --workspace --no-fail-fast
 
       - name: Upload harness roots
         if: failure()

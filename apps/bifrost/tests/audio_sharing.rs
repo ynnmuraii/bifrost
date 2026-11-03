@@ -780,22 +780,22 @@ $hashes = @{{}}
 foreach ($rootId in @({a}, {b})) {{
     $core = Get-CimInstance Win32_Process -Filter "ProcessId = $rootId"
     if ($null -eq $core) {{ throw 'owned fixture core exited' }}
+    $coreCreationDate = if ($null -eq $core.CreationDate) {{ '<unavailable>' }} else {{ $core.CreationDate.ToUniversalTime().ToString('o') }}
     foreach ($process in @($core) + @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $rootId")) {{
+        $creationDate = if ($null -eq $process.CreationDate) {{ '<unavailable>' }} else {{ $process.CreationDate.ToUniversalTime().ToString('o') }}
         if (![string]::Equals($process.ExecutablePath, $expected, [StringComparison]::OrdinalIgnoreCase)) {{
-            throw "[DEBUG-rel050-owned-child] fixture role did not use Cargo-selected binary: pid=$($process.ProcessId) parent=$($process.ParentProcessId) image=$($process.ExecutablePath)"
+            throw "[DEBUG-rel050-owned-child] fixture role did not use Cargo-selected binary: pid=$($process.ProcessId) parent=$($process.ParentProcessId) created=$creationDate core=$rootId coreCreated=$coreCreationDate image=$($process.ExecutablePath)"
         }}
+        $commandLinePresent = ![string]::IsNullOrEmpty([string]$process.CommandLine)
+        $firstArgument = '<unavailable>'
+        if ($process.CommandLine -match '^(?:"[^"]*"|\S+)\s+("[^"]*"|\S+)') {{
+            $firstArgument = $Matches[1]
+            if ($firstArgument -notmatch '^"?[A-Za-z-][A-Za-z0-9_-]{{0,31}}"?$') {{ $firstArgument = '<redacted>' }}
+        }}
+        [Console]::Error.WriteLine("[DEBUG-rel050-owned-child] pid=$($process.ProcessId) parent=$($process.ParentProcessId) created=$creationDate core=$rootId coreCreated=$coreCreationDate image=$($process.ExecutablePath) commandLinePresent=$commandLinePresent firstArgument=$firstArgument")
         if ($process.ProcessId -eq $rootId) {{ $role = 'core' }}
         elseif ($process.CommandLine -match '\s(audio|agent)(?:\s|$)') {{ $role = $Matches[1] }}
-        else {{
-            $commandLinePresent = ![string]::IsNullOrEmpty([string]$process.CommandLine)
-            $firstArgument = '<unavailable>'
-            if ($process.CommandLine -match '^(?:"[^"]*"|\S+)\s+("[^"]*"|\S+)') {{
-                $firstArgument = $Matches[1]
-                if ($firstArgument -notmatch '^"?[A-Za-z-][A-Za-z0-9_-]{{0,31}}"?$') {{ $firstArgument = '<redacted>' }}
-            }}
-            [Console]::Error.WriteLine("[DEBUG-rel050-owned-child] pid=$($process.ProcessId) parent=$($process.ParentProcessId) image=$($process.ExecutablePath) commandLinePresent=$commandLinePresent firstArgument=$firstArgument")
-            throw 'unexpected child of owned fixture core'
-        }}
+        else {{ throw 'unexpected child of owned fixture core' }}
         if (!$hashes.ContainsKey($process.ExecutablePath)) {{
             $sha = [Security.Cryptography.SHA256]::Create()
             $stream = [IO.File]::OpenRead($process.ExecutablePath)
@@ -819,6 +819,9 @@ foreach ($rootId in @({a}, {b})) {{
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .expect("inspect only fixture core/agent/audio process images");
+    if output.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
     assert!(
         output.status.success(),
         "owned fixture inspection failed\nstdout:\n{}\nstderr:\n{}",
