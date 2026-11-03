@@ -122,29 +122,45 @@ async fn more_than_256_handoffs_keep_native_media_and_initial_key_reuse_guard() 
         .await
         .unwrap();
     session_event(&mut source.core, 5, 0).await;
+    // A heartbeat renewal may arrive after the stopped session was retired.
+    renew(&mut source.core, 13, 1000).await;
     let mut reused = start(1, a, b);
     reused.session_id = vec![14; 16];
-    source
-        .core
-        .send(2001, Msg::StartSession(reused))
+    for (request_id, session_id, expected_code, attempt) in
+        [(2001, 14, 5, reused), (2002, 13, 4, start(1, a, b))]
+    {
+        source
+            .core
+            .send(request_id, Msg::StartSession(attempt))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut received = source.core.recv().await.unwrap();
+                let message = received.frame.msg.take().unwrap();
+                if received.frame.request_id == request_id {
+                    let Msg::Error(error) = message else {
+                        panic!("guarded StartSession {request_id} answered with a non-error frame");
+                    };
+                    assert_eq!(error.session_id.as_slice(), &[session_id; 16]);
+                    assert_eq!(error.code, expected_code);
+                    break;
+                }
+                if let Msg::Error(error) = message {
+                    assert!(
+                        received.frame.request_id == 100
+                            && error.session_id.as_slice() == &[13; 16]
+                            && error.code == 6,
+                        "unexpected uncorrelated error: request={} session={:?} code={}",
+                        received.frame.request_id,
+                        error.session_id,
+                        error.code,
+                    );
+                }
+            }
+        })
         .await
-        .unwrap();
-    loop {
-        if let Msg::Error(error) = next(&mut source.core).await {
-            assert_eq!(error.code, 5);
-            break;
-        }
-    }
-    source
-        .core
-        .send(2002, Msg::StartSession(start(1, a, b)))
-        .await
-        .unwrap();
-    loop {
-        if let Msg::Error(error) = next(&mut source.core).await {
-            assert_eq!(error.code, 4);
-            break;
-        }
+        .expect("the guarded start answers its own request before the absolute deadline");
     }
     source
         .core

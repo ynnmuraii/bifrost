@@ -319,17 +319,26 @@ async fn watched_metadata_is_closed_while_native_control_is_blocked() {
         Msg::MediaCommandResult(w::MediaCommandResult { result: 5 })
     ));
     // The still-authorized listener is independent of this source's metadata permission.
+    // Leave an earlier real response queued, as session_event's heartbeats may do.
+    listener
+        .core
+        .send(0, Msg::Ping(w::Ping { serial: 123 }))
+        .await
+        .unwrap();
     listener
         .core
         .send(0, Msg::Ping(w::Ping { serial: 456 }))
         .await
         .unwrap();
-    loop {
-        if let Msg::Pong(pong) = next(&mut listener.core).await {
-            assert_eq!(pong.serial, 456);
-            break;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(next(&mut listener.core).await, Msg::Pong(pong) if pong.serial == 456) {
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("the still-authorized Listener answers the current ping despite older replies");
     source
         .core
         .send(100, Msg::Shutdown(w::Shutdown {}))

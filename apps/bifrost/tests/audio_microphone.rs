@@ -485,7 +485,6 @@ fn dropping_held_source_gui_remutes_actual_listener_before_parent_timeout() {
 fn stale_unmute_does_not_cancel_an_existing_gui_ptt_hold() {
     let _guard = common::serial();
     let (two, mut listener, mut source) = pair("audio-mic-stale-unmute");
-    mute(&mut source, true);
     agree(&mut listener, &mut source, true, false);
     ptt(&mut source, true);
     agree(&mut listener, &mut source, false, true);
