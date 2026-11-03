@@ -736,10 +736,23 @@ fn source_can_receive_without_clearing_independent_media_preferences() {
 #[cfg(windows)]
 fn fixture_binary_hash() -> String {
     let path = env!("CARGO_BIN_EXE_bifrost").replace('\'', "''");
+    // Use .NET directly: hosted Windows PowerShell may not autoload Get-FileHash.
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$sha = [Security.Cryptography.SHA256]::Create()
+$stream = [IO.File]::OpenRead('{path}')
+try {{
+    [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+}} finally {{
+    $stream.Dispose()
+    $sha.Dispose()
+}}
+"#
+    );
     let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command",
-            &format!("$ErrorActionPreference='Stop'; (Get-FileHash -Algorithm SHA256 -LiteralPath '{path}').Hash")])
-        .output().expect("hash the exact Cargo-selected binary before launching fixture cores");
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("hash the exact Cargo-selected binary before launching fixture cores");
     assert!(
         output.status.success(),
         "{}",
@@ -775,7 +788,14 @@ foreach ($rootId in @({a}, {b})) {{
             throw 'fixture role did not use Cargo-selected binary'
         }}
         if (!$hashes.ContainsKey($process.ExecutablePath)) {{
-            $hashes[$process.ExecutablePath] = (Get-FileHash -Algorithm SHA256 -LiteralPath $process.ExecutablePath).Hash.ToLowerInvariant()
+            $sha = [Security.Cryptography.SHA256]::Create()
+            $stream = [IO.File]::OpenRead($process.ExecutablePath)
+            try {{
+                $hashes[$process.ExecutablePath] = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+            }} finally {{
+                $stream.Dispose()
+                $sha.Dispose()
+            }}
         }}
         $hash = $hashes[$process.ExecutablePath]
         if ($hash -ne '{expected_hash}') {{ throw 'fixture image changed after prelaunch hash' }}

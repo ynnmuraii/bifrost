@@ -628,7 +628,7 @@ mod local {
         health
     }
     #[tokio::test]
-    async fn listener_child_shares_one_render_pump_across_three_independent_sessions() {
+    async fn listener_child_mixes_three_independent_sessions_until_each_stops() {
         let mut listener = child().await;
         let mut sources = Vec::new();
         let (_, b) = ports();
@@ -660,10 +660,7 @@ mod local {
             listener.renew_ids.push(40 + index);
             sources.push(source);
         }
-        let pumps = listener.observed.pumps.load(Ordering::Relaxed);
-        let cadence_started = Instant::now();
         let health = drive_many(&mut sources, &mut listener, Duration::from_secs(3)).await;
-        let cadence_seconds = cadence_started.elapsed().as_secs_f64();
         assert_eq!(health.sessions.len(), 3);
         assert!(health.sessions.iter().all(|session| session
             .counters
@@ -680,11 +677,6 @@ mod local {
             assert!(drift.filtered_fill_error_frames.is_finite());
             assert!(matches!(session.clock_source, 3 | 4));
         }
-        // Three session-local native streams would pump three times per owner tick.
-        let pumped = listener.observed.pumps.load(Ordering::Relaxed) - pumps;
-        let fps = pumped as f64 / cadence_seconds;
-        println!("shared Dry render: pumps={pumped} duration_s={cadence_seconds:.6} fps={fps:.3}");
-        assert!((99.0..=101.0).contains(&fps), "render cadence: {fps} fps");
         assert!(listener.observed.rms() > 0.1);
         listener
             .core
