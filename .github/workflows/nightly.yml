@@ -161,13 +161,31 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bifrost-roots" | Out-Null
 
-      - name: Test (full-context diagnostic; NOT release acceptance)
+      - name: Test (owned-child 20x probe; NOT release acceptance)
+        shell: pwsh
         env:
           BIFROST_KEEP_ROOTS: "1"
           TMP: ${{ runner.temp }}\bifrost-roots
           TEMP: ${{ runner.temp }}\bifrost-roots
-        # Diagnostic branch only: preserve the full failing-suite context.
-        run: cargo test --locked --workspace --no-fail-fast
+        # Diagnostic branch only: 20 sequential runs of the existing instrumented
+        # owned-child Windows case, compiled once, stopping at the first nonzero.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = & cargo test --locked -p bifrost --test audio_sharing --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = $lines |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'audio_sharing' -and $_.executable } |
+            Select-Object -Last 1 -ExpandProperty executable
+          if (-not $exe) { throw 'owned-child probe: audio_sharing test binary not built' }
+          for ($i = 1; $i -le 20; $i++) {
+            Write-Host "PROBE_ITERATION=$i"
+            & $exe windows_process_source_reverses_roles_and_mode_change_keeps_owned_media_running --exact --nocapture
+            $code = $LASTEXITCODE
+            Write-Host "PROBE_ITERATION_EXIT iteration=$i code=$code"
+            if ($code -ne 0) { exit $code }
+          }
+          exit 0
 
       - name: Upload harness roots
         if: failure()
