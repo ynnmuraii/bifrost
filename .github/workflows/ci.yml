@@ -98,7 +98,9 @@ jobs:
         # bottom carry the measurements behind that split.
         include:
           - os: ubuntu-latest
-            timeout: 20
+            # The full suite can finish near 20 minutes; leave bounded headroom
+            # for the post-job target-cache archive as well as a cold build.
+            timeout: 30
           - os: windows-latest
             timeout: 30
     steps:

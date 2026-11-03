@@ -342,6 +342,11 @@ impl Actor {
         {
             return;
         }
+        // An automatic Source still awaits its selected Listener's authenticated
+        // group; a cached Hello may describe the peer's previous role.
+        if self.config.group_id.is_none() {
+            return;
+        }
         if let Some(code) = self.start_refusal(peer) {
             self.system_failed(code);
             return;
@@ -439,12 +444,67 @@ mod tests {
         controlled_system_off(false, NativeStart::Deadline).await;
     }
 
+    #[tokio::test]
+    async fn system_off_with_mic_keeps_status_responsive_during_parent_updates() {
+        const CHILD: &str = "BIFROST_MIC_PARENT_TEST_CHILD";
+        const ROOT: &str = "BIFROST_MIC_PARENT_TEST_ROOT";
+        if std::env::var_os(CHILD).is_some() {
+            controlled_system_off(false, NativeStart::MicContention).await;
+            return;
+        }
+        use tokio::io::AsyncReadExt;
+        let root = std::env::temp_dir().join(format!(
+            "bf-mic-parent-{}",
+            u128::from_be_bytes(identity::random16().expect("owned fixture ID"))
+        ));
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session::audio::sharing::tests::system_off_with_mic_keeps_status_responsive_during_parent_updates",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(ROOT, &root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("owned Actor test child");
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let capture = tokio::spawn(async move {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err)).unwrap();
+            (out, err)
+        });
+        let result = timeout(Duration::from_secs(20), child.wait()).await;
+        if result.is_err() {
+            child
+                .kill()
+                .await
+                .expect("kill and reap only the owned stalled test child");
+        }
+        let (stdout, stderr) = capture.await.unwrap();
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        assert!(
+            matches!(result, Ok(Ok(status)) if status.success()),
+            "owned Actor child failed or stalled: {result:?}\n{}\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        );
+        print!("{}", String::from_utf8_lossy(&stdout));
+    }
+
     enum NativeStart {
         Fenced,
         Issued,
         Started,
         RevokePending,
         ControlPending,
+        MicContention,
         Deadline,
     }
 
@@ -459,15 +519,21 @@ mod tests {
             NativeStart::Started
                 | NativeStart::RevokePending
                 | NativeStart::ControlPending
+                | NativeStart::MicContention
                 | NativeStart::Deadline
         );
         let revoke_pending = matches!(native, NativeStart::RevokePending);
         let control_pending = matches!(native, NativeStart::ControlPending);
         let past_deadline = matches!(native, NativeStart::Deadline);
-        let root = std::env::temp_dir().join(format!(
-            "bf-stop-{}",
-            u128::from_be_bytes(identity::random16().expect("owned fixture ID"))
-        ));
+        let mic_contention = matches!(native, NativeStart::MicContention);
+        let root = if mic_contention {
+            std::path::PathBuf::from(std::env::var_os("BIFROST_MIC_PARENT_TEST_ROOT").unwrap())
+        } else {
+            std::env::temp_dir().join(format!(
+                "bf-stop-{}",
+                u128::from_be_bytes(identity::random16().expect("owned fixture ID"))
+            ))
+        };
         let paths = config::Paths::new(&root, &root, &root, Some(root.clone()));
         let identity = Arc::new(
             identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(&root))
@@ -477,7 +543,7 @@ mod tests {
         let local = identity.node_id();
         let peer = NodeId::new([7; 32]);
         let (manager, _links, _) = manager_for(identity, peer, None, Vec::new());
-        let audio = config::AudioConfig {
+        let mut audio = config::AudioConfig {
             enabled: true,
             system_sharing: Some(true),
             role: config::AudioRole::Source,
@@ -485,6 +551,10 @@ mod tests {
             listener_node_id: Some(config::audio::HexId(*peer.as_bytes())),
             ..Default::default()
         };
+        if mic_contention {
+            audio.microphone.control_enabled = true;
+            audio.microphone.muted = true;
+        }
         let mut persisted = config::Config {
             audio: audio.clone(),
             ..Default::default()
@@ -535,7 +605,7 @@ mod tests {
                 trusted: true,
                 hello: Some(hello),
                 focus_support: false,
-                mic_support: false,
+                mic_support: mic_contention,
                 media_support: false,
                 media_seek_support: false,
                 rekey_support: false,
@@ -698,7 +768,8 @@ mod tests {
                 "optional thumbnail sent native Stop"
             );
         }
-        if revoke_pending || control_pending {
+        if revoke_pending || control_pending || mic_contention {
+            let coordinator = Arc::new(coordinator);
             coordinator.links.send_modify(|links| {
                 links.peers = actor.peers.clone();
                 links.trusted.insert(peer);
@@ -719,6 +790,32 @@ mod tests {
             })
             .await
             .expect("actual actor publishes established session");
+            let contention = mic_contention.then(|| {
+                let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let active = Arc::clone(&running);
+                let parent = Arc::clone(&coordinator);
+                let (ready, started) = std::sync::mpsc::sync_channel(0);
+                let writer = std::thread::spawn(move || {
+                    let caps = [
+                        net::Capability::AudioControlV1 as i32,
+                        net::Capability::AudioListener as i32,
+                        net::Capability::MicControlV1 as i32,
+                    ];
+                    parent.capabilities_changed(peer, &caps);
+                    ready.send(()).unwrap();
+                    let mut updates = 1usize;
+                    while active.load(Ordering::Acquire) {
+                        parent.capabilities_changed(peer, &caps);
+                        updates += 1;
+                        std::thread::yield_now();
+                    }
+                    updates
+                });
+                started
+                    .recv()
+                    .expect("actual Coordinator completed its first parent update");
+                (running, writer)
+            });
             let (out, mut replies) = mpsc::channel(4);
             coordinator
                 .submit(Request {
@@ -751,7 +848,19 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            if revoke_pending {
+            if mic_contention {
+                native_events
+                    .send(AudioSupervisorEvent::SessionEvent {
+                        generation: 1,
+                        event: worker::SessionEvent {
+                            session_id: view.session.to_vec(),
+                            kind: worker::EventKind::Stopped as i32,
+                            ..Default::default()
+                        },
+                    })
+                    .await
+                    .unwrap();
+            } else if revoke_pending {
                 coordinator.trusted(&identity::TrustStore::new());
             } else {
                 coordinator.capabilities_changed(peer, &[]);
@@ -761,16 +870,21 @@ mod tests {
                     request_id: 92,
                     connection_id: [11; 16],
                     message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
-                    out,
+                    out: out.clone(),
                 })
-                .expect("ordinary public status command while native stop is withheld");
+                .expect("ordinary public status command during native stop");
             timeout(Duration::from_secs(5), async {
                 loop {
                     let (_, message) = consumer.recv().await.unwrap();
                     if let gui::gui_frame::Msg::AudioStatus(status) = message {
                         if status.sessions.iter().any(|session| {
                             session.session_id == view.session
-                                && session.state == gui::AudioSessionState::Failed as i32
+                                && session.state
+                                    == if mic_contention {
+                                        gui::AudioSessionState::Idle as i32
+                                    } else {
+                                        gui::AudioSessionState::Failed as i32
+                                    }
                         }) {
                             assert_eq!(status.system_sharing_requested, Some(false));
                             break;
@@ -786,7 +900,34 @@ mod tests {
                 }
             })
             .await
-            .expect("queued security withdrawal and public command precede native Stopped");
+            .expect("actual Actor processes native stop, parent changes, and public status");
+            if let Some((running, writer)) = contention {
+                assert!(
+                    !*shutdown.borrow(),
+                    "independent microphone policy retains the worker"
+                );
+                for request_id in 93..=155 {
+                    coordinator
+                        .submit(Request {
+                            request_id,
+                            connection_id: [11; 16],
+                            message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                            out: out.clone(),
+                        })
+                        .expect("public status admission during parent updates");
+                    let (id, message) = replies.recv().await.unwrap();
+                    assert_eq!(id, request_id);
+                    let gui::gui_frame::Msg::AudioStatus(status) = message else {
+                        panic!("public audio status reply");
+                    };
+                    assert_eq!(status.system_sharing_requested, Some(false));
+                    let mic = status.config.unwrap().microphone.unwrap();
+                    assert!(mic.control_enabled && mic.muted);
+                }
+                running.store(false, Ordering::Release);
+                let updates = writer.join().expect("owned Coordinator writer closes");
+                println!("ACTOR_PARENT_PROGRESS status_replies=64 parent_updates={updates} native_stop=completed mic_policy=enabled");
+            }
             coordinator.stopping.send_replace(true);
             runner.await.unwrap();
             native.await.unwrap();
@@ -1226,12 +1367,16 @@ mod tests {
         Legacy,
         WaitingLocalDeny,
         WaitingUnpair,
+        RoleFlip,
+        KnownWrongRole,
     }
 
     async fn unsolicited_offer_with_stored_consent(setup: SourceSetup) {
         let terminal_failure = setup == SourceSetup::TerminalFailure;
-        let legacy = setup == SourceSetup::Legacy;
+        let legacy = matches!(setup, SourceSetup::Legacy | SourceSetup::KnownWrongRole);
         let unpaired = setup == SourceSetup::WaitingUnpair;
+        let role_flip = setup == SourceSetup::RoleFlip;
+        let known_wrong_role = setup == SourceSetup::KnownWrongRole;
         let root = std::env::temp_dir().join(format!(
             "bifrost-sharing-offer-{}",
             u128::from_be_bytes(identity::random16().expect("owned fixture ID"))
@@ -1302,9 +1447,13 @@ mod tests {
         let audio = config::AudioConfig {
             enabled: true,
             system_sharing: if legacy { None } else { Some(true) },
-            role: config::AudioRole::Source,
+            role: if role_flip {
+                config::AudioRole::Listener
+            } else {
+                config::AudioRole::Source
+            },
             group_id: Some(config::audio::HexId([3; 16])),
-            listener_node_id: Some(config::audio::HexId(*listener_id.as_bytes())),
+            listener_node_id: (!role_flip).then_some(config::audio::HexId(*listener_id.as_bytes())),
             allow_send_to: if legacy {
                 vec![config::audio::HexId(*listener_id.as_bytes())]
             } else {
@@ -1335,10 +1484,237 @@ mod tests {
         actor.configure().expect("startup configuration");
         actor.sync_links();
         actor.drain().await;
-        assert!(
-            !actor.system_requested,
-            "modern Source restart has no volatile activation"
+        assert_eq!(
+            actor.system_requested, role_flip,
+            "only the initial Listener owns active receive intent"
         );
+        if role_flip || known_wrong_role {
+            let stale = wire::encode_control(
+                &fsm::Control::Hello(fsm::Hello {
+                    role: model::AudioRole::Source,
+                    group: Some([3; 16]),
+                    listener: *source_id.as_bytes(),
+                    available: true,
+                    allowed: true,
+                    consent_revision: 1,
+                }),
+                model::AudioRole::Source,
+                44913,
+                connection,
+            )
+            .unwrap();
+            listener_manager
+                .send_audio_control(&source_id, stale)
+                .await
+                .unwrap();
+            let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
+            coordinator.receive(peer, envelope_connection, message);
+            let command = actor.commands.recv().await.unwrap();
+            actor.on_network(command.parent, command.message.unwrap());
+            actor.drain().await;
+            // Only the native IPC boundary is controlled; public intent, the
+            // actual Actor and authenticated peer messages remain real.
+            let (handle, _stops, shutdown, native) = AudioHandle::controlled_stop(1);
+            actor.worker = Some(Worker {
+                handle,
+                generation: 1,
+                alive: true,
+                model_ready: false,
+                pid: 0,
+                probe_ack: 0,
+            });
+            actor.probed(
+                1,
+                1,
+                worker::Ready {
+                    backend: worker::BackendKind::Dry as i32,
+                    probed: true,
+                    capabilities: [
+                        worker::Capability::SystemCapture,
+                        worker::Capability::Render,
+                    ]
+                    .into_iter()
+                    .map(|capability| worker::CapabilityAvailability {
+                        capability: capability as i32,
+                        availability: worker::Availability::Available as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+                },
+            );
+            actor.drain().await;
+            let (out, mut replies) = mpsc::channel(4);
+            let runner = tokio::spawn(actor.run());
+            coordinator
+                .submit(Request {
+                    request_id: 0,
+                    connection_id: [11; 16],
+                    message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                    out: out.clone(),
+                })
+                .unwrap();
+            let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(id, 0);
+            let gui::gui_frame::Msg::AudioStatus(initial) = reply else {
+                panic!("initial public status reply")
+            };
+            coordinator
+                .submit(Request {
+                    request_id: 1,
+                    connection_id: [11; 16],
+                    message: gui::gui_frame::Msg::SetSystemAudioSharing(
+                        gui::SetSystemAudioSharing {
+                            enabled: true,
+                            role: gui::AudioRole::Source as i32,
+                            listener_node_id: listener_id.as_bytes().to_vec(),
+                            expected_revision: initial.revision,
+                        },
+                    ),
+                    out: out.clone(),
+                })
+                .unwrap();
+            let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(id, 1);
+            assert!(
+                matches!(&reply, gui::gui_frame::Msg::OpResult(result) if result.ok),
+                "public Source ON reply: {reply:?}"
+            );
+            coordinator
+                .submit(Request {
+                    request_id: 2,
+                    connection_id: [11; 16],
+                    message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                    out: out.clone(),
+                })
+                .unwrap();
+            let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(id, 2);
+            let gui::gui_frame::Msg::AudioStatus(status) = reply else {
+                panic!("public status reply")
+            };
+            println!(
+                "SOURCE_SCOPE_STATUS requested={:?} error={} group={:?}",
+                status.system_sharing_requested,
+                status.system_sharing_error,
+                status.config.as_ref().unwrap().group_id
+            );
+            let mut requests = 0;
+            if role_flip {
+                assert_eq!(status.system_sharing_requested, Some(true), "new intent survives the previous peer role while the automatic group is unresolved");
+                assert!(status.system_sharing_error.is_empty());
+                assert!(status.config.unwrap().group_id.is_empty());
+                assert!(
+                    !*shutdown.borrow(),
+                    "pending Source keeps its controlled worker"
+                );
+                let fresh = wire::encode_control(
+                    &fsm::Control::Hello(fsm::Hello {
+                        role: model::AudioRole::Listener,
+                        group: Some([4; 16]),
+                        listener: *listener_id.as_bytes(),
+                        available: true,
+                        allowed: true,
+                        consent_revision: 2,
+                    }),
+                    model::AudioRole::Listener,
+                    44913,
+                    connection,
+                )
+                .unwrap();
+                listener_manager
+                    .send_audio_control(&source_id, fresh)
+                    .await
+                    .unwrap();
+                let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
+                coordinator.receive(peer, envelope_connection, message);
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        let (_, _, message) = next_audio(&mut listener_events).await;
+                        if let Some(net::audio_control::Body::StartRequest(request)) = message.body
+                        {
+                            assert_eq!(request.group_id.as_slice(), &[4; 16]);
+                            assert_eq!(request.source_node_id.as_slice(), source_id.as_bytes());
+                            assert_eq!(request.kind, net::AudioStreamKind::System as i32);
+                            requests += 1;
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("fresh authenticated Listener scope starts the existing intent");
+                for request_id in 3..=10 {
+                    coordinator
+                        .submit(Request {
+                            request_id,
+                            connection_id: [11; 16],
+                            message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                            out: out.clone(),
+                        })
+                        .unwrap();
+                    let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(id, request_id);
+                    let gui::gui_frame::Msg::AudioStatus(status) = reply else {
+                        panic!("public status reply")
+                    };
+                    assert_eq!(status.system_sharing_requested, Some(true));
+                    assert!(status.system_sharing_error.is_empty());
+                    assert_eq!(status.config.unwrap().group_id.as_slice(), &[4; 16]);
+                }
+            } else {
+                assert_eq!(status.system_sharing_requested, Some(false));
+                assert_eq!(
+                    status.system_sharing_error,
+                    ipc::audio::codes::AUDIO_ROLE_CONFLICT
+                );
+            }
+            coordinator.stopping.send_replace(true);
+            runner.await.unwrap();
+            native.await.unwrap();
+            source_manager.kill_all().await;
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    match listener_events.recv().await.unwrap() {
+                        transport::LinkEvent::Message {
+                            message: transport::convert::Inbound::Audio { message, .. },
+                            ..
+                        } => {
+                            if matches!(
+                                message.body,
+                                Some(net::audio_control::Body::StartRequest(_))
+                            ) {
+                                requests += 1;
+                            }
+                        }
+                        transport::LinkEvent::Down { peer, .. } if peer == source_id => break,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("owned peer link closes after observed startup messages");
+            assert_eq!(requests, usize::from(role_flip), "one accepted intent sends one peer System RequestStart, known-scope refusal sends none");
+            listener_manager.kill_all().await;
+            source_runner.abort();
+            listener_runner.abort();
+            let _ = source_runner.await;
+            let _ = listener_runner.await;
+            drop(coordinator);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
         if matches!(
             setup,
             SourceSetup::WaitingLocalDeny | SourceSetup::WaitingUnpair
@@ -1565,6 +1941,16 @@ mod tests {
         drop(actor);
         drop(coordinator);
         std::fs::remove_dir_all(root).expect("remove owned TLS fixture");
+    }
+
+    #[tokio::test]
+    async fn source_scope_role_flip_waits_for_current_listener_before_start() {
+        unsolicited_offer_with_stored_consent(SourceSetup::RoleFlip).await;
+    }
+
+    #[tokio::test]
+    async fn source_scope_known_group_wrong_role_remains_terminal() {
+        unsolicited_offer_with_stored_consent(SourceSetup::KnownWrongRole).await;
     }
 
     #[tokio::test]

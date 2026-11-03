@@ -2,7 +2,7 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
-## 0.5.0 — 2026-11-03
+## 0.5.0 — 2026-11-04
 
 ### English
 
@@ -31,6 +31,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - A last-selected, still-live paused/stopped media session remains eligible when the platform reports no current player; removed or unknown sessions are never cached as a replacement.
 - Sharing intent, connection progress, startup failures and observed running audio remain distinct. System-audio OFF cancels a pending start without changing mic/PTT or media-control settings; with resume disabled, restarting a Source leaves sharing stopped until a fresh ON.
 - System-audio OFF preserves matching native stop completion instead of reporting intentional worker retirement or expected peer-capability withdrawal as a crash/revocation failure. Genuine worker losses and security revocations remain failures, including when stopping is delayed.
+- Avoids a core-control deadlock when system audio is turned off with microphone control still enabled and peer capabilities update concurrently; microphone policy is preserved.
+- Automatic Source startup after a role change waits for the selected Listener's current authenticated group, rather than cancelling fresh sharing intent from a cached previous-role announcement. Existing trust/consent checks and known-group refusals are unchanged.
 - Audio settings and popup warnings show observed path-failure reasons and local/peer UDP ports, with conditional role-scoped guidance rather than unproven firewall blame.
 - A newer pairing attempt visibly cancels the older ceremony on both computers; delayed confirmations cannot approve the replacement.
 - CLI pairing rejection and EOF cancellation now exit unsuccessfully, including when the pairing window belongs to an already-running core.
@@ -82,6 +84,8 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Последний выбранный существующий медиасеанс на паузе или остановке остаётся доступным, когда платформа не сообщает текущий плеер; удалённые и неизвестные сеансы не подменяются кэшем.
 - Намерение передачи, подключение, ошибка запуска и наблюдаемый работающий звук не выдаются друг за друга. Выключение системного звука отменяет ожидающий запуск, не меняя микрофон/PTT и медиакоманды; при выключенном возобновлении после перезапуска источника требуется новое включение передачи.
 - При выключении системного звука сохраняется подтверждение остановки нативного потока: штатное завершение аудиопроцесса и ожидаемое снятие аудиовозможности пира больше не выдаются за сбой или отзыв доверия. Настоящие потери процесса и отзывы разрешений безопасности остаются ошибками, в том числе при задержке остановки.
+- Устранена взаимная блокировка управления ядром при выключении системного звука с отдельно включённым управлением микрофоном и одновременном обновлении возможностей пира; политика микрофона сохраняется.
+- После смены ролей автоматический запуск источника ждёт актуальную группу выбранного Listener, подтверждённую через аутентифицированное соединение: устаревшее объявление прежней роли больше не отменяет новое намерение передачи. Проверки доверия/согласия и отказы при известной группе не изменены.
 - Настройки и предупреждения плеера показывают наблюдаемую причину отказа аудиопути и местный/удалённый UDP-порты; подсказки учитывают роль и не объявляют брандмауэр виновным без доказательств.
 - Новая попытка сопряжения видимо отменяет старую на обоих компьютерах; запоздавшее подтверждение не может одобрить замену.
 - Отказ от сопряжения в CLI и отмена через EOF завершаются ошибкой, в том числе когда окно сопряжения обслуживает уже запущенная служба.

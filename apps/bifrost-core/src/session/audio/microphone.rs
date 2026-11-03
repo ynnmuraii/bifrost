@@ -751,23 +751,24 @@ impl Actor {
             .borrow()
             .peers
             .get(&NodeId::new(parent.peer))
-            .is_some_and(|p| {
-                p.trusted
-                    && p.parent == parent
-                    && p.mic_support
-                    && match self.config.role {
-                        config::AudioRole::Listener => self
-                            .config
-                            .peers
-                            .iter()
-                            .any(|c| c.node_id.0 == parent.peer && c.allow_mic_control),
-                        config::AudioRole::Source => self
-                            .config
-                            .listener_node_id
-                            .is_some_and(|id| id.0 == parent.peer),
-                        _ => false,
-                    }
-            })
+            .is_some_and(|peer| peer.parent == parent && self.mic_peer_allowed(peer))
+    }
+    // Callers may already hold the parent watch: inspect this snapshot entry only.
+    fn mic_peer_allowed(&self, peer: &Peer) -> bool {
+        peer.trusted
+            && peer.mic_support
+            && match self.config.role {
+                config::AudioRole::Listener => self
+                    .config
+                    .peers
+                    .iter()
+                    .any(|c| c.node_id.0 == peer.parent.peer && c.allow_mic_control),
+                config::AudioRole::Source => self
+                    .config
+                    .listener_node_id
+                    .is_some_and(|id| id.0 == peer.parent.peer),
+                _ => false,
+            }
     }
     /// Call after sync_links; native privacy effects are drained on the next tick.
     pub(super) fn mic_on_parents_changed(&mut self) {
@@ -799,7 +800,7 @@ impl Actor {
                 .borrow()
                 .peers
                 .values()
-                .filter(|p| enabled && self.mic_parent_allowed(p.parent)),
+                .filter(|p| enabled && self.mic_peer_allowed(p)),
         ) {
             *slot = Some(peer.parent);
         }
@@ -1981,7 +1982,7 @@ impl Actor {
                 .borrow()
                 .peers
                 .values()
-                .filter(|p| self.mic_parent_allowed(p.parent)),
+                .filter(|p| self.mic_peer_allowed(p)),
         ) {
             *slot = Some(peer.parent);
         }
