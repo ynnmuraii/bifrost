@@ -899,12 +899,82 @@ fn emergency_talk_release_is_append_only_and_has_no_press_or_lease_payload() {
 }
 
 #[test]
+fn thumbnails_and_rekey_keep_the_existing_control_frame_budget() {
+    use prost::Message;
+    let chunk = wire::MediaArtworkChunk {
+        session_id: vec![3; 16],
+        token: 1,
+        revision: 2,
+        artwork_id: vec![7; 32],
+        total_bytes: 49152,
+        offset: 0,
+        data: vec![8; 1024],
+        width: 192,
+        height: 192,
+    };
+    let frame = control(Body::Artwork(chunk.clone()));
+    assert!(frame.encoded_len() <= 2048);
+    assert!(audio_control(&frame).is_ok());
+    for bad in [
+        wire::MediaArtworkChunk {
+            data: vec![0; 1025],
+            ..chunk.clone()
+        },
+        wire::MediaArtworkChunk {
+            total_bytes: 49153,
+            ..chunk.clone()
+        },
+        wire::MediaArtworkChunk {
+            offset: u32::MAX,
+            ..chunk.clone()
+        },
+        wire::MediaArtworkChunk {
+            width: 193,
+            ..chunk.clone()
+        },
+        wire::MediaArtworkChunk {
+            artwork_id: vec![0; 31],
+            ..chunk.clone()
+        },
+        wire::MediaArtworkChunk {
+            data: Vec::new(),
+            ..chunk
+        },
+    ] {
+        assert!(audio_control(&control(Body::Artwork(bad))).is_err());
+    }
+    let prepare = wire::AudioRekey {
+        session_id: vec![3; 16],
+        epoch: 2,
+        stage: 1,
+        nonce: vec![9; 32],
+    };
+    assert!(audio_control(&control(Body::Rekey(prepare.clone()))).is_ok());
+    for bad in [
+        wire::AudioRekey {
+            epoch: 0,
+            ..prepare.clone()
+        },
+        wire::AudioRekey {
+            stage: 2,
+            ..prepare.clone()
+        },
+        wire::AudioRekey {
+            nonce: Vec::new(),
+            ..prepare
+        },
+    ] {
+        assert!(audio_control(&control(Body::Rekey(bad))).is_err());
+    }
+}
+#[test]
 fn media_metadata_bounds_clear_shape_and_nested_debug_are_private() {
     let info = wire::MediaInfo {
         session_id: vec![3; 16],
         present: true,
         token: 1,
         revision: 1,
+        artwork_id: Vec::new(),
         app: "a".repeat(128),
         title: "é".repeat(128),
         subtitle: "s".repeat(256),

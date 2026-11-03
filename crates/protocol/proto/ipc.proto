@@ -344,6 +344,8 @@ message GuiFrame {
     SetAudioPeerGain set_audio_peer_gain = 70;
     SendMediaCommand send_media_command = 71;
     SetSystemAudioSharing set_system_audio_sharing = 72;
+    GetAudioArtwork get_audio_artwork = 73;
+    AudioArtwork audio_artwork = 74;
   }
 }
 // Also replays the current open PairingWindow and unanswered PairingPrompt as events
@@ -789,7 +791,12 @@ message MediaInfo {
   optional uint64 position_ms = 4; uint64 session_token = 5; optional uint64 duration_ms = 6;
   AudioPlaybackState playback = 7; AudioMediaCommands commands = 8; uint64 revision = 9;
   optional uint64 seek_min_ms = 10; optional uint64 seek_max_ms = 11;
+  bytes artwork_id = 12; // Empty or SHA256; pixels never repeat in AudioStatus.
 }
+// Current consented session and native token must match. A miss is an unavailable OpResult.
+message GetAudioArtwork { bytes session_id = 1; uint64 session_token = 2; bytes artwork_id = 3; }
+// One in-memory source-normalized JPEG thumbnail, <=49152 bytes and <=192x192 pixels.
+message AudioArtwork { bytes session_id = 1; uint64 session_token = 2; bytes artwork_id = 3; string mime = 4; bytes data = 5; uint32 width = 6; uint32 height = 7; }
 message ListAudioDevices { AudioDeviceKind kind = 1; }
 message AudioDevice { string id = 1; string name = 2; bool is_default = 3; bool available = 4; }
 message AudioDevices { AudioDeviceKind kind = 1; uint64 revision = 2; repeated AudioDevice devices = 3; bool complete = 4; }

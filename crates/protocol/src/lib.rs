@@ -239,10 +239,22 @@ redacted_audio_debug!(
     audio_worker::Attach,
     audio_worker::DirectionMaterial,
     audio_worker::StartSession,
+    audio_worker::RotateSession,
     audio_worker::MediaInfo,
+    audio_worker::MediaArtwork,
     audio_worker::MediaSessions,
 );
 
+impl std::fmt::Debug for ipc::AudioArtwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AudioArtwork([REDACTED])")
+    }
+}
+impl std::fmt::Debug for wire::MediaArtworkChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediaArtworkChunk([REDACTED])")
+    }
+}
 impl Drop for audio_worker::Attach {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.launch_token);

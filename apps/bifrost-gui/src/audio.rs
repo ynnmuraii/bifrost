@@ -1,10 +1,11 @@
 //! Authoritative audio IPC adapter. Pending intents never change playback or privacy state.
 use crate::audio_player::{
-    AppKind, AudioPlayerAction, AudioPlayerCard, AudioSeekTarget, StreamState,
+    AppKind, Artwork, AudioPlayerAction, AudioPlayerCard, AudioSeekTarget, StreamState,
 };
 use crate::view_model::{Modal, Request, ViewModel};
 use audio_model::status as model;
 use protocol::ipc::{self, gui_frame::Msg};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use ui_text::{text, Key, Lang};
 
@@ -15,6 +16,16 @@ pub enum AudioRequest {
     Mutation,
     /// An urgent existing control must not own an outstanding system switch's ACK.
     AuxiliaryMutation,
+    /// One cover fetch: an unavailable cache is an honest "no image", not an audio failure.
+    Artwork,
+}
+
+/// The current-scope tuple a cover is requested and cached by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtRequest {
+    session_id: [u8; 16],
+    token: u64,
+    id: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +44,32 @@ pub enum AudioAction {
     OpenSettings,
 }
 
+type ArtDecodeJob = ([u8; 32], Vec<u8>);
+type ArtDecodeResult = ([u8; 32], Option<Artwork>);
+
+/// The off-thread cover decode channel, shared by clones of the view.
+#[derive(Clone, Default)]
+struct ArtWorker {
+    inner: Arc<ArtWorkerInner>,
+}
+
+#[derive(Default)]
+struct ArtWorkerInner {
+    /// A bounded job queue: a hostile hash rotation cannot grow threads or memory without end.
+    jobs: std::sync::Mutex<Option<mpsc::SyncSender<ArtDecodeJob>>>,
+    results: std::sync::Mutex<Option<mpsc::Receiver<ArtDecodeResult>>>,
+    /// Hashes handed to the one worker and not yet answered.
+    inflight: std::sync::Mutex<Vec<[u8; 32]>>,
+    wake: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for ArtWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ArtWorker(..)")
+    }
+}
+
+/// The authoritative audio state plus the decoded-cover cache.
 #[derive(Debug, Clone)]
 pub struct AudioView {
     pub status: Option<ipc::AudioStatus>,
@@ -46,6 +83,7 @@ pub struct AudioView {
     pending_since: Option<Instant>,
     pending_snapshot_id: Option<u64>,
     pending_target: Option<[u8; 32]>,
+    pending_mode: Option<i32>,
     pub retargeting: bool,
     /// Pending switch intent, not an indication of active capture or playback.
     pub system_intent: Option<(ipc::AudioRole, bool)>,
@@ -53,6 +91,13 @@ pub struct AudioView {
     pub dirty: bool,
     /// Ownership of a GUI hold button, separate from authoritative/global PTT state.
     pub gui_ptt_held: bool,
+    /// Decoded covers, keyed by the authoritative hash; bounded by the cards on screen.
+    pub artwork: Vec<Artwork>,
+    /// Tuples already asked for once; pruned when the scope/hash leaves the status.
+    art_requested: Vec<ArtRequest>,
+    /// Local request ids for tuples, so a reply without a usable frame id can still retire it.
+    art_inflight: Vec<(u64, ArtRequest)>,
+    art_worker: ArtWorker,
 }
 
 impl Default for AudioView {
@@ -69,11 +114,16 @@ impl Default for AudioView {
             pending_since: None,
             pending_snapshot_id: None,
             pending_target: None,
+            pending_mode: None,
             retargeting: false,
             system_intent: None,
             device_requests: Vec::new(),
             dirty: false,
             gui_ptt_held: false,
+            artwork: Vec::new(),
+            art_requested: Vec::new(),
+            art_inflight: Vec::new(),
+            art_worker: ArtWorker::default(),
         }
     }
 }
@@ -101,6 +151,22 @@ pub fn default_config() -> ipc::AudioConfig {
 }
 
 impl AudioView {
+    pub fn player_mode(&self, connected: bool) -> crate::audio_player::PlayerMode {
+        let status = self.status.as_ref();
+        let config = status.and_then(|status| status.config.as_ref());
+        let current = config
+            .and_then(|config| ipc::AudioMode::try_from(config.mode).ok())
+            .filter(|mode| matches!(mode, ipc::AudioMode::MixAll | ipc::AudioMode::FollowFocus));
+        crate::audio_player::PlayerMode {
+            current,
+            enabled: connected
+                && self.available
+                && !self.pending
+                && current.is_some()
+                && status.is_some_and(|status| status.role == ipc::AudioRole::Listener as i32)
+                && config.is_some_and(|config| config.role == ipc::AudioRole::Listener as i32),
+        }
+    }
     fn settle(&mut self) {
         self.pending = false;
         self.pending_id = None;
@@ -108,17 +174,196 @@ impl AudioView {
         self.pending_since = None;
         self.pending_snapshot_id = None;
         self.pending_target = None;
+        self.pending_mode = None;
         self.retargeting = false;
         self.system_intent = None;
     }
     fn fail(&mut self, lang: Lang, key: Key) {
+        let preserve_draft = self.pending_mode.is_some();
         self.settle();
         self.error = Some(text(lang, key).into());
+        if preserve_draft {
+            return;
+        }
         if let Some(config) = self.status.as_ref().and_then(|s| s.config.as_ref()) {
             self.draft = config.clone();
         }
         self.dirty = false;
     }
+    /// The decoded cover for `id`, if this window already holds it.
+    pub fn artwork_for(&self, id: [u8; 32]) -> Option<Artwork> {
+        self.artwork.iter().find(|art| art.id == id).cloned()
+    }
+
+    /// The decoded pixels are read by the GUI thread; the decode itself never runs there.
+    pub fn set_art_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self.art_worker.inner.wake.lock().expect("art wake") = Some(wake);
+    }
+
+    /// Keeps the cache and the asked-for tuples at exactly the status's current scope, and
+    /// returns the tuples that still need one request. Position revisions never re-request.
+    fn plan_artwork(&mut self, wanted: &[ArtRequest]) -> Vec<ArtRequest> {
+        self.art_requested
+            .retain(|request| wanted.contains(request));
+        self.artwork
+            .retain(|art| wanted.iter().any(|request| request.id == art.id));
+        let mut fresh = Vec::new();
+        for request in wanted {
+            if self.artwork.iter().any(|art| art.id == request.id)
+                || self.art_requested.contains(request)
+            {
+                continue;
+            }
+            self.art_requested.push(*request);
+            fresh.push(*request);
+        }
+        fresh
+    }
+
+    fn note_art_request(&mut self, id: u64, request: ArtRequest) {
+        self.art_inflight.push((id, request));
+    }
+
+    /// Retires the tuple a reply answers even when the frame carried no usable request id, so
+    /// a best-effort cover never stays inflight until the generic audio deadline.
+    pub(crate) fn take_art_inflight(&mut self, artwork: &ipc::AudioArtwork) -> Option<u64> {
+        let id = <[u8; 32]>::try_from(artwork.artwork_id.as_slice()).ok()?;
+        let session_id = <[u8; 16]>::try_from(artwork.session_id.as_slice()).ok()?;
+        let token = artwork.session_token;
+        let index = self.art_inflight.iter().position(|(_, request)| {
+            request.id == id && request.token == token && request.session_id == session_id
+        })?;
+        Some(self.art_inflight.remove(index).0)
+    }
+
+    fn prune_art_inflight(&mut self) {
+        self.art_inflight
+            .retain(|(_, request)| self.art_requested.contains(request));
+    }
+
+    /// A reply is accepted only for the tuple currently asked for. One bounded worker decodes
+    /// it off the render thread; duplicate inflight hashes are dropped, not queued twice.
+    pub(crate) fn accept_artwork(&mut self, artwork: ipc::AudioArtwork) {
+        if artwork.mime != "image/jpeg"
+            || artwork.data.is_empty()
+            || artwork.data.len() > protocol::limits::MAX_AUDIO_ARTWORK_BYTES
+            || artwork.width == 0
+            || artwork.height == 0
+            || artwork.width > protocol::limits::MAX_AUDIO_ARTWORK_EDGE
+            || artwork.height > protocol::limits::MAX_AUDIO_ARTWORK_EDGE
+        {
+            return;
+        }
+        let Ok(id) = <[u8; 32]>::try_from(artwork.artwork_id.as_slice()) else {
+            return;
+        };
+        let Ok(session_id) = <[u8; 16]>::try_from(artwork.session_id.as_slice()) else {
+            return;
+        };
+        let request = ArtRequest {
+            session_id,
+            token: artwork.session_token,
+            id,
+        };
+        if !self.art_requested.contains(&request) || self.artwork.iter().any(|art| art.id == id) {
+            return;
+        }
+        {
+            let inflight = self.art_worker.inner.inflight.lock().expect("art inflight");
+            if inflight.contains(&id) {
+                return;
+            }
+        }
+        let wake = self.art_worker.inner.wake.lock().expect("art wake").clone();
+        let mut spawn_failed = false;
+        let mut enqueued = false;
+        {
+            let mut jobs = self.art_worker.inner.jobs.lock().expect("art jobs");
+            let mut results = self.art_worker.inner.results.lock().expect("art results");
+            if jobs.is_none() {
+                let (job_tx, job_rx) = mpsc::sync_channel::<ArtDecodeJob>(2);
+                let (result_tx, result_rx) = mpsc::channel::<ArtDecodeResult>();
+                let worker_wake = wake.clone();
+                match std::thread::Builder::new()
+                    .name("bifrost-gui-artwork".to_owned())
+                    .spawn(move || {
+                        while let Ok((id, data)) = job_rx.recv() {
+                            let decoded = decode_artwork(&id, &data);
+                            let sent = result_tx.send((id, decoded)).is_ok();
+                            if sent {
+                                if let Some(wake) = &worker_wake {
+                                    wake();
+                                }
+                            }
+                        }
+                    }) {
+                    Ok(_) => {
+                        *jobs = Some(job_tx);
+                        *results = Some(result_rx);
+                    }
+                    Err(_) => spawn_failed = true,
+                }
+            }
+            if !spawn_failed {
+                if let Some(job_tx) = jobs.as_ref().cloned() {
+                    self.art_worker
+                        .inner
+                        .inflight
+                        .lock()
+                        .expect("art inflight")
+                        .push(id);
+                    enqueued = job_tx.try_send((id, artwork.data)).is_ok();
+                }
+            }
+        }
+        if spawn_failed {
+            // No decoder: forget this tuple so a later status may ask once more instead of
+            // waiting on a worker that does not exist.
+            self.art_requested.retain(|held| held != &request);
+            self.prune_art_inflight();
+            return;
+        }
+        if !enqueued {
+            // Saturated: drop this cover honestly (no image, no retry loop).
+            self.art_worker
+                .inner
+                .inflight
+                .lock()
+                .expect("art inflight")
+                .retain(|held| *held != id);
+        }
+    }
+
+    /// Takes every decoded cover whose tuple is still current and reports whether a frame is
+    /// needed. A stale or failed result is dropped, never shown for another track or scope.
+    pub fn drain_artwork(&mut self) -> bool {
+        let guard = self.art_worker.inner.results.lock().expect("art results");
+        let Some(results) = guard.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Ok((id, decoded)) = results.try_recv() {
+            self.art_worker
+                .inner
+                .inflight
+                .lock()
+                .expect("art inflight")
+                .retain(|held| *held != id);
+            let Some(art) = decoded else {
+                continue;
+            };
+            let current = self.art_requested.iter().any(|request| request.id == id);
+            if current && !self.artwork.iter().any(|held| held.id == id) {
+                if self.artwork.len() >= 4 {
+                    self.artwork.remove(0);
+                }
+                self.artwork.push(art);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn deadline(&self) -> Option<Instant> {
         self.pending_since.map(|t| t + Duration::from_secs(10))
     }
@@ -170,6 +415,7 @@ pub fn error_key(code: &str) -> Key {
         "AUDIO_ROLE_CONFLICT" => Key::AudioRoleConflict,
         "AUDIO_UNSUPPORTED_BACKEND" => Key::AudioUnsupportedBackend,
         "AUDIO_NO_UDP_PATH" => Key::AudioNoUdpPath,
+        "AUDIO_KEY_EXPIRED" => Key::AudioKeyExpired,
         "AUDIO_DEVICE_UNAVAILABLE" => Key::AudioDeviceUnavailable,
         "AUDIO_VIRTUAL_MIC_MISSING" => Key::AudioVirtualMicMissing,
         "AUDIO_CONFIG_WRITE" => Key::AudioConfigWrite,
@@ -189,7 +435,77 @@ fn system_error_key(code: &str) -> Key {
     }
 }
 
+/// The one current-scope tuple per consented stream that carries an authoritative image hash.
+/// Empty when the core's bounded cache is not complete; the id itself is the readiness signal.
+fn wanted_artworks(status: &model::AudioStatus) -> Vec<ArtRequest> {
+    let mut wanted: Vec<ArtRequest> = Vec::new();
+    for session in &status.sessions {
+        let Some(media) = session.media_info.as_ref() else {
+            continue;
+        };
+        let Some(id) = media.artwork_id else {
+            continue;
+        };
+        if media.session_token == 0 || wanted.iter().any(|request| request.id == id) {
+            continue;
+        }
+        wanted.push(ArtRequest {
+            session_id: session.session_id,
+            token: media.session_token,
+            id,
+        });
+    }
+    wanted
+}
+
+/// Decodes one normalized JPEG thumbnail, bounded before any RGBA allocation: the header is
+/// read first, so a 49 KiB file that claims a huge canvas is rejected rather than expanded.
+pub fn decode_artwork(id: &[u8; 32], data: &[u8]) -> Option<Artwork> {
+    if data.is_empty() || data.len() > protocol::limits::MAX_AUDIO_ARTWORK_BYTES {
+        return None;
+    }
+    let reader =
+        image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Jpeg);
+    let (width, height) = reader.into_dimensions().ok()?;
+    if width == 0
+        || height == 0
+        || width > protocol::limits::MAX_AUDIO_ARTWORK_EDGE
+        || height > protocol::limits::MAX_AUDIO_ARTWORK_EDGE
+    {
+        return None;
+    }
+    let reader =
+        image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Jpeg);
+    let image = reader.decode().ok()?.into_rgba8();
+    if image.width() != width || image.height() != height {
+        return None;
+    }
+    Some(Artwork {
+        id: *id,
+        rgba: Arc::from(image.into_raw().into_boxed_slice()),
+        width,
+        height,
+    })
+}
+
 impl ViewModel {
+    /// A decoded cover wakes the window; decoding itself never runs on the render thread.
+    pub fn set_audio_art_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.audio.set_art_wake(wake);
+    }
+
+    /// Moves decoded covers into the player's cache and onto the cards that are on screen now;
+    /// a repaint alone must show the image, without waiting for another authoritative status.
+    pub fn drain_artwork(&mut self) -> bool {
+        let changed = self.audio.drain_artwork();
+        if changed {
+            for card in &mut self.audio_player.cards {
+                card.artwork = card.artwork_id.and_then(|id| self.audio.artwork_for(id));
+            }
+        }
+        changed
+    }
+
     pub fn request_audio_status(&mut self, now: Instant) {
         if !self
             .inflight
@@ -256,6 +572,8 @@ impl ViewModel {
         let Ok(model) = crate::audio_wire::decode_status(&status) else {
             self.audio.available = false;
             self.audio.fail(self.look.language, Key::AudioUnavailable);
+            self.audio.artwork.clear();
+            self.audio.art_requested.clear();
             self.audio_player.replace_cards(Vec::new(), false);
             return;
         };
@@ -265,7 +583,7 @@ impl ViewModel {
                 .as_ref()
                 .is_some_and(|config| config.listener_node_id.as_slice() == target)
         });
-        if (!self.audio.dirty || self.audio.pending)
+        if (!self.audio.dirty || self.audio.pending && self.audio.pending_mode.is_none())
             && (self.audio.system_intent.is_none() || correlated_snapshot && target_observed)
         {
             if let Some(config) = status.config.as_ref() {
@@ -286,12 +604,18 @@ impl ViewModel {
             self.audio
                 .pending_revision
                 .is_some_and(|revision| status.revision > revision)
+                && self.audio.pending_mode.is_none_or(|mode| {
+                    status
+                        .config
+                        .as_ref()
+                        .is_some_and(|config| config.mode == mode)
+                })
         };
         if settles_request {
             self.audio.settle();
         }
         self.audio.available = true;
-        let cards = map_cards(
+        let mut cards = map_cards(
             &model,
             self.status
                 .as_ref()
@@ -303,8 +627,28 @@ impl ViewModel {
                 session.local_role == model::AudioRole::Listener
                     && session.state == model::SessionState::Running
             });
+        // The id is present only once the core's bounded cache is complete, so a `None` → `Some`
+        // transition is exactly the one moment to ask once — never on a position revision.
+        let wanted = wanted_artworks(&model);
+        let fresh = self.audio.plan_artwork(&wanted);
+        self.audio.prune_art_inflight();
+        for card in &mut cards {
+            card.artwork = card.artwork_id.and_then(|id| self.audio.artwork_for(id));
+        }
         self.audio_player.replace_cards(cards, observed_active);
         self.audio.status = Some(status);
+        for request in fresh {
+            let id = self.begin_request(Request::Audio(AudioRequest::Artwork), Instant::now());
+            self.audio.note_art_request(id, request);
+            self.outgoing.push((
+                id,
+                Msg::GetAudioArtwork(ipc::GetAudioArtwork {
+                    session_id: request.session_id.to_vec(),
+                    session_token: request.token,
+                    artwork_id: request.id.to_vec(),
+                }),
+            ));
+        }
         if correlated_snapshot && !self.audio.pending {
             self.audio.pending_snapshot_id = None;
         }
@@ -334,6 +678,12 @@ impl ViewModel {
             .push((id, Msg::GetAudioStatus(ipc::GetAudioStatus {})));
     }
     pub fn audio_result(&mut self, id: u64, kind: AudioRequest, result: ipc::OpResult) {
+        if kind == AudioRequest::Artwork {
+            // An unavailable cover cache is an honest "no image", not an audio failure: no
+            // error banner, no retry, and the player keeps its neutral mark.
+            let _ = (id, result);
+            return;
+        }
         if kind == AudioRequest::Devices {
             self.audio
                 .device_requests
@@ -380,16 +730,26 @@ impl ViewModel {
         }
     }
     pub fn tick_audio(&mut self, now: Instant) {
-        let expired = self
-            .inflight
-            .iter()
-            .any(|r| matches!(r.request, Request::Audio(_)) && now >= r.deadline);
+        // A cover is best-effort: its timeout retires the request silently and never turns an
+        // otherwise healthy audio session into an unavailable subsystem.
+        let expired = self.inflight.iter().any(|r| {
+            matches!(
+                r.request,
+                Request::Audio(kind) if kind != AudioRequest::Artwork
+            ) && now >= r.deadline
+        });
         if expired || self.audio.deadline().is_some_and(|d| now >= d) {
             self.inflight
                 .retain(|r| !matches!(r.request, Request::Audio(_)) || now < r.deadline);
             self.audio.available = false;
             self.audio.fail(self.look.language, Key::AudioUnavailable);
         }
+        self.inflight.retain(|r| {
+            !(matches!(r.request, Request::Audio(AudioRequest::Artwork)) && now >= r.deadline)
+        });
+        self.audio
+            .art_inflight
+            .retain(|(id, _)| self.inflight.iter().any(|request| request.id == *id));
         self.audio
             .device_requests
             .retain(|(id, _)| self.inflight.iter().any(|request| request.id == *id));
@@ -527,6 +887,25 @@ impl ViewModel {
                 pressed: *pressed,
                 expected_revision: revision,
             }),
+            AudioAction::Player(AudioPlayerAction::SetMode(mode)) => {
+                if !self.audio.player_mode(true).enabled
+                    || !matches!(mode, ipc::AudioMode::MixAll | ipc::AudioMode::FollowFocus)
+                {
+                    return;
+                }
+                let Some(current) = status.config.as_ref() else {
+                    return;
+                };
+                if current.mode == *mode as i32 {
+                    return;
+                }
+                let mut config = current.clone();
+                config.mode = *mode as i32;
+                Msg::SetAudio(ipc::SetAudio {
+                    config: Some(config),
+                    expected_revision: revision,
+                })
+            }
             AudioAction::Player(intent) => {
                 let Some(message) = player_request(status, intent) else {
                     self.audio.error = Some(text(self.look.language, Key::AudioStaleMedia).into());
@@ -550,7 +929,7 @@ impl ViewModel {
                 self.outgoing.retain(|(id, _)| *id != snapshot);
             }
         }
-        let auxiliary = self.audio.system_intent.is_some()
+        let auxiliary = (self.audio.system_intent.is_some() || self.audio.pending_mode.is_some())
             && !matches!(
                 action,
                 AudioAction::Share(_)
@@ -598,6 +977,10 @@ impl ViewModel {
         self.audio.pending = true;
         self.audio.pending_id = Some(id);
         self.audio.pending_snapshot_id = None;
+        self.audio.pending_mode = match action {
+            AudioAction::Player(AudioPlayerAction::SetMode(mode)) => Some(*mode as i32),
+            _ => None,
+        };
         self.audio.retargeting = matches!(action, AudioAction::Retarget(_));
         self.audio.pending_target = match action {
             AudioAction::Retarget(target) => Some(*target),
@@ -693,6 +1076,8 @@ pub fn map_cards(
                 subtitle: media
                     .filter(|m| !m.subtitle.is_empty())
                     .map(|m| m.subtitle.clone()),
+                artwork_id: media.and_then(|m| m.artwork_id),
+                artwork: None,
                 has_media_session: media.is_some(),
                 app: AppKind::System,
                 position_ms: media.and_then(|m| m.position_ms),
@@ -886,5 +1271,202 @@ pub fn consume_navigation(view: &mut ViewModel, startup: bool) {
         Some("player") => view.audio_player.open = true,
         Some("settings") => view.audio_action(&AudioAction::OpenSettings, Instant::now()),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod artwork_attach_tests {
+    use super::*;
+    use crate::audio_player::{AppKind, StreamState};
+    use crate::view_model::{CoreEndpoint, LocalConfig};
+
+    #[test]
+    fn a_decoded_cover_reaches_the_current_card_without_a_new_status() {
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: "test-endpoint".into(),
+            },
+            LocalConfig {
+                display_name: "W".into(),
+                ..Default::default()
+            },
+        );
+        vm.audio_player.cards = vec![AudioPlayerCard {
+            stream_id: "stream".into(),
+            source_name: "WORKSTATION".into(),
+            title: Some("Title".into()),
+            subtitle: None,
+            artwork_id: Some([5; 32]),
+            artwork: None,
+            has_media_session: true,
+            app: AppKind::System,
+            position_ms: None,
+            duration_ms: None,
+            seek: None,
+            playing: true,
+            can_prev: false,
+            can_play_pause: false,
+            can_next: false,
+            muted: false,
+            gain_percent: 100,
+            state: StreamState::Ready,
+            path: None,
+            background: false,
+        }];
+        vm.audio.art_requested.push(ArtRequest {
+            session_id: [1; 16],
+            token: 9,
+            id: [5; 32],
+        });
+        let image = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image)
+            .expect("encode fixture");
+        vm.audio.accept_artwork(ipc::AudioArtwork {
+            session_id: vec![1; 16],
+            session_token: 9,
+            artwork_id: vec![5; 32],
+            mime: "image/jpeg".into(),
+            data: jpeg,
+            width: 4,
+            height: 4,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut attached = false;
+        while Instant::now() < deadline {
+            if vm.drain_artwork() {
+                attached = vm.audio_player.cards[0].artwork.is_some();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            attached,
+            "a decoded cover must reach the current card without waiting for another status"
+        );
+        assert_eq!(
+            vm.audio_player.cards[0]
+                .artwork
+                .as_ref()
+                .unwrap()
+                .rgba
+                .len(),
+            4 * 4 * 4
+        );
+    }
+
+    #[test]
+    fn a_duplicate_reply_is_not_queued_twice() {
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: "test-endpoint".into(),
+            },
+            LocalConfig {
+                display_name: "W".into(),
+                ..Default::default()
+            },
+        );
+        vm.audio_player.cards = vec![AudioPlayerCard {
+            stream_id: "stream".into(),
+            source_name: "WORKSTATION".into(),
+            title: Some("Title".into()),
+            subtitle: None,
+            artwork_id: Some([6; 32]),
+            artwork: None,
+            has_media_session: true,
+            app: AppKind::System,
+            position_ms: None,
+            duration_ms: None,
+            seek: None,
+            playing: true,
+            can_prev: false,
+            can_play_pause: false,
+            can_next: false,
+            muted: false,
+            gain_percent: 100,
+            state: StreamState::Ready,
+            path: None,
+            background: false,
+        }];
+        vm.audio.art_requested.push(ArtRequest {
+            session_id: [1; 16],
+            token: 9,
+            id: [6; 32],
+        });
+        let image = image::RgbImage::from_pixel(4, 4, image::Rgb([1, 2, 3]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image)
+            .expect("encode fixture");
+        let reply = |data: Vec<u8>| ipc::AudioArtwork {
+            session_id: vec![1; 16],
+            session_token: 9,
+            artwork_id: vec![6; 32],
+            mime: "image/jpeg".into(),
+            data,
+            width: 4,
+            height: 4,
+        };
+        vm.audio.accept_artwork(reply(jpeg.clone()));
+        vm.audio.accept_artwork(reply(jpeg));
+        assert_eq!(
+            vm.audio
+                .art_worker
+                .inner
+                .inflight
+                .lock()
+                .expect("inflight")
+                .len(),
+            1,
+            "an identical hash already being decoded is not queued twice"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audio_timeout_tests {
+    use super::*;
+    use crate::view_model::{CoreEndpoint, Inflight, LocalConfig};
+
+    #[test]
+    fn artwork_timeout_is_best_effort_and_never_disables_audio() {
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: "test-endpoint".into(),
+            },
+            LocalConfig {
+                display_name: "W".into(),
+                ..Default::default()
+            },
+        );
+        vm.audio.available = true;
+        let now = Instant::now();
+        vm.inflight.push(Inflight {
+            id: 7,
+            request: Request::Audio(AudioRequest::Artwork),
+            deadline: now - Duration::from_secs(1),
+            clipboard_target: None,
+        });
+        vm.tick_audio(now);
+        assert!(
+            vm.audio.available,
+            "a cover timeout is not an audio failure"
+        );
+        assert!(vm.audio.error.is_none());
+        assert!(
+            vm.inflight.is_empty(),
+            "the timed-out cover request is retired"
+        );
+        // The generic audio timeout still fails the subsystem for a real audio request.
+        vm.inflight.push(Inflight {
+            id: 8,
+            request: Request::Audio(AudioRequest::Mutation),
+            deadline: now - Duration::from_secs(1),
+            clipboard_target: None,
+        });
+        vm.tick_audio(now);
+        assert!(!vm.audio.available);
+        assert!(vm.audio.error.is_some());
     }
 }

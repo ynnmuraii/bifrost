@@ -56,6 +56,9 @@ impl Sender {
             encoded: [0; MAX_PAYLOAD_LEN],
         })
     }
+    pub(crate) fn sealer_mut(&mut self) -> &mut Sealer {
+        &mut self.sealer
+    }
     /// Algorithmic delay queried from the configured Opus encoder, not a profile estimate.
     pub fn codec_lookahead_us(&mut self) -> Result<u32, MediaError> {
         Ok(
@@ -199,6 +202,9 @@ impl Receiver {
             paused: true,
         })
     }
+    pub(crate) fn opener_mut(&mut self) -> &mut Opener {
+        &mut self.opener
+    }
     pub fn output_capacity_samples(&self) -> usize {
         self.resampler.output_capacity_frames() * 4
     }
@@ -260,7 +266,12 @@ impl Receiver {
             }
             let discontinuities = self.jitter.health().discontinuities;
             self.jitter
-                .insert(now, header.packet_number, header.media_timestamp, payload)
+                .insert(
+                    now,
+                    (u64::from(header.key_epoch - 1) << 24) | header.packet_number,
+                    header.media_timestamp,
+                    payload,
+                )
                 .map_err(MediaError::Jitter)?;
             if self.jitter.health().discontinuities != discontinuities {
                 self.decoder.reset()?;

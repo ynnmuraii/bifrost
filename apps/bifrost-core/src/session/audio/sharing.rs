@@ -448,6 +448,10 @@ mod tests {
         Deadline,
     }
 
+    #[tokio::test]
+    async fn malformed_optional_artwork_cannot_stop_an_established_audio_actor() {
+        controlled_system_off(false, NativeStart::Started).await;
+    }
     async fn controlled_system_off(worker_lost: bool, native: NativeStart) {
         let native_issued = !matches!(native, NativeStart::Fenced);
         let native_started = matches!(
@@ -534,6 +538,9 @@ mod tests {
                 mic_support: false,
                 media_support: false,
                 media_seek_support: false,
+                rekey_support: false,
+                artwork_support: false,
+                artwork_rejected: 0,
                 focus_sent_revision: 0,
                 focus_request_at: None,
                 focus_reply_at: None,
@@ -644,6 +651,7 @@ mod tests {
                 capture_active: native_started.then_some(true),
                 sending: native_started.then_some(true),
                 applied_gain: None,
+                rotation: rotation::State::default(),
             },
         );
         let (handle, mut stops, mut shutdown, native) = AudioHandle::controlled_stop(1);
@@ -657,6 +665,39 @@ mod tests {
         });
         let (native_events, events) = mpsc::channel(8);
         actor.worker_events = Some(events);
+        if native_started {
+            coordinator.links.send_modify(|links| {
+                links.peers = actor.peers.clone();
+                links.trusted.insert(peer);
+            });
+            actor.admitted.insert(peer);
+            let before = actor.model.session(parent.peer).unwrap();
+            for (width, total_bytes) in [(193, 1024), (192, 49153)] {
+                let message = net::AudioControl {
+                    control_version: 1,
+                    body: Some(net::audio_control::Body::Artwork(net::MediaArtworkChunk {
+                        session_id: view.session.to_vec(),
+                        token: 1,
+                        revision: 1,
+                        artwork_id: vec![1; 32],
+                        total_bytes,
+                        offset: 0,
+                        data: vec![0; 1024],
+                        width,
+                        height: 1,
+                    })),
+                };
+                let violation = protocol::validate::audio_control(&message).unwrap_err();
+                assert_eq!(violation, protocol::validate::AudioViolation::Artwork);
+                coordinator.rejected(peer, parent.connection_id, violation);
+            }
+            actor.sync_links();
+            assert_eq!(actor.model.session(parent.peer).unwrap(), before);
+            assert!(
+                stops.try_recv().is_err(),
+                "optional thumbnail sent native Stop"
+            );
+        }
         if revoke_pending || control_pending {
             coordinator.links.send_modify(|links| {
                 links.peers = actor.peers.clone();

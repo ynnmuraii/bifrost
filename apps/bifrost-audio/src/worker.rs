@@ -230,6 +230,11 @@ where
         } else {
             None
         };
+        let rotation_id = if let Msg::RotateSession(rotation) = &message {
+            Some(rotation.session_id.clone())
+        } else {
+            None
+        };
         self.mic_controls.fence = Some((privacy_epoch, talk_epoch));
         if matches!(&message, Msg::AcquireMicMute(_))
             && (privacy_epoch != self.shared.privacy.epoch.load(Ordering::Acquire)
@@ -251,6 +256,14 @@ where
             }
             Msg::ListDevices(query) => self.devices(request_id, query),
             Msg::StartSession(start) => self.start(start, secrets.ok_or(6), permit.ok_or(6)),
+            Msg::RotateSession(rotation) => self.rotate(rotation, secrets),
+            #[cfg(debug_assertions)]
+            Msg::SetTestClock(clock) if self.kind == w::BackendKind::Dry as i32 => {
+                for session in &self.sessions {
+                    session.media.advance_test_clock(clock.offset_ms);
+                }
+                Ok(())
+            }
             Msg::StopSession(stop) => {
                 self.stop(&stop.session_id, self.shared.stop_reason(&stop.session_id));
                 Ok(())
@@ -304,10 +317,20 @@ where
                 request_id,
                 Msg::Error(w::Error {
                     code,
-                    session_id: start_id.unwrap_or_default(),
+                    session_id: start_id.or(rotation_id).unwrap_or_default(),
                 }),
             );
         }
+    }
+    fn rotation_event(&self, id: &[u8], epoch: u32, kind: u32) {
+        self.response(
+            0,
+            Msg::RotationEvent(w::RotationEvent {
+                session_id: id.to_vec(),
+                epoch,
+                kind,
+            }),
+        );
     }
     fn active_source(&mut self) -> bool {
         self.sessions.iter_mut().any(|session| {
@@ -624,11 +647,61 @@ where
                 && start
                     .capture
                     .as_ref()
-                    .is_some_and(|capture| capture.kind == 2),
+                    .is_some_and(|capture| matches!(capture.kind, 1 | 2)),
             source_silence_attempted: false,
         });
         self.event(&id, 1, 0, port);
         Ok(())
+    }
+    fn rotate(
+        &mut self,
+        rotation: w::RotateSession,
+        secrets: Option<contract::SessionSecrets>,
+    ) -> Result<(), i32> {
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| {
+                rotation.session_id == session.id
+                    && session.authorized.load(Ordering::Acquire)
+                    && !self.shared.stopping.load(Ordering::Acquire)
+            })
+            .ok_or(6)?;
+        if rotation.activate {
+            return session
+                .media
+                .activate_rotation(rotation.epoch)
+                .map_err(media_error);
+        }
+        let secrets = secrets.ok_or(6)?;
+        let fingerprint = |key: &[u8]| -> [u8; 32] {
+            digest(&SHA256, key)
+                .as_ref()
+                .try_into()
+                .expect("SHA256 length")
+        };
+        let forward = fingerprint(secrets.forward.key());
+        let reverse = fingerprint(secrets.reverse.key());
+        if forward == reverse
+            || self.used_keys.contains(&forward)
+            || self.used_keys.contains(&reverse)
+        {
+            return Err(5);
+        }
+        // Runtime binds fresh material to the strictly increasing epoch before AEAD use.
+        // Initial-session tombstones remain bounded; rotations never consume start slots.
+        let (forward, forward_prefix) = secrets.forward.into_parts();
+        let (reverse, reverse_prefix) = secrets.reverse.into_parts();
+        session
+            .media
+            .prepare_rotation(
+                rotation.epoch,
+                media::SessionMaterial {
+                    forward: DirectionMaterial::new(forward, forward_prefix),
+                    reverse: DirectionMaterial::new(reverse, reverse_prefix),
+                },
+            )
+            .map_err(media_error)
     }
     fn stop(&mut self, id: &[u8], reason: i32) {
         if let Some(index) = self.sessions.iter().position(|session| session.id == id) {
@@ -773,7 +846,7 @@ where
                 continue;
             }
             // This is the existing active-Source admission (auth + committed sending).
-            // Kind1 Windows process exclusion, kind3 and all Listeners never enter it.
+            // Process-exclusion and monitor Sources share admission; kind3 and Listeners do not.
             let session = &mut self.sessions[index];
             if session.source_silence_required
                 && !session.source_silence_attempted
@@ -834,6 +907,15 @@ where
                     media::MediaEvent::Degraded => self.event(&session.id, 2, 0, 0),
                     media::MediaEvent::DeviceInvalidated => self.event(&session.id, 3, 0, 0),
                     media::MediaEvent::RotationRequired => self.event(&session.id, 4, 0, 0),
+                    media::MediaEvent::RotationDue { epoch } => {
+                        self.rotation_event(&session.id, epoch, 1)
+                    }
+                    media::MediaEvent::RotationPrepared { epoch } => {
+                        self.rotation_event(&session.id, epoch, 2)
+                    }
+                    media::MediaEvent::RotationActivated { epoch } => {
+                        self.rotation_event(&session.id, epoch, 3)
+                    }
                     media::MediaEvent::Stopped { reason } => {
                         ended = Some(stop_reason(reason));
                         break;

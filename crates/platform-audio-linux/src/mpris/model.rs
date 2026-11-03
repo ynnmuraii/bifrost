@@ -21,6 +21,8 @@ pub(super) struct Player {
     identity: String,
     title: String,
     subtitle: String,
+    artwork_url: Option<String>,
+    artwork: Option<audio_backend::artwork::Artwork>,
     track: Option<String>,
     duration: Option<u64>,
     pub state: PlaybackState,
@@ -80,6 +82,8 @@ impl Player {
             identity: String::new(),
             title: String::new(),
             subtitle: String::new(),
+            artwork_url: None,
+            artwork: None,
             track: None,
             duration: None,
             state: PlaybackState::Unknown,
@@ -136,6 +140,7 @@ impl Player {
         .expect("metadata bounded at ingestion");
         info.position_ms = self.position(now);
         info.duration_ms = self.duration;
+        info.artwork = self.artwork.clone();
         if info.commands.seek {
             info.seek_min_ms = Some(0);
             info.seek_max_ms = self.duration;
@@ -198,6 +203,13 @@ impl Player {
             }
             if let Some(value) = properties.remove("Metadata") {
                 let mut metadata = Properties::try_from(value).unwrap_or_default();
+                let old_title = self.title.clone();
+                let old_track = self.track.clone();
+                let artwork_url = metadata
+                    .remove("mpris:artUrl")
+                    .and_then(|value| String::try_from(value).ok())
+                    .filter(|url| url.len() <= 2048);
+                let artwork_changed = replace(&mut self.artwork_url, artwork_url);
                 changed |= replace(
                     &mut self.title,
                     truncate(
@@ -238,6 +250,13 @@ impl Player {
                 if replace(&mut self.track, track) || uncertain {
                     self.position = None;
                     self.position_at = now;
+                    changed = true;
+                }
+                if artwork_changed || old_title != self.title || old_track != self.track {
+                    self.artwork = self
+                        .artwork_url
+                        .as_deref()
+                        .and_then(|url| cached_artwork(url, self.artwork.as_ref()));
                     changed = true;
                 }
             }
@@ -293,6 +312,62 @@ impl Player {
         }
     }
 }
+fn cached_artwork(
+    url: &str,
+    previous: Option<&audio_backend::artwork::Artwork>,
+) -> Option<audio_backend::artwork::Artwork> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })?;
+    cached_artwork_in(&cache, url, previous)
+}
+fn cached_artwork_in(
+    cache: &std::path::Path,
+    url: &str,
+    previous: Option<&audio_backend::artwork::Artwork>,
+) -> Option<audio_backend::artwork::Artwork> {
+    use audio_backend::artwork::{normalize, MAX_NATIVE_BYTES};
+    use std::{io::Read, os::unix::fs::MetadataExt, path::Path};
+    let location = url.strip_prefix("file://")?;
+    // Percent-encoded/remote/query locations are unsupported, never decoded or fetched.
+    if !location.starts_with('/') || location.contains(['%', '?', '#', '\0']) {
+        return None;
+    }
+    let path = Path::new(location);
+    if !matches!(
+        path.extension()?.to_str()?.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg"
+    ) {
+        return None;
+    }
+    let cache = cache.canonicalize().ok()?;
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(&cache) || path.symlink_metadata().ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let fd = rustix::fs::open(
+        &canonical,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
+    let file = std::fs::File::from(fd);
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != cache.metadata().ok()?.uid()
+        || metadata.len() > MAX_NATIVE_BYTES as u64
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_NATIVE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    normalize(&bytes, previous)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +404,55 @@ mod tests {
         assert_eq!(info.state, PlaybackState::Unknown);
         assert!(info.commands.play);
         assert!(!info.commands.toggle);
+    }
+    #[test]
+    fn artwork_reads_only_bounded_regular_images_inside_owned_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "bf-art-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let image = cache.join("cover.png");
+        std::fs::write(
+            &image,
+            [
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0,
+                2, 8, 2, 0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 22, 73, 68, 65, 84, 120, 156, 99,
+                80, 241, 152, 224, 49, 65, 133, 97, 130, 138, 135, 202, 4, 15, 0, 27, 122, 3, 241,
+                244, 33, 109, 130, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+            ],
+        )
+        .unwrap();
+        let url = format!("file://{}", image.display());
+        assert!(cached_artwork_in(&cache, &url, None).is_some());
+        assert!(cached_artwork_in(&cache, "https://example.invalid/private.jpg", None).is_none());
+        let outside = root.join("private.jpg");
+        std::fs::write(&outside, b"private bytes").unwrap();
+        assert!(
+            cached_artwork_in(&cache, &format!("file://{}", outside.display()), None).is_none()
+        );
+        let symlink = cache.join("alias.jpg");
+        std::os::unix::fs::symlink(&outside, &symlink).unwrap();
+        assert!(
+            cached_artwork_in(&cache, &format!("file://{}", symlink.display()), None).is_none()
+        );
+        std::fs::write(
+            &image,
+            vec![0; audio_backend::artwork::MAX_NATIVE_BYTES + 1],
+        )
+        .unwrap();
+        assert!(cached_artwork_in(&cache, &url, None).is_none());
+        std::fs::remove_file(symlink).unwrap();
+        std::fs::remove_file(outside).unwrap();
+        std::fs::remove_file(image).unwrap();
+        std::fs::remove_dir(cache).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
     #[test]
     fn timeline_rate_pause_seek_and_bounds() {

@@ -39,6 +39,13 @@ use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, Sense, Stroke, UiBu
 pub use bridge::Bridge as AsciiBridge;
 pub use field::{Field, Frame as FieldFrame};
 pub use theme::{apply as apply_theme, install_fonts, Palette};
+/// The rail/settings icon set, exposed so the offscreen icon matrix renders the real vectors.
+pub use widgets::{paint_icon as paint_rail_icon, Icon as RailIcon};
+
+/// The mono face at `size`, for offscreen fixtures that label the real icon set.
+pub fn theme_font(size: f32) -> eframe::egui::FontId {
+    theme::font(size, theme::fam::mono())
+}
 
 use crate::gui_settings::Theme;
 use crate::map::Pt;

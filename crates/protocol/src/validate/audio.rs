@@ -24,6 +24,7 @@ pub enum AudioViolation {
     QueueFull,
     Shape,
     Metadata,
+    Artwork,
 }
 
 impl AudioViolation {
@@ -272,6 +273,17 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
             }
         }
         Body::FocusRequest(request) => id(&request.group_id, 16)?,
+        Body::Rekey(rekey) => {
+            id(&rekey.session_id, 16)?;
+            if rekey.epoch < 2 || !(1..=4).contains(&rekey.stage) {
+                return Err(AudioViolation::Epoch);
+            }
+            if rekey.stage == 1 {
+                id(&rekey.nonce, 32)?;
+            } else if !rekey.nonce.is_empty() {
+                return Err(AudioViolation::Shape);
+            }
+        }
         Body::MicControl(control) => {
             id(&control.group_id, 16)?;
             id(&control.request_id, 16)?;
@@ -339,8 +351,44 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
             }
             result(ack.result)?;
         }
+        Body::ArtworkRequest(request) => {
+            let valid = (|| {
+                id(&request.session_id, 16)?;
+                id(&request.artwork_id, 32)?;
+                if request.token == 0 {
+                    return Err(AudioViolation::Epoch);
+                }
+                Ok(())
+            })();
+            valid.map_err(|_| AudioViolation::Artwork)?;
+        }
+        Body::Artwork(artwork) => {
+            let valid = (|| {
+                id(&artwork.session_id, 16)?;
+                id(&artwork.artwork_id, 32)?;
+                if artwork.token == 0
+                    || artwork.revision == 0
+                    || artwork.total_bytes == 0
+                    || artwork.total_bytes as usize > limits::MAX_AUDIO_ARTWORK_BYTES
+                    || artwork.data.is_empty()
+                    || artwork.data.len() > limits::MAX_AUDIO_ARTWORK_CHUNK
+                    || (artwork.offset as usize)
+                        .checked_add(artwork.data.len())
+                        .is_none_or(|end| end > artwork.total_bytes as usize)
+                    || !(1..=192).contains(&artwork.width)
+                    || !(1..=192).contains(&artwork.height)
+                {
+                    return Err(AudioViolation::Metadata);
+                }
+                Ok(())
+            })();
+            valid.map_err(|_| AudioViolation::Artwork)?;
+        }
         Body::MediaInfo(info) => {
             id(&info.session_id, 16)?;
+            if !info.artwork_id.is_empty() {
+                id(&info.artwork_id, 32).map_err(|_| AudioViolation::Artwork)?;
+            }
             if info.app.len() > 128
                 || info.title.len() > 256
                 || info.subtitle.len() > 256
@@ -369,7 +417,8 @@ pub fn audio_control(message: &wire::AudioControl) -> Result<(), AudioViolation>
                 if info.token == 0 || info.revision == 0 {
                     return Err(AudioViolation::Epoch);
                 }
-            } else if info.token != 0
+            } else if !info.artwork_id.is_empty()
+                || info.token != 0
                 || !info.app.is_empty()
                 || !info.title.is_empty()
                 || !info.subtitle.is_empty()

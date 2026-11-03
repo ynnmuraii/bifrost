@@ -1494,6 +1494,12 @@ impl ViewModel {
         match msg {
             Msg::AudioStatus(status) => self.apply_audio_status(frame.request_id, status),
             Msg::AudioDevices(devices) => self.apply_audio_devices(frame.request_id, devices),
+            Msg::AudioArtwork(artwork) => {
+                if let Some(id) = self.audio.take_art_inflight(&artwork) {
+                    self.take_inflight(id);
+                }
+                self.audio.accept_artwork(artwork);
+            }
             Msg::Status(status) => self.apply_status(status),
             Msg::TopologyDoc(doc) => self.apply_topology(doc),
             Msg::PairingWindow(window) => self.apply_pairing_window(window),
@@ -4314,6 +4320,8 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::OpResult(_) => "OpResult",
         Msg::TopologyDoc(_) => "TopologyDoc",
         Msg::PendingEdits(_) => "PendingEdits",
+        Msg::GetAudioArtwork(_) => "GetAudioArtwork",
+        Msg::AudioArtwork(_) => "AudioArtwork",
         Msg::PairingWindow(_) => "PairingWindow",
     }
 }

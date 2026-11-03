@@ -20,7 +20,10 @@ struct Pair {
 
 impl Pair {
     fn new(label: &str) -> Self {
-        let nodes = Unpaired::start_audio(label);
+        Self::from_nodes(Unpaired::start_audio(label))
+    }
+
+    fn from_nodes(nodes: Unpaired) -> Self {
         nodes.wait_ready();
         let mut listener = Window::open(&nodes.a);
         let mut source = Window::open(&nodes.b);
@@ -728,4 +731,214 @@ fn source_can_receive_without_clearing_independent_media_preferences() {
     assert_eq!(after.output_device, before.output_device);
     assert_eq!(after.capture_device, before.capture_device);
     assert_eq!(after.resume_system_audio, before.resume_system_audio);
+}
+
+#[cfg(windows)]
+fn fixture_binary_hash() -> String {
+    let path = env!("CARGO_BIN_EXE_bifrost").replace('\'', "''");
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            &format!("$ErrorActionPreference='Stop'; (Get-FileHash -Algorithm SHA256 -LiteralPath '{path}').Hash")])
+        .output().expect("hash the exact Cargo-selected binary before launching fixture cores");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hash = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .to_ascii_lowercase();
+    assert_eq!(hash.len(), 64);
+    println!(
+        "WINDOWS_SOURCE_FIXTURE_BINARY path={} sha256={hash}",
+        env!("CARGO_BIN_EXE_bifrost")
+    );
+    hash
+}
+
+#[cfg(windows)]
+fn owned_roles(nodes: [&common::Node; 2], expected_hash: &str) -> Vec<(u64, String, u64)> {
+    let path = env!("CARGO_BIN_EXE_bifrost").replace('\'', "''");
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$expected = [IO.Path]::GetFullPath('{path}')
+$hashes = @{{}}
+foreach ($rootId in @({a}, {b})) {{
+    $core = Get-CimInstance Win32_Process -Filter "ProcessId = $rootId"
+    if ($null -eq $core) {{ throw 'owned fixture core exited' }}
+    foreach ($process in @($core) + @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $rootId")) {{
+        if ($process.ProcessId -eq $rootId) {{ $role = 'core' }}
+        elseif ($process.CommandLine -match '\s(audio|agent)(?:\s|$)') {{ $role = $Matches[1] }}
+        else {{ throw 'unexpected child of owned fixture core' }}
+        if (![string]::Equals($process.ExecutablePath, $expected, [StringComparison]::OrdinalIgnoreCase)) {{
+            throw 'fixture role did not use Cargo-selected binary'
+        }}
+        if (!$hashes.ContainsKey($process.ExecutablePath)) {{
+            $hashes[$process.ExecutablePath] = (Get-FileHash -Algorithm SHA256 -LiteralPath $process.ExecutablePath).Hash.ToLowerInvariant()
+        }}
+        $hash = $hashes[$process.ExecutablePath]
+        if ($hash -ne '{expected_hash}') {{ throw 'fixture image changed after prelaunch hash' }}
+        "$rootId`t$role`t$($process.ProcessId)`t$($process.ExecutablePath)`t$hash"
+    }}
+}}
+"#,
+        a = nodes[0].pid(),
+        b = nodes[1].pid()
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("inspect only fixture core/agent/audio process images");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::str::from_utf8(&output.stdout).expect("owned process receipt");
+    let mut roles = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        println!("WINDOWS_SOURCE_OWNED_PROCESS {line}");
+        let mut fields = line.split('\t');
+        let core: u64 = fields.next().expect("core PID").parse().unwrap();
+        let role = fields.next().expect("role").to_owned();
+        let pid: u64 = fields.next().expect("role PID").parse().unwrap();
+        let _image = fields.next().expect("image path");
+        assert_eq!(fields.next(), Some(expected_hash));
+        assert_eq!(fields.next(), None);
+        roles.push((core, role, pid));
+    }
+    for node in nodes {
+        for role in ["core", "agent", "audio"] {
+            assert_eq!(
+                roles
+                    .iter()
+                    .filter(|(root, kind, _)| *root == u64::from(node.pid()) && kind == role)
+                    .count(),
+                1
+            );
+        }
+    }
+    roles.sort();
+    roles
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_process_source_reverses_roles_and_mode_change_keeps_owned_media_running() {
+    let _guard = common::serial();
+    let expected_hash = fixture_binary_hash();
+    let mut pair = Pair::from_nodes(Unpaired::start_audio_no_input("wr"));
+    let mut preferences = pair
+        .listener
+        .status()
+        .config
+        .expect("isolated Listener preferences");
+    preferences.mode = wire::AudioMode::FollowFocus as i32;
+    pair.listener.configure(preferences);
+    pair.receive();
+    pair.share();
+    let first = audio::healthy(
+        &mut pair.listener,
+        &mut pair.source,
+        &pair.listener_id,
+        &pair.source_id,
+    );
+    let roles_before = owned_roles([&pair.nodes.a, &pair.nodes.b], &expected_hash);
+    let listener_before = saved(&pair.nodes.a);
+    let source_before = saved(&pair.nodes.b);
+    let ended_before = (
+        pair.nodes.a.log().matches("audio session ended").count(),
+        pair.nodes.b.log().matches("audio session ended").count(),
+    );
+    // The player button sends precisely this mode-only SetAudio on an ACTIVE
+    // Listener. MixAll must remove focus ducking without replacing SYSTEM/native ownership.
+    let mut mode_only = pair
+        .listener
+        .status()
+        .config
+        .expect("active Listener config");
+    mode_only.mode = wire::AudioMode::MixAll as i32;
+    pair.listener.configure(mode_only);
+    pair.listener
+        .wait("MixAll reaches running worker gain policy", |status| {
+            status.mode == wire::AudioMode::MixAll as i32
+                && status.sessions.iter().any(|session| {
+                    session.session_id == first
+                        && session.gain_percent == 100
+                        && !session.muted
+                        && session.state == wire::AudioSessionState::Running as i32
+                })
+        });
+    assert_eq!(
+        audio::healthy(
+            &mut pair.listener,
+            &mut pair.source,
+            &pair.listener_id,
+            &pair.source_id,
+        ),
+        first
+    );
+    assert_eq!(
+        owned_roles([&pair.nodes.a, &pair.nodes.b], &expected_hash),
+        roles_before
+    );
+    assert_eq!(
+        (
+            pair.nodes.a.log().matches("audio session ended").count(),
+            pair.nodes.b.log().matches("audio session ended").count(),
+        ),
+        ended_before,
+        "mode-only configuration must not stop either native SYSTEM lifecycle"
+    );
+    let mut expected_listener = listener_before;
+    expected_listener.mode = config::AudioMode::MixAll;
+    assert_eq!(
+        saved(&pair.nodes.a),
+        expected_listener,
+        "all independent Listener preferences preserved"
+    );
+    assert_eq!(
+        saved(&pair.nodes.b),
+        source_before,
+        "Source consent, local-sound authority and P4 preferences unchanged"
+    );
+    sharing(
+        &mut pair.source,
+        false,
+        wire::AudioRole::Source,
+        &pair.listener_id,
+    );
+    sharing(&mut pair.listener, false, wire::AudioRole::Listener, &[]);
+    stopped_cleanly(&mut pair.source, &first);
+    stopped_cleanly(&mut pair.listener, &first);
+
+    sharing(&mut pair.source, true, wire::AudioRole::Listener, &[]);
+    sharing(
+        &mut pair.listener,
+        true,
+        wire::AudioRole::Source,
+        &pair.source_id,
+    );
+    let reversed = audio::healthy(
+        &mut pair.source,
+        &mut pair.listener,
+        &pair.source_id,
+        &pair.listener_id,
+    );
+    assert_ne!(
+        first, reversed,
+        "role reversal negotiates a fresh media session"
+    );
+    assert_eq!(pair.listener.status().role, wire::AudioRole::Source as i32);
+    assert_eq!(pair.source.status().role, wire::AudioRole::Listener as i32);
+    sharing(
+        &mut pair.listener,
+        false,
+        wire::AudioRole::Source,
+        &pair.source_id,
+    );
+    sharing(&mut pair.source, false, wire::AudioRole::Listener, &[]);
+    stopped_cleanly(&mut pair.listener, &reversed);
+    stopped_cleanly(&mut pair.source, &reversed);
 }

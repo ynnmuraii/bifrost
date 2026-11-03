@@ -22,6 +22,7 @@ pub(super) struct Controls {
     dirty: bool,
     sessions: Vec<MediaInfo>,
     current: Option<MediaSessionToken>,
+    last_artwork: Option<(MediaSessionToken, [u8; 32])>,
     revision: u64,
     last_refresh: Option<Instant>,
     next_native_id: u64,
@@ -35,6 +36,7 @@ impl Controls {
             dirty: false,
             sessions: Vec::new(),
             current: None,
+            last_artwork: None,
             revision: 0,
             last_refresh: None,
             next_native_id: 0,
@@ -246,6 +248,7 @@ impl Controls {
     }
 
     fn publish_empty(&mut self, emit: &mut impl FnMut(u64, Msg)) {
+        self.last_artwork = None;
         self.revision = self.revision.saturating_add(1);
         emit(
             0,
@@ -305,6 +308,10 @@ impl Controls {
             .sessions
             .iter()
             .map(|info| w::MediaInfo {
+                artwork_id: info
+                    .artwork
+                    .as_ref()
+                    .map_or_else(Vec::new, |art| art.id.to_vec()),
                 token: info.session.0,
                 revision: info.revision,
                 app_id: bounded_text(info.app(), 128),
@@ -336,6 +343,27 @@ impl Controls {
                 revision: self.revision,
             }),
         );
+        let current_artwork = self
+            .current
+            .and_then(|token| self.sessions.iter().find(|info| info.session == token))
+            .and_then(|info| info.artwork.as_ref().map(|art| (info, art)));
+        let identity = current_artwork.map(|(info, art)| (info.session, art.id));
+        if identity != self.last_artwork {
+            self.last_artwork = identity;
+            if let Some((info, art)) = current_artwork {
+                emit(
+                    0,
+                    Msg::MediaArtwork(w::MediaArtwork {
+                        token: info.session.0,
+                        revision: info.revision,
+                        artwork_id: art.id.to_vec(),
+                        data: art.data.to_vec(),
+                        width: art.width,
+                        height: art.height,
+                    }),
+                );
+            }
+        }
         Ok(())
     }
 }

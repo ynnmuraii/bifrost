@@ -1,4 +1,4 @@
-//! No core, audio endpoint or native input. Optional PNGs use BIFROST_SETTINGS_SHOTS.
+//! Audio settings consumer regressions: no core, audio endpoint or native input.
 mod support;
 
 use bifrost_gui::audio::AudioAction;
@@ -209,6 +209,47 @@ fn click(at: egui::Pos2) -> Vec<egui::Event> {
     ]
 }
 
+fn accessibility_bounds(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+    let update = output.platform_output.accesskit_update.as_ref()?;
+    let node = &update
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some(label) || node.value() == Some(label))?
+        .1;
+    let bounds = node.bounds()?;
+    Some(egui::Rect::from_min_max(
+        egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+        egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+    ))
+}
+
+fn power_rect(output: &egui::FullOutput, lang: Lang) -> egui::Rect {
+    for key in [
+        Key::AudioStartReceive,
+        Key::AudioStopReceive,
+        Key::AudioStartShare,
+        Key::AudioStopShare,
+    ] {
+        if let Some(bounds) = accessibility_bounds(output, text(lang, key)) {
+            return bounds;
+        }
+    }
+    panic!("power control is missing");
+}
+
+fn open_details(ctx: &egui::Context, vm: &ViewModel, size: egui::Vec2, lang: Lang) {
+    let (output, _) = frame(ctx, vm, size, Vec::new());
+    let at = labels(&output)
+        .into_iter()
+        .find(|(s, _)| s == text(lang, Key::AudioStateDetails))
+        .unwrap()
+        .1
+        .center();
+    frame(ctx, vm, size, click(at));
+    for _ in 0..4 {
+        frame(ctx, vm, size, Vec::new());
+    }
+}
 fn open_advanced(ctx: &egui::Context, vm: &ViewModel, size: egui::Vec2) {
     let (output, _) = frame(ctx, vm, size, Vec::new());
     let at = labels(&output)
@@ -243,26 +284,14 @@ fn settings_render_localized_without_mutating_drafts_in_both_themes() {
                     ctx.enable_accesskit();
                     let size = egui::vec2(width, 6000.0);
                     frame(&ctx, &vm, size, Vec::new());
+                    open_details(&ctx, &vm, size, lang);
                     let (output, actions) = frame(&ctx, &vm, size, Vec::new());
                     assert!(actions.is_empty(), "{scene}");
                     assert_eq!(vm.audio.draft, before);
                     let labels = labels(&output);
                     assert!(labels
                         .iter()
-                        .any(|(s, _)| s == text(lang, Key::AudioDiagnostics)));
-                    assert_eq!(
-                        text(lang, Key::AudioDiagnostics),
-                        if lang == Lang::En {
-                            "Audio"
-                        } else {
-                            "Звук"
-                        }
-                    );
-                    if vm.audio.status.is_some() {
-                        assert!(labels
-                            .iter()
-                            .any(|(s, _)| s == text(lang, Key::AudioDetails)));
-                    }
+                        .any(|(s, _)| s == text(lang, Key::AudioStateDetails)));
                     assert!(!labels.iter().any(|(s, _)| {
                         s.contains(support::PEER_NODE)
                             || s.contains(&"11".repeat(16))
@@ -301,21 +330,17 @@ fn settings_render_localized_without_mutating_drafts_in_both_themes() {
 fn receive_switch_is_one_explicit_intent_without_group_or_apply_ritual() {
     for lang in [Lang::En, Lang::Ru] {
         for theme in [Theme::Light, Theme::Dark] {
-            let mut vm = fixture(lang, theme, "ready");
+            let mut vm = fixture(lang, theme, "listener");
             vm.audio.draft.group_id.clear();
             let before = vm.audio.draft.clone();
             let ctx = egui::Context::default();
             ui::install_fonts(&ctx);
+            ctx.enable_accesskit();
             let size = egui::vec2(400.0, 1200.0);
             frame(&ctx, &vm, size, Vec::new());
             let (output, _) = frame(&ctx, &vm, size, Vec::new());
             let values = labels(&output);
-            let at = values
-                .iter()
-                .find(|(s, _)| s == text(lang, Key::AudioReceiveSystem))
-                .unwrap()
-                .1
-                .center();
+            let at = power_rect(&output, lang).center();
             let (_, actions) = frame(&ctx, &vm, size, click(at));
             assert_eq!(actions, [Action::Audio(AudioAction::Receive(true))]);
             assert_eq!(vm.audio.draft, before);
@@ -357,6 +382,7 @@ fn microphone_summary_uses_committed_control_config_and_preserves_release() {
                 ui::install_fonts(&ctx);
                 let size = egui::vec2(760.0, 6000.0);
                 frame(&ctx, &vm, size, Vec::new());
+                open_details(&ctx, &vm, size, lang);
                 let (output, actions) = frame(&ctx, &vm, size, Vec::new());
                 let values = labels(&output);
                 assert_eq!(
@@ -401,15 +427,11 @@ fn share_switch_sends_one_intent_with_empty_auto_group_and_no_optimistic_activit
         let before = vm.audio.draft.clone();
         let ctx = egui::Context::default();
         ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
         let size = egui::vec2(400.0, 1200.0);
         frame(&ctx, &vm, size, Vec::new());
         let (output, _) = frame(&ctx, &vm, size, Vec::new());
-        let at = labels(&output)
-            .iter()
-            .find(|(s, _)| s == text(Lang::En, Key::AudioShareSystem))
-            .unwrap()
-            .1
-            .center();
+        let at = power_rect(&output, Lang::En).center();
         let (_, actions) = frame(&ctx, &vm, size, click(at));
         if available {
             assert_eq!(actions, [Action::Audio(AudioAction::Share(true))]);
@@ -429,27 +451,29 @@ fn privacy_stop_and_release_remain_available_while_pending_or_status_is_stale() 
         vm.audio.available = available;
         let ctx = egui::Context::default();
         ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
         let size = egui::vec2(760.0, 800.0);
         frame(&ctx, &vm, size, Vec::new());
+        open_details(&ctx, &vm, size, Lang::En);
         let (output, _) = frame(&ctx, &vm, size, Vec::new());
-        for key in [
-            Key::AudioStopSystem,
-            Key::AudioPttRelease,
-            Key::AudioMicMute,
-        ] {
-            let at = labels(&output)
-                .iter()
-                .find(|(s, _)| s == text(Lang::En, key))
-                .unwrap()
-                .1
-                .center();
+        for key in [Key::AudioStopShare, Key::AudioPttRelease, Key::AudioMicMute] {
+            let at = if key == Key::AudioStopShare {
+                power_rect(&output, Lang::En).center()
+            } else {
+                labels(&output)
+                    .iter()
+                    .find(|(s, _)| s == text(Lang::En, key))
+                    .unwrap()
+                    .1
+                    .center()
+            };
             let (_, actions) = frame(&ctx, &vm, size, click(at));
             assert_eq!(actions.len(), 1);
             match key {
-                Key::AudioStopSystem => {
+                Key::AudioStopShare => {
                     assert!(matches!(
                         actions[0],
-                        Action::Audio(AudioAction::StopSystemAudio)
+                        Action::Audio(AudioAction::Share(false))
                     ))
                 }
                 Key::AudioPttRelease => assert!(matches!(
@@ -461,109 +485,6 @@ fn privacy_stop_and_release_remain_available_while_pending_or_status_is_stale() 
                     Action::Audio(AudioAction::SetMicrophoneMute(true))
                 )),
                 _ => unreachable!(),
-            }
-        }
-    }
-}
-
-#[test]
-fn optional_offscreen_settings_pngs() {
-    let Some(dir) = std::env::var_os("BIFROST_SETTINGS_SHOTS") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    for (lang, language) in [(Lang::En, "en"), (Lang::Ru, "ru")] {
-        for (theme, theme_name) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
-            for (width, height, layout) in [
-                (320.0, 900.0, "narrow"),
-                (760.0, 900.0, "wide"),
-                (320.0, 6000.0, "narrow-full"),
-                (760.0, 6000.0, "wide-full"),
-            ] {
-                for scene in [
-                    "unavailable",
-                    "ready",
-                    "pending",
-                    "source",
-                    "source-no-mic",
-                    "listener",
-                    "error",
-                ] {
-                    let vm = fixture(lang, theme, scene);
-                    let mut harness = egui_kittest::Harness::builder()
-                        .with_size(egui::vec2(width, height))
-                        .wgpu()
-                        .build_ui(move |ui| {
-                            if !ui
-                                .data_mut(|data| {
-                                    data.get_temp::<bool>(egui::Id::new("settings-fonts"))
-                                })
-                                .unwrap_or(false)
-                            {
-                                ui::install_fonts(ui.ctx());
-                                ui.data_mut(|data| {
-                                    data.insert_temp(egui::Id::new("settings-fonts"), true)
-                                });
-                            }
-                            ui::apply_theme(ui.ctx(), &Palette::of(theme));
-                            ui.set_style(ui.ctx().global_style());
-                            egui::Frame::NONE
-                                .fill(Palette::of(theme).bg)
-                                .show(ui, |ui| {
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            audio_settings::body(
-                                                ui,
-                                                &Palette::of(theme),
-                                                &vm,
-                                                &mut Vec::new(),
-                                            );
-                                        });
-                                });
-                        });
-                    harness.run_steps(3);
-                    harness
-                        .render()
-                        .unwrap()
-                        .save(dir.join(format!(
-                            "settings-{scene}-{language}-{theme_name}-{layout}.png"
-                        )))
-                        .unwrap();
-                }
-            }
-            for (width, height, layout) in [(320.0, 700.0, "narrow"), (1000.0, 900.0, "wide")] {
-                for scene in ["source", "listener"] {
-                    let mut vm = fixture(lang, theme, scene);
-                    vm.modal = Some(Modal::Audio);
-                    let now = std::time::Instant::now();
-                    let mut state = ui::UiState::new(now);
-                    let mut elapsed = 0.0;
-                    let mut harness = egui_kittest::Harness::builder()
-                        .with_size(egui::vec2(width, height))
-                        .wgpu()
-                        .build_ui(move |ui| {
-                            elapsed += 0.25;
-                            ui::draw(
-                                ui,
-                                &vm,
-                                &mut state,
-                                ui::Env {
-                                    now: now + std::time::Duration::from_secs_f64(elapsed),
-                                    animate: false,
-                                },
-                            );
-                        });
-                    harness.run_steps(5);
-                    harness
-                        .render()
-                        .unwrap()
-                        .save(dir.join(format!(
-                            "settings-modal-{scene}-{language}-{theme_name}-{layout}.png"
-                        )))
-                        .unwrap();
-                }
             }
         }
     }
@@ -584,6 +505,7 @@ fn ptt_is_held_and_releases_outside_the_button_without_optimistic_state() {
     ui::install_fonts(&ctx);
     let size = egui::vec2(760.0, 900.0);
     frame(&ctx, &vm, size, Vec::new());
+    open_details(&ctx, &vm, size, Lang::En);
     let (output, _) = frame(&ctx, &vm, size, Vec::new());
     let at = labels(&output)
         .iter()
@@ -703,7 +625,7 @@ fn listener_group_setup_is_primary_and_advanced_fields_are_collapsed() {
     }
     assert!(values
         .iter()
-        .any(|(s, _)| s == text(Lang::En, Key::AudioReceiveSystem)));
+        .any(|(s, _)| s == text(Lang::En, Key::AudioReceiveMode)));
     assert!(!values
         .iter()
         .any(|(s, _)| s == text(Lang::En, Key::AudioApply)));
@@ -746,14 +668,16 @@ fn details_reveal_raw_counters_without_exposing_ids_in_normal_flow() {
                 || s.contains(&"11".repeat(16))
                 || s.contains(text(lang, Key::AudioHealthCounters))
         }));
-        let at = values
-            .iter()
+        open_details(&ctx, &vm, size, lang);
+        let (output, actions) = frame(&ctx, &vm, size, Vec::new());
+        assert!(actions.is_empty());
+        let at = labels(&output)
+            .into_iter()
             .find(|(s, _)| s == text(lang, Key::AudioDetails))
             .unwrap()
             .1
             .center();
-        let (_, actions) = frame(&ctx, &vm, size, click(at));
-        assert!(actions.is_empty());
+        frame(&ctx, &vm, size, click(at));
         let (output, _) = frame(&ctx, &vm, size, Vec::new());
         assert!(labels(&output).iter().any(|(s, _)| {
             s.contains(text(lang, Key::AudioHealthCounters)) && s.contains("123")
@@ -771,6 +695,7 @@ fn disabled_ptt_hides_hold_and_hotkey_but_keeps_emergency_release() {
         ui::install_fonts(&ctx);
         let size = egui::vec2(760.0, 6000.0);
         frame(&ctx, &vm, size, Vec::new());
+        open_details(&ctx, &vm, size, Lang::En);
         let (output, _) = frame(&ctx, &vm, size, Vec::new());
         let values = labels(&output);
         for key in [Key::AudioPttPress, Key::AudioPttHotkey] {
@@ -956,6 +881,7 @@ fn passive_status_loss_and_reconnect_do_not_emit_global_release_or_a_fresh_press
     ui::install_fonts(&ctx);
     let size = egui::vec2(760.0, 900.0);
     frame(&ctx, &vm, size, Vec::new());
+    open_details(&ctx, &vm, size, Lang::En);
     let (output, _) = frame(&ctx, &vm, size, Vec::new());
     let at = labels(&output)
         .iter()
@@ -1050,6 +976,7 @@ fn native_ptt_arming_is_localized_and_never_disables_gui_hold() {
                 ui::install_fonts(&ctx);
                 let size = egui::vec2(760.0, 1200.0);
                 frame(&ctx, &vm, size, Vec::new());
+                open_details(&ctx, &vm, size, lang);
                 let (output, actions) = frame(&ctx, &vm, size, Vec::new());
                 assert!(actions.is_empty());
                 let labels = labels(&output);
@@ -1092,8 +1019,8 @@ fn native_ptt_arming_is_localized_and_never_disables_gui_hold() {
 #[test]
 fn source_and_receive_off_remain_actionable_during_pending_start_and_status_loss() {
     for (role, key) in [
-        (ipc::AudioRole::Source, Key::AudioShareSystem),
-        (ipc::AudioRole::Listener, Key::AudioReceiveSystem),
+        (ipc::AudioRole::Source, Key::AudioStopShare),
+        (ipc::AudioRole::Listener, Key::AudioStopReceive),
     ] {
         for available in [true, false] {
             let mut vm = fixture(Lang::Ru, Theme::Dark, "pending");
@@ -1101,14 +1028,12 @@ fn source_and_receive_off_remain_actionable_during_pending_start_and_status_loss
             vm.audio.system_intent = Some((role, true));
             let ctx = egui::Context::default();
             ui::install_fonts(&ctx);
+            ctx.enable_accesskit();
             let size = egui::vec2(320.0, 1600.0);
             frame(&ctx, &vm, size, Vec::new());
             let (output, _) = frame(&ctx, &vm, size, Vec::new());
-            let at = labels(&output)
-                .into_iter()
-                .find(|(s, _)| s == text(Lang::Ru, key))
-                .unwrap()
-                .1
+            let at = accessibility_bounds(&output, text(Lang::Ru, key))
+                .expect("urgent power control stays reachable")
                 .center();
             let (_, actions) = frame(&ctx, &vm, size, click(at));
             let expected = if role == ipc::AudioRole::Source {
@@ -1145,8 +1070,8 @@ fn task_first_status_and_switch_bounds_wrap_in_both_locales_at_effective_narrow_
                         );
                     }
                     for key in [
-                        Key::AudioShareSystem,
-                        Key::AudioReceiveSystem,
+                        Key::AudioShareMode,
+                        Key::AudioReceiveMode,
                         Key::AudioAdvanced,
                     ] {
                         assert!(values.iter().any(|(s, _)| s == text(lang, key)));
@@ -1166,8 +1091,10 @@ fn task_first_status_and_switch_bounds_wrap_in_both_locales_at_effective_narrow_
                         .expect("controls");
                     for (_, node) in &tree.nodes {
                         if [
-                            text(lang, Key::AudioShareSystem),
-                            text(lang, Key::AudioReceiveSystem),
+                            text(lang, Key::AudioStartShare),
+                            text(lang, Key::AudioStartReceive),
+                            text(lang, Key::AudioStopShare),
+                            text(lang, Key::AudioStopReceive),
                         ]
                         .contains(&node.label().unwrap_or_default())
                         {
@@ -1210,14 +1137,12 @@ fn queued_previous_failure_cannot_remove_new_switch_off_action_before_current_ac
     );
     let ctx = egui::Context::default();
     ui::install_fonts(&ctx);
+    ctx.enable_accesskit();
     let size = egui::vec2(320.0, 1600.0);
     frame(&ctx, &vm, size, Vec::new());
     let (output, _) = frame(&ctx, &vm, size, Vec::new());
-    let at = labels(&output)
-        .into_iter()
-        .find(|(s, _)| s == text(Lang::En, Key::AudioShareSystem))
-        .unwrap()
-        .1
+    let at = accessibility_bounds(&output, text(Lang::En, Key::AudioStopShare))
+        .expect("off stays reachable before the current ack")
         .center();
     let (_, actions) = frame(&ctx, &vm, size, click(at));
     assert_eq!(actions, [Action::Audio(AudioAction::Share(false))]);
@@ -1283,6 +1208,7 @@ fn main_audio_tasks_follow_current_role_without_duplicate_pending_or_error_instr
             }
             let ctx = egui::Context::default();
             ui::install_fonts(&ctx);
+            ctx.enable_accesskit();
             let size = egui::vec2(320.0, 1600.0);
             frame(&ctx, &vm, size, Vec::new());
             let (output, actions) = frame(&ctx, &vm, size, Vec::new());
@@ -1297,9 +1223,15 @@ fn main_audio_tasks_follow_current_role_without_duplicate_pending_or_error_instr
                     .top()
             };
             if scene == "listener" {
-                assert!(top(Key::AudioReceiveSystem) < top(Key::AudioListenerTarget));
+                assert!(values
+                    .iter()
+                    .any(|(s, _)| s == text(lang, Key::AudioReceiveMode)));
+                assert!(
+                    accessibility_bounds(&output, text(lang, Key::AudioStartReceive)).is_some()
+                );
             } else {
-                assert!(top(Key::AudioListenerTarget) < top(Key::AudioShareSystem));
+                assert!(top(Key::AudioShareMode) < top(Key::AudioListenerTarget));
+                assert!(top(Key::AudioListenerTarget) < power_rect(&output, lang).top());
             }
             if scene == "pending" {
                 assert!(values
@@ -1395,18 +1327,311 @@ fn receiver_picker_retargets_live_source_once_but_off_selection_is_draft_only() 
                 assert!(values
                     .iter()
                     .any(|(s, _)| s == text(lang, Key::AudioSwitchingReceiver)));
-                assert!(values.iter().any(
-                    |(s, _)| s.contains("LAPTOP") && s.contains(text(lang, Key::AudioSharing))
-                ));
-                assert!(!values
-                    .iter()
-                    .any(|(s, _)| s.contains("HTPC") && s.contains(text(lang, Key::AudioSharing))));
+                assert!(!values.iter().any(|(s, _)| {
+                    s.contains("HTPC") && s.contains(text(lang, Key::AudioSwitchingReceiver))
+                }));
             } else {
                 assert!(commands.is_empty());
                 assert!(!vm.audio.pending);
                 assert!(!vm.audio.sharing_requested(ipc::AudioRole::Source));
             }
             assert_eq!(vm.audio.draft.listener_node_id, b);
+        }
+    }
+}
+
+#[test]
+fn power_circle_is_one_hit_target_and_disabled_controls_send_nothing() {
+    for lang in [Lang::En, Lang::Ru] {
+        for (scene, on) in [("ready", false), ("source", true)] {
+            let mut vm = fixture(lang, Theme::Dark, scene);
+            vm.audio.draft.role = ipc::AudioRole::Source as i32;
+            vm.audio.status.as_mut().unwrap().role = ipc::AudioRole::Source as i32;
+            if on {
+                vm.audio.status.as_mut().unwrap().system_sharing_requested = Some(true);
+            }
+            let before = vm.audio.draft.clone();
+            let ctx = egui::Context::default();
+            ui::install_fonts(&ctx);
+            ctx.enable_accesskit();
+            let size = egui::vec2(428.0, 1600.0);
+            frame(&ctx, &vm, size, Vec::new());
+            let (output, _) = frame(&ctx, &vm, size, Vec::new());
+            let rect = power_rect(&output, lang);
+            assert!(
+                (rect.width() - 64.0).abs() < 1.0,
+                "{lang:?} {scene}: {rect:?}"
+            );
+            assert!(
+                (rect.height() - 64.0).abs() < 1.0,
+                "{lang:?} {scene}: {rect:?}"
+            );
+            let expected = if on {
+                AudioAction::Share(false)
+            } else {
+                AudioAction::Share(true)
+            };
+            for offset in [
+                egui::vec2(0.0, 0.0),
+                egui::vec2(-20.0, -20.0),
+                egui::vec2(20.0, -20.0),
+                egui::vec2(-20.0, 20.0),
+                egui::vec2(20.0, 20.0),
+            ] {
+                let at = rect.center() + offset;
+                assert!((at - rect.center()).length() < 32.0);
+                let (_, actions) = frame(&ctx, &vm, size, click(at));
+                assert_eq!(
+                    actions,
+                    [Action::Audio(expected.clone())],
+                    "{lang:?} {scene} {offset:?}"
+                );
+            }
+            assert_eq!(vm.audio.draft, before);
+        }
+
+        let mut vm = fixture(lang, Theme::Dark, "listener");
+        vm.connection = bifrost_gui::view_model::Connection::Disconnected { why: String::new() };
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let size = egui::vec2(428.0, 1600.0);
+        frame(&ctx, &vm, size, Vec::new());
+        let (output, _) = frame(&ctx, &vm, size, Vec::new());
+        let (_, actions) = frame(&ctx, &vm, size, click(power_rect(&output, lang).center()));
+        assert!(
+            actions.is_empty(),
+            "{lang:?}: disconnected control is inert"
+        );
+
+        let mut vm = fixture(lang, Theme::Dark, "ready");
+        vm.audio.draft.listener_node_id.clear();
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        frame(&ctx, &vm, size, Vec::new());
+        let (output, _) = frame(&ctx, &vm, size, Vec::new());
+        let (_, actions) = frame(&ctx, &vm, size, click(power_rect(&output, lang).center()));
+        assert!(
+            actions.is_empty(),
+            "{lang:?}: no receiver means no source activation"
+        );
+    }
+}
+
+#[test]
+fn power_control_keeps_heading_and_hint_beside_the_circle_without_clipping() {
+    for lang in [Lang::En, Lang::Ru] {
+        for theme in [Theme::Light, Theme::Dark] {
+            for width in [320.0, 428.0, 760.0] {
+                let vm = fixture(lang, theme, "listener");
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                ctx.enable_accesskit();
+                let size = egui::vec2(width, 1600.0);
+                frame(&ctx, &vm, size, Vec::new());
+                let (output, _) = frame(&ctx, &vm, size, Vec::new());
+                let power = power_rect(&output, lang);
+                let heading = accessibility_bounds(&output, text(lang, Key::AudioPowerReceiveOff))
+                    .expect("heading is an accessible caption");
+                let hint = accessibility_bounds(&output, text(lang, Key::AudioPowerHint))
+                    .expect("helper is readable text");
+                assert!((power.width() - 64.0).abs() < 1.0, "{lang:?} {width}");
+                assert!((power.height() - 64.0).abs() < 1.0, "{lang:?} {width}");
+                assert!(
+                    heading.left() >= power.right() + 8.0,
+                    "{lang:?} {width}: heading must start beside the circle: {heading:?} {power:?}"
+                );
+                assert!(
+                    hint.left() >= power.right() + 8.0,
+                    "{lang:?} {width}: hint must start beside the circle: {hint:?} {power:?}"
+                );
+                assert!(heading.right() <= width - 12.0, "{lang:?} {width}");
+                assert!(hint.right() <= width - 12.0, "{lang:?} {width}");
+                assert!(!power.intersects(heading));
+                assert!(!power.intersects(hint));
+                for (label, rect) in labels(&output) {
+                    assert!(
+                        !power.intersects(rect),
+                        "{lang:?} {width}: {label} overlaps the power target"
+                    );
+                }
+                let update = output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .expect("controls");
+                let action_labels = [
+                    Key::AudioStartReceive,
+                    Key::AudioStopReceive,
+                    Key::AudioStartShare,
+                    Key::AudioStopShare,
+                ]
+                .map(|key| text(lang, key));
+                let controls = update
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| {
+                        node.label()
+                            .is_some_and(|label| action_labels.contains(&label))
+                    })
+                    .count();
+                assert_eq!(controls, 1, "{lang:?} {width}: exactly one power target");
+            }
+        }
+    }
+}
+
+#[test]
+fn power_heading_is_policy_and_detail_is_the_existing_authoritative_state() {
+    for lang in [Lang::En, Lang::Ru] {
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let size = egui::vec2(428.0, 1600.0);
+
+        let vm = fixture(lang, Theme::Dark, "listener");
+        frame(&ctx, &vm, size, Vec::new());
+        let (output, _) = frame(&ctx, &vm, size, Vec::new());
+        let values = labels(&output);
+        assert!(values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioPowerReceiveOff)));
+        assert!(values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioPowerHint)));
+        assert!(!values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioIdle)));
+        assert!(!values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioStateRunning)));
+        assert!(
+            accessibility_bounds(&output, text(lang, Key::AudioPowerReceiveOff)).is_some(),
+            "state heading is a caption, not a tooltip"
+        );
+
+        let mut vm = fixture(lang, Theme::Dark, "listener");
+        vm.audio.pending = true;
+        vm.audio.system_intent = Some((ipc::AudioRole::Listener, true));
+        frame(&ctx, &vm, size, Vec::new());
+        let (output, _) = frame(&ctx, &vm, size, Vec::new());
+        let values = labels(&output);
+        assert!(values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioPowerReceiveOn)));
+        assert!(values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioReceivingReady)));
+        assert!(!values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioStateRunning)));
+
+        let mut vm = fixture(lang, Theme::Dark, "source");
+        vm.audio.draft.role = ipc::AudioRole::Source as i32;
+        vm.audio.status.as_mut().unwrap().role = ipc::AudioRole::Source as i32;
+        vm.audio.status.as_mut().unwrap().system_sharing_requested = Some(true);
+        frame(&ctx, &vm, size, Vec::new());
+        let (output, _) = frame(&ctx, &vm, size, Vec::new());
+        let values = labels(&output);
+        assert!(values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioPowerShareOn)));
+        assert!(
+            values.iter().any(|(label, _)| {
+                label.contains(text(lang, Key::AudioShareOn)) && label.contains("LAPTOP")
+            }),
+            "the detail is the existing running state, never invented"
+        );
+        assert!(!values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioStateRunning)));
+
+        let mut vm = fixture(lang, Theme::Dark, "error");
+        vm.audio.draft.role = ipc::AudioRole::Listener as i32;
+        vm.audio.status.as_mut().unwrap().role = ipc::AudioRole::Listener as i32;
+        vm.audio.status.as_mut().unwrap().system_sharing_requested = Some(false);
+        frame(&ctx, &vm, size, Vec::new());
+        let (output, _) = frame(&ctx, &vm, size, Vec::new());
+        let values = labels(&output);
+        assert!(values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioPowerReceiveOff)));
+        assert!(values
+            .iter()
+            .any(|(label, _)| label == text(lang, Key::AudioDeviceUnavailable)));
+    }
+}
+
+#[test]
+fn pending_power_off_sends_only_off_and_preserves_the_draft() {
+    for lang in [Lang::En, Lang::Ru] {
+        let mut vm = fixture(lang, Theme::Dark, "listener");
+        vm.audio.pending = true;
+        vm.audio.system_intent = Some((ipc::AudioRole::Listener, true));
+        let before = vm.audio.draft.clone();
+        let ctx = egui::Context::default();
+        ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        let size = egui::vec2(428.0, 1600.0);
+        frame(&ctx, &vm, size, Vec::new());
+        let (output, _) = frame(&ctx, &vm, size, Vec::new());
+        assert!(
+            accessibility_bounds(&output, text(lang, Key::AudioStopReceive)).is_some(),
+            "{lang:?}: urgent OFF stays reachable while pending"
+        );
+        let (_, actions) = frame(&ctx, &vm, size, click(power_rect(&output, lang).center()));
+        assert_eq!(actions, [Action::Audio(AudioAction::Receive(false))]);
+        assert_eq!(vm.audio.draft, before);
+        assert!(vm.audio.pending);
+    }
+}
+
+#[test]
+fn mode_selection_emits_one_draft_edit_only_when_editable_and_unlocked() {
+    for lang in [Lang::En, Lang::Ru] {
+        for width in [320.0, 760.0] {
+            for scene in [
+                "ready",
+                "unavailable",
+                "missing-status",
+                "pending",
+                "active",
+            ] {
+                let mut vm = fixture(lang, Theme::Dark, scene);
+                if scene == "missing-status" {
+                    vm.audio.status = None;
+                }
+                let before = vm.audio.draft.clone();
+                let ctx = egui::Context::default();
+                ui::install_fonts(&ctx);
+                ctx.enable_accesskit();
+                let size = egui::vec2(width, 1600.0);
+                frame(&ctx, &vm, size, Vec::new());
+                let (output, _) = frame(&ctx, &vm, size, Vec::new());
+                let at = labels(&output)
+                    .into_iter()
+                    .find(|(label, _)| label == text(lang, Key::AudioReceiveMode))
+                    .unwrap()
+                    .1
+                    .center();
+                let (clicked, actions) = frame(&ctx, &vm, size, click(at));
+                if scene == "ready" {
+                    let mut expected = before.clone();
+                    expected.role = ipc::AudioRole::Listener as i32;
+                    assert_eq!(
+                        actions,
+                        [Action::Audio(AudioAction::EditConfig(Box::new(expected)))]
+                    );
+                    assert!(
+                        accessibility_bounds(&clicked, text(lang, Key::AudioStartReceive))
+                            .is_some()
+                    );
+                } else {
+                    assert!(actions.is_empty());
+                }
+                assert_eq!(vm.audio.draft, before);
+            }
         }
     }
 }

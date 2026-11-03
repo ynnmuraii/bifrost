@@ -62,6 +62,290 @@ fn backend() -> DryBackend {
 }
 
 #[test]
+fn process_source_silence_covers_nondefault_outputs_and_preserves_capture_and_microphone() {
+    let mut backend = backend();
+    backend
+        .apply(ScriptEvent::UpsertDevice(device(
+            "other",
+            Direction::Render,
+        )))
+        .unwrap();
+    backend
+        .apply(ScriptEvent::SetMute {
+            device: id("other"),
+            muted: true,
+        })
+        .unwrap();
+    let original_revision = lock(&backend.state).devices[&id("other")].mute_revision;
+    let mut mic = backend.acquire_mute(&selection("mic")).unwrap();
+    let generation = mic.snapshot().unwrap().generation;
+    mic.set_capture_mute(generation, true).unwrap();
+    let samples = Arc::new(AtomicUsize::new(0));
+    let observed = samples.clone();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(move |block| {
+                observed.fetch_add(
+                    block
+                        .samples
+                        .iter()
+                        .filter(|sample| **sample != 0.0)
+                        .count(),
+                    Ordering::Relaxed,
+                );
+            }),
+        )
+        .unwrap();
+    assert_eq!(stream.device(), None);
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let admitted = hold.clone();
+    stream
+        .suppress_local_playback(Arc::new(move || admitted.load(Ordering::Acquire)))
+        .unwrap();
+    assert!(lock(&backend.state).devices[&id("speaker")].muted);
+    assert!(lock(&backend.state).devices[&id("other")].muted);
+    stream.pump(64).unwrap();
+    assert!(samples.load(Ordering::Acquire) > 0);
+    hold.store(false, Ordering::Release);
+    stream.pump(64).unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    assert!(lock(&backend.state).devices[&id("other")].muted);
+    assert_eq!(
+        lock(&backend.state).devices[&id("other")].mute_revision,
+        original_revision
+    );
+    assert!(mic.snapshot().unwrap().muted);
+    assert_eq!(
+        stream.suppress_local_playback(Arc::new(|| true)),
+        Err(BackendError::PermissionDenied)
+    );
+    stream.stop().unwrap();
+    assert!(mic.snapshot().unwrap().muted);
+}
+
+#[test]
+fn process_source_partial_acquire_cancellation_rolls_back_prior_output() {
+    let mut backend = backend();
+    backend
+        .apply(ScriptEvent::UpsertDevice(device(
+            "other",
+            Direction::Render,
+        )))
+        .unwrap();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    let state = backend.state.clone();
+    assert_eq!(
+        stream.suppress_local_playback(Arc::new(move || {
+            // Cancel after the first actual write, not after an implementation call count.
+            !lock(&state).devices[&id("other")].muted
+        })),
+        Err(BackendError::PermissionDenied)
+    );
+    let state = lock(&backend.state);
+    for name in ["other", "speaker"] {
+        let output = &state.devices[&id(name)];
+        assert!(!output.muted);
+        assert!(!output.leased);
+    }
+}
+
+#[test]
+fn process_source_scope_growth_stops_without_muting_new_output() {
+    let mut backend = backend();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    stream.suppress_local_playback(Arc::new(|| true)).unwrap();
+    let mut second = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    second.suppress_local_playback(Arc::new(|| true)).unwrap();
+    backend
+        .apply(ScriptEvent::UpsertDevice(device(
+            "new-output",
+            Direction::Render,
+        )))
+        .unwrap();
+    assert_eq!(stream.snapshot().status, StreamStatus::DeviceInvalidated);
+    assert_eq!(second.snapshot().status, StreamStatus::DeviceInvalidated);
+    assert_eq!(stream.pump(64), Err(BackendError::DeviceGone));
+    assert_eq!(second.pump(64), Err(BackendError::DeviceGone));
+    let mut joining = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    assert_eq!(
+        joining.suppress_local_playback(Arc::new(|| true)),
+        Err(BackendError::DeviceGone)
+    );
+    assert!(!lock(&backend.state).devices[&id("new-output")].muted);
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+}
+
+#[test]
+fn process_source_return_local_keeps_scope_pinned_without_late_restoration() {
+    let mut backend = backend();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    let hold = Arc::new(AtomicBool::new(true));
+    let admitted = hold.clone();
+    stream
+        .suppress_local_playback(Arc::new(move || admitted.load(Ordering::Acquire)))
+        .unwrap();
+    hold.store(false, Ordering::Release);
+    stream.pump(64).unwrap();
+    let revision = lock(&backend.state).devices[&id("speaker")].mute_revision;
+    backend
+        .apply(ScriptEvent::UpsertDevice(device(
+            "new-output",
+            Direction::Render,
+        )))
+        .unwrap();
+    assert_eq!(stream.snapshot().status, StreamStatus::DeviceInvalidated);
+    assert_eq!(stream.pump(64), Err(BackendError::DeviceGone));
+    stream.stop().unwrap();
+    assert!(!lock(&backend.state).devices[&id("new-output")].muted);
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    assert_eq!(
+        lock(&backend.state).devices[&id("speaker")].mute_revision,
+        revision
+    );
+}
+
+#[test]
+fn process_source_default_inside_scope_is_not_an_incarnation_change() {
+    let mut backend = backend();
+    backend
+        .apply(ScriptEvent::UpsertDevice(device(
+            "other",
+            Direction::Render,
+        )))
+        .unwrap();
+    let mut stream = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    stream.suppress_local_playback(Arc::new(|| true)).unwrap();
+    let mut defaults = backend.defaults().unwrap();
+    defaults.multimedia.render = Some(id("other"));
+    backend.apply(ScriptEvent::SetDefaults(defaults)).unwrap();
+    assert_eq!(stream.snapshot().status, StreamStatus::Running);
+    stream.pump(64).unwrap();
+    backend
+        .apply(ScriptEvent::RemoveDevice(id("speaker")))
+        .unwrap();
+    backend
+        .apply(ScriptEvent::UpsertDevice(device(
+            "speaker",
+            Direction::Render,
+        )))
+        .unwrap();
+    stream.stop().unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    assert!(!lock(&backend.state).devices[&id("other")].muted);
+}
+
+#[test]
+fn process_source_sessions_share_one_owner_until_last_stop_and_return_local_latches() {
+    let mut backend = backend();
+    let mut first = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    let captured = Arc::new(AtomicUsize::new(0));
+    let observed = captured.clone();
+    let mut second = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(move |block| {
+                observed.fetch_add(
+                    block
+                        .samples
+                        .iter()
+                        .filter(|sample| **sample != 0.0)
+                        .count(),
+                    Ordering::Relaxed,
+                );
+            }),
+        )
+        .unwrap();
+    first.suppress_local_playback(Arc::new(|| true)).unwrap();
+    let hold = Arc::new(AtomicBool::new(true));
+    let admitted = hold.clone();
+    second
+        .suppress_local_playback(Arc::new(move || admitted.load(Ordering::Acquire)))
+        .unwrap();
+    first.stop().unwrap();
+    assert!(lock(&backend.state).devices[&id("speaker")].muted);
+    assert!(lock(&backend.state).devices[&id("speaker")].leased);
+    second.pump(64).unwrap();
+    let before_return = captured.load(Ordering::Acquire);
+    assert!(
+        before_return > 0,
+        "remaining Source capture must still produce media"
+    );
+    hold.store(false, Ordering::Release);
+    second.pump(64).unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    assert!(captured.load(Ordering::Acquire) > before_return);
+    assert_eq!(second.snapshot().status, StreamStatus::Running);
+    hold.store(true, Ordering::Release);
+    second.pump(64).unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    assert_eq!(
+        second.suppress_local_playback(Arc::new(|| true)),
+        Err(BackendError::PermissionDenied)
+    );
+    let mut joining = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    assert_eq!(
+        joining.suppress_local_playback(Arc::new(|| true)),
+        Err(BackendError::Busy)
+    );
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+    joining.stop().unwrap();
+    second.stop().unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].leased);
+    let mut fresh = backend
+        .start_capture(
+            CaptureSpec::SystemExcludingOwnProcessTree { format: format() },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    fresh.suppress_local_playback(Arc::new(|| true)).unwrap();
+    assert!(lock(&backend.state).devices[&id("speaker")].muted);
+    fresh.stop().unwrap();
+    assert!(!lock(&backend.state).devices[&id("speaker")].muted);
+}
+
+#[test]
 fn source_volume_unmute_retains_hold_without_stopping_capture() {
     let mut backend = backend();
     let mut stream = backend

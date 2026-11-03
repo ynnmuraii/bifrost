@@ -339,6 +339,7 @@ fn convert(session: media::MediaSession) -> Result<MediaInfo, BackendError> {
             seek: seekable,
         },
     )?;
+    info.artwork = session.artwork;
     info.duration_ms = duration_ms;
     info.position_ms = position_ms;
     if seekable {
@@ -401,6 +402,7 @@ mod tests {
             app_id: String::new(),
             title: String::new(),
             artist: String::new(),
+            artwork: None,
             playback_status: 4,
             controls: media::Controls {
                 seek,
@@ -501,6 +503,7 @@ mod tests {
                 app_id: String::new(),
                 title: String::new(),
                 artist: String::new(),
+                artwork: None,
                 playback_status: native,
                 controls: media::Controls::default(),
                 timeline: media::Timeline {

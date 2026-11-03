@@ -14,6 +14,7 @@
 
 use std::fmt;
 
+pub mod artwork;
 pub mod dry;
 
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;
@@ -395,6 +396,7 @@ pub struct MediaInfo {
     pub seek_max_ms: Option<u64>,
     pub state: PlaybackState,
     pub commands: MediaCommands,
+    pub artwork: Option<artwork::Artwork>,
 }
 
 impl MediaInfo {
@@ -422,6 +424,7 @@ impl MediaInfo {
             seek_max_ms: None,
             state,
             commands,
+            artwork: None,
         })
     }
 

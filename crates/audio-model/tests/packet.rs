@@ -106,7 +106,6 @@ fn malformed_or_unsupported_header_fields_are_rejected() {
         (6, 128, PacketError::UnsupportedFlags(0x8000)),
         (7, 1, PacketError::UnsupportedFlags(1)),
         (27, 0, PacketError::UnsupportedKeyEpoch(0)),
-        (27, 2, PacketError::UnsupportedKeyEpoch(2)),
         (40, 0, PacketError::InvalidMediaFields),
         (42, 255, PacketError::PayloadTooLarge),
     ] {
@@ -117,6 +116,16 @@ fn malformed_or_unsupported_header_fields_are_rejected() {
 }
 
 #[test]
+fn nonzero_key_epochs_are_structural_and_installed_keys_remain_authoritative() {
+    for epoch in [1, 2, u32::MAX] {
+        let value = Header {
+            key_epoch: epoch,
+            ..header()
+        };
+        assert_eq!(Header::decode(&value.encode().unwrap()).unwrap(), value);
+    }
+}
+#[test]
 fn encode_enforces_the_same_field_rules_as_decode() {
     for value in [
         Header {
@@ -125,10 +134,6 @@ fn encode_enforces_the_same_field_rules_as_decode() {
         },
         Header {
             key_epoch: 0,
-            ..header()
-        },
-        Header {
-            key_epoch: 2,
             ..header()
         },
         Header {

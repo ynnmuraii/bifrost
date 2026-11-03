@@ -236,6 +236,8 @@ pub(crate) fn audio_capability(
     use protocol::wire::{audio_control::Body, Capability};
     match message.body {
         Some(Body::Focus(_) | Body::FocusRequest(_)) => Capability::AudioFocusReportV1,
+        Some(Body::Rekey(_)) => Capability::AudioRekeyV1,
+        Some(Body::Artwork(_) | Body::ArtworkRequest(_)) => Capability::MediaArtworkV1,
         Some(Body::MicControl(_) | Body::MicState(_) | Body::MicAck(_)) => Capability::MicControlV1,
         Some(Body::MediaInfo(_) | Body::MediaCommand(_) | Body::MediaAck(_)) => {
             Capability::MediaControlV1
@@ -244,6 +246,9 @@ pub(crate) fn audio_capability(
     }
 }
 
+fn has_artwork_id(message: &protocol::wire::AudioControl) -> bool {
+    matches!(&message.body, Some(protocol::wire::audio_control::Body::MediaInfo(info)) if !info.artwork_id.is_empty())
+}
 fn is_seek(message: &protocol::wire::AudioControl) -> bool {
     matches!(&message.body,
         Some(protocol::wire::audio_control::Body::MediaCommand(command))
@@ -282,6 +287,10 @@ struct QueueState {
     remote_media: bool,
     local_seek: bool,
     remote_seek: bool,
+    local_rekey: bool,
+    remote_rekey: bool,
+    local_artwork: bool,
+    remote_artwork: bool,
     urgent_run: u8,
     input_run: u8,
 }
@@ -293,11 +302,18 @@ impl QueueState {
             && !self.refusing
             && self.family_allowed(audio_capability(message))
             && (!is_seek(message) || self.local_seek && self.remote_seek)
+            && (!has_artwork_id(message) || self.local_artwork && self.remote_artwork)
     }
 
     fn family_allowed(&self, capability: protocol::wire::Capability) -> bool {
         use protocol::wire::Capability;
         match capability {
+            Capability::AudioRekeyV1 => {
+                self.local_audio && self.remote_audio && self.local_rekey && self.remote_rekey
+            }
+            Capability::MediaArtworkV1 => {
+                self.local_media && self.remote_media && self.local_artwork && self.remote_artwork
+            }
             Capability::MicControlV1 => self.local_mic && self.remote_mic,
             Capability::MediaControlV1 => self.local_media && self.remote_media,
             Capability::AudioFocusReportV1 => self.local_focus && self.remote_focus,
@@ -308,7 +324,20 @@ impl QueueState {
     fn purge_audio(&mut self) {
         let allowed = |message: &protocol::wire::AudioControl| {
             (!is_seek(message) || self.local_seek && self.remote_seek)
+                && (!has_artwork_id(message) || self.local_artwork && self.remote_artwork)
                 && match audio_capability(message) {
+                    protocol::wire::Capability::AudioRekeyV1 => {
+                        self.local_audio
+                            && self.remote_audio
+                            && self.local_rekey
+                            && self.remote_rekey
+                    }
+                    protocol::wire::Capability::MediaArtworkV1 => {
+                        self.local_media
+                            && self.remote_media
+                            && self.local_artwork
+                            && self.remote_artwork
+                    }
                     protocol::wire::Capability::MicControlV1 => self.local_mic && self.remote_mic,
                     protocol::wire::Capability::MediaControlV1 => {
                         self.local_media && self.remote_media
@@ -381,6 +410,10 @@ impl InputQueue {
                 remote_media: false,
                 local_seek: false,
                 remote_seek: false,
+                local_rekey: false,
+                remote_rekey: false,
+                local_artwork: false,
+                remote_artwork: false,
                 urgent_run: 0,
                 input_run: 0,
             }),
@@ -399,6 +432,10 @@ impl InputQueue {
         state.local_media =
             capabilities.contains(&(protocol::wire::Capability::MediaControlV1 as i32));
         state.local_seek = capabilities.contains(&(protocol::wire::Capability::MediaSeekV1 as i32));
+        state.local_rekey =
+            capabilities.contains(&(protocol::wire::Capability::AudioRekeyV1 as i32));
+        state.local_artwork =
+            capabilities.contains(&(protocol::wire::Capability::MediaArtworkV1 as i32));
         state.purge_audio();
     }
 
@@ -411,6 +448,8 @@ impl InputQueue {
             protocol::wire::Capability::MicControlV1 as i32,
             protocol::wire::Capability::MediaControlV1 as i32,
             protocol::wire::Capability::MediaSeekV1 as i32,
+            protocol::wire::Capability::AudioRekeyV1 as i32,
+            protocol::wire::Capability::MediaArtworkV1 as i32,
         ] {
             // A withdrawal admitted while this write was in flight wins immediately.
             if capabilities.contains(&cap)
@@ -425,6 +464,10 @@ impl InputQueue {
                     state.local_mic = true;
                 } else if cap == protocol::wire::Capability::MediaControlV1 as i32 {
                     state.local_media = true;
+                } else if cap == protocol::wire::Capability::MediaArtworkV1 as i32 {
+                    state.local_artwork = true;
+                } else if cap == protocol::wire::Capability::AudioRekeyV1 as i32 {
+                    state.local_rekey = true;
                 } else if cap == protocol::wire::Capability::MediaSeekV1 as i32 {
                     state.local_seek = true;
                 } else {
@@ -446,6 +489,10 @@ impl InputQueue {
             capabilities.contains(&(protocol::wire::Capability::MediaControlV1 as i32));
         state.remote_seek =
             capabilities.contains(&(protocol::wire::Capability::MediaSeekV1 as i32));
+        state.remote_rekey =
+            capabilities.contains(&(protocol::wire::Capability::AudioRekeyV1 as i32));
+        state.remote_artwork =
+            capabilities.contains(&(protocol::wire::Capability::MediaArtworkV1 as i32));
         state.purge_audio();
     }
 
@@ -826,6 +873,12 @@ impl InputQueue {
                 }
                 if !capabilities.contains(&(protocol::wire::Capability::MediaControlV1 as i32)) {
                     state.local_media = false;
+                }
+                if !capabilities.contains(&(protocol::wire::Capability::AudioRekeyV1 as i32)) {
+                    state.local_rekey = false;
+                }
+                if !capabilities.contains(&(protocol::wire::Capability::MediaArtworkV1 as i32)) {
+                    state.local_artwork = false;
                 }
                 if !capabilities.contains(&(protocol::wire::Capability::MediaSeekV1 as i32)) {
                     state.local_seek = false;
@@ -1499,6 +1552,56 @@ mod tests {
             queue.push(Outbound::CapabilitiesChanged(vec![])).unwrap();
             queue.local_capabilities_written(&caps);
             assert!(!queue.audio_allowed(&audio));
+        }
+    }
+    #[test]
+    fn rekey_and_thumbnail_require_bilateral_caps_and_withdrawal_fences_inflight_writes() {
+        for (cap, body) in [
+            (
+                wire::Capability::AudioRekeyV1,
+                wire::audio_control::Body::Rekey(wire::AudioRekey {
+                    session_id: vec![1; 16],
+                    epoch: 2,
+                    stage: 4,
+                    nonce: Vec::new(),
+                }),
+            ),
+            (
+                wire::Capability::MediaArtworkV1,
+                wire::audio_control::Body::ArtworkRequest(wire::MediaArtworkRequest {
+                    session_id: vec![1; 16],
+                    token: 2,
+                    artwork_id: vec![3; 32],
+                }),
+            ),
+        ] {
+            let queue = InputQueue::new(16);
+            let base = [
+                wire::Capability::AudioControlV1 as i32,
+                wire::Capability::MediaControlV1 as i32,
+            ];
+            let mut caps = base.to_vec();
+            caps.push(cap as i32);
+            let message = wire::AudioControl {
+                control_version: 1,
+                body: Some(body),
+            };
+            queue.ready(false);
+            queue.set_local_audio(&caps);
+            queue.set_remote_audio(&base);
+            assert!(!queue.audio_allowed(&message));
+            queue.set_remote_audio(&caps);
+            assert!(queue.audio_allowed(&message));
+            queue.push(Outbound::AudioControl(message.clone())).unwrap();
+            queue.set_remote_audio(&base);
+            assert!(!queue.audio_allowed(&message));
+            assert!(queue.pop().is_none());
+            queue.set_remote_audio(&caps);
+            queue
+                .push(Outbound::CapabilitiesChanged(base.to_vec()))
+                .unwrap();
+            queue.local_capabilities_written(&caps);
+            assert!(!queue.audio_allowed(&message));
         }
     }
     #[test]

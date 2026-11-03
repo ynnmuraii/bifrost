@@ -5,7 +5,10 @@
 
 use crate::*;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, MutexGuard, Weak,
+};
 
 pub const MAX_PUMP_FRAMES: usize = MAX_CAPTURE_BLOCK_FRAMES;
 pub const RENDER_SAMPLE_CAPACITY: usize = 4096;
@@ -84,6 +87,7 @@ struct State {
     now_ns: u64,
     ptt_expires_at_ns: Option<u64>,
     unavailable: Option<BackendError>,
+    process_source_silence: Option<Arc<Mutex<Weak<ProcessSilence>>>>,
 }
 
 impl State {
@@ -206,7 +210,7 @@ impl State {
     }
 }
 
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
@@ -237,11 +241,22 @@ impl DryBackend {
                 now_ns: 0,
                 ptt_expires_at_ns: None,
                 unavailable: None,
+                process_source_silence: None,
             })),
             capabilities,
         }
     }
 
+    /// Owned render fixture observation: (muted, leased, mute revision).
+    pub fn render_mute_state(&self, device: &DeviceId) -> Result<(bool, bool, u64), BackendError> {
+        let state = lock(&self.state);
+        let endpoint = state
+            .devices
+            .get(device)
+            .filter(|endpoint| endpoint.device.direction == Direction::Render)
+            .ok_or(BackendError::DeviceGone)?;
+        Ok((endpoint.muted, endpoint.leased, endpoint.mute_revision))
+    }
     /// Last executed command, not merely admitted request. Bounded scripted command sink.
     pub fn last_media_command(&self) -> Option<MediaCommandRequest> {
         lock(&self.state).last_media_command
@@ -815,6 +830,121 @@ enum Callback {
     Render(RenderCallback),
 }
 
+struct SourceAdmission {
+    admitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    active: AtomicBool,
+}
+impl SourceAdmission {
+    fn admitted(&self) -> bool {
+        if !self.active.load(Ordering::Acquire) {
+            return false;
+        }
+        if !(self.admitted)() {
+            self.active.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+}
+struct ProcessOwnership {
+    guards: Vec<DryMuteGuard>,
+    released: bool,
+    error: Option<BackendError>,
+}
+impl ProcessOwnership {
+    fn release(&mut self) {
+        self.released = true;
+        for guard in &mut self.guards {
+            // A different owner's revision never becomes our restoration authority.
+            let _ = guard.restore();
+        }
+    }
+}
+struct ProcessSilence {
+    state: Arc<Mutex<State>>,
+    ownership: Mutex<ProcessOwnership>,
+    admissions: Mutex<Vec<Weak<SourceAdmission>>>,
+}
+impl ProcessSilence {
+    fn admitted(&self) -> bool {
+        let mut admitted = false;
+        lock(&self.admissions).retain(|entry| {
+            if let Some(entry) = entry.upgrade() {
+                admitted |= entry.admitted();
+                true
+            } else {
+                false
+            }
+        });
+        admitted
+    }
+    fn status(&self) -> Result<(), BackendError> {
+        let ownership = lock(&self.ownership);
+        if let Some(error) = ownership.error {
+            return Err(error);
+        }
+        if !DryStream::process_scope_matches(&lock(&self.state), &ownership.guards) {
+            return Err(BackendError::DeviceGone);
+        }
+        Ok(())
+    }
+    fn pump(&self) -> Result<(), BackendError> {
+        let mut ownership = lock(&self.ownership);
+        if let Some(error) = ownership.error {
+            return Err(error);
+        }
+        if !DryStream::process_scope_matches(&lock(&self.state), &ownership.guards) {
+            ownership.error = Some(BackendError::DeviceGone);
+            ownership.release();
+            return Err(BackendError::DeviceGone);
+        }
+        if ownership.released {
+            return Ok(());
+        }
+        if !self.admitted() {
+            ownership.release();
+            return Ok(());
+        }
+        for guard in &mut ownership.guards {
+            if !self.admitted() {
+                ownership.release();
+                return Ok(());
+            }
+            let mut state = lock(&self.state);
+            let endpoint = state.endpoint(&guard.device, guard.generation)?;
+            if endpoint.mute_revision != guard.revision {
+                guard.owned = false;
+            }
+            let endpoint = state
+                .devices
+                .get_mut(&guard.device)
+                .ok_or(BackendError::DeviceGone)?;
+            if !endpoint.muted {
+                endpoint.mute_revision = endpoint
+                    .mute_revision
+                    .checked_add(1)
+                    .ok_or(BackendError::Busy)?;
+                endpoint.muted = true;
+                guard.owned = !guard.original;
+            }
+            guard.revision = endpoint.mute_revision;
+        }
+        Ok(())
+    }
+}
+struct ProcessSourceLease {
+    shared: Arc<ProcessSilence>,
+    admission: Arc<SourceAdmission>,
+}
+impl Drop for ProcessSourceLease {
+    fn drop(&mut self) {
+        self.admission.active.store(false, Ordering::Release);
+        if !self.shared.admitted() {
+            lock(&self.shared.ownership).release();
+        }
+    }
+}
+
 pub struct DryStream {
     state: Arc<Mutex<State>>,
     endpoint: Option<(DeviceId, u64)>,
@@ -823,6 +953,7 @@ pub struct DryStream {
     microphone: bool,
     monitor: bool,
     source_silence: Option<DryMuteGuard>,
+    process_source_silence: Option<ProcessSourceLease>,
     source_admitted: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     callback: Option<Callback>,
     buffer: Vec<f32>,
@@ -849,6 +980,7 @@ impl DryStream {
             microphone,
             monitor: false,
             source_silence: None,
+            process_source_silence: None,
             source_admitted: None,
             callback: Some(callback),
             buffer: vec![0.0; samples],
@@ -858,12 +990,144 @@ impl DryStream {
         }
     }
 
+    fn process_scope_matches(state: &State, guards: &[DryMuteGuard]) -> bool {
+        state
+            .devices
+            .values()
+            .filter(|endpoint| endpoint.device.direction == Direction::Render)
+            .map(|endpoint| (&endpoint.device.id, endpoint.generation))
+            .eq(guards.iter().map(|guard| (&guard.device, guard.generation)))
+    }
+
+    fn suppress_process_playback(
+        &mut self,
+        admitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), BackendError> {
+        if let Some(lease) = &self.process_source_silence {
+            if !lease.admission.admitted() || lock(&lease.shared.ownership).released {
+                return Err(BackendError::PermissionDenied);
+            }
+            return lease.shared.status();
+        }
+        if !admitted() {
+            return Err(BackendError::PermissionDenied);
+        }
+        let admission = Arc::new(SourceAdmission {
+            admitted: admitted.clone(),
+            active: AtomicBool::new(true),
+        });
+        let pool = lock(&self.state)
+            .process_source_silence
+            .get_or_insert_with(|| Arc::new(Mutex::new(Weak::new())))
+            .clone();
+        let mut pool = lock(&pool);
+        let existing = pool.upgrade();
+        if let Some(shared) = existing {
+            shared.pump()?;
+            if lock(&shared.ownership).released {
+                return Err(BackendError::Busy);
+            }
+            lock(&shared.admissions).push(Arc::downgrade(&admission));
+            self.process_source_silence = Some(ProcessSourceLease { shared, admission });
+            return Ok(());
+        }
+        let targets: Vec<_> = {
+            let state = lock(&self.state);
+            state.available()?;
+            state
+                .devices
+                .values()
+                .filter(|endpoint| endpoint.device.direction == Direction::Render)
+                .map(|endpoint| {
+                    (
+                        endpoint.device.id.clone(),
+                        endpoint.generation,
+                        endpoint.muted,
+                        endpoint.mute_revision,
+                    )
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            return Err(BackendError::DeviceGone);
+        }
+        let mut guards = Vec::with_capacity(targets.len());
+        for (device, generation, original, observed_revision) in targets {
+            // Caller code never runs under the Dry lock, including partial-acquire cancellation.
+            if !admitted() {
+                return Err(BackendError::PermissionDenied);
+            }
+            let mut state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Err(BackendError::Busy),
+            };
+            let endpoint = state.endpoint(&device, generation)?;
+            if endpoint.mute_revision != observed_revision || endpoint.muted != original {
+                return Err(BackendError::OwnershipLost);
+            }
+            if endpoint.leased {
+                return Err(BackendError::Busy);
+            }
+            let revision = if original {
+                observed_revision
+            } else {
+                observed_revision.checked_add(1).ok_or(BackendError::Busy)?
+            };
+            let endpoint = state
+                .devices
+                .get_mut(&device)
+                .ok_or(BackendError::DeviceGone)?;
+            endpoint.leased = true;
+            endpoint.muted = true;
+            endpoint.mute_revision = revision;
+            guards.push(DryMuteGuard {
+                state: self.state.clone(),
+                device,
+                generation,
+                original,
+                revision,
+                owned: !original,
+                active: true,
+            });
+        }
+        if !admitted() {
+            return Err(BackendError::PermissionDenied);
+        }
+        let same_scope = Self::process_scope_matches(&lock(&self.state), &guards);
+        if !same_scope {
+            return Err(BackendError::DeviceGone);
+        }
+        let shared = Arc::new(ProcessSilence {
+            state: self.state.clone(),
+            ownership: Mutex::new(ProcessOwnership {
+                guards,
+                released: false,
+                error: None,
+            }),
+            admissions: Mutex::new(vec![Arc::downgrade(&admission)]),
+        });
+        *pool = Arc::downgrade(&shared);
+        self.process_source_silence = Some(ProcessSourceLease { shared, admission });
+        Ok(())
+    }
+
+    fn release_process_playback(&mut self) {
+        self.process_source_silence.take();
+    }
+
     /// Advances 1..=MAX_PUMP_FRAMES actual frames, independent of chunk boundaries.
     /// Sample (frame, channel) is `((frame * channels + channel) % 256) / 128 - 1`.
     /// Muted microphone capture produces silence and advances its clock. Disappearance, profile
     /// replacement and server errors stop the stream and release its callback before returning.
     /// Both 480-frame/48 kHz and 441-frame/44.1 kHz native blocks fit the bounded scratch buffer.
     pub fn pump(&mut self, frames: usize) -> Result<(), BackendError> {
+        if let Some(lease) = &self.process_source_silence {
+            if let Err(error) = lease.shared.pump() {
+                self.status = stream_status(error);
+                return Err(error);
+            }
+        }
         if let Some(guard) = self.source_silence.as_mut() {
             if self
                 .source_admitted
@@ -981,6 +1245,20 @@ impl Stream for DryStream {
 
     fn snapshot(&self) -> StreamSnapshot {
         let status = if self.status == StreamStatus::Running {
+            if self
+                .process_source_silence
+                .as_ref()
+                .is_some_and(|lease| lease.shared.status().is_err())
+            {
+                return StreamSnapshot {
+                    status: StreamStatus::DeviceInvalidated,
+                    device_position: None,
+                    clock_frequency: None,
+                    host_time_100ns: None,
+                    underrun_frames: 0,
+                    dropped_capture_frames: 0,
+                };
+            }
             let state = lock(&self.state);
             match &self.endpoint {
                 Some((id, generation)) => state.endpoint(id, *generation).map(|_| ()),
@@ -1009,6 +1287,9 @@ impl Stream for DryStream {
     ) -> Result<(), BackendError> {
         if self.status != StreamStatus::Running {
             return Err(BackendError::Stopped);
+        }
+        if self.feedback == FeedbackGuarantee::OwnProcessTreeExcluded {
+            return self.suppress_process_playback(admitted);
         }
         if !self.monitor {
             return Err(BackendError::Unsupported);
@@ -1073,6 +1354,7 @@ impl Stream for DryStream {
     }
 
     fn stop(&mut self) -> Result<(), BackendError> {
+        self.release_process_playback();
         let restored = self.source_silence.take().map_or(Ok(()), |mut guard| {
             if let Ok(endpoint) = lock(&guard.state).endpoint(&guard.device, guard.generation) {
                 guard.revision = endpoint.mute_revision;

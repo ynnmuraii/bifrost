@@ -5314,9 +5314,9 @@ mod audio_focus_extraction_tests {
 
 #[cfg(any(feature = "audio", test))]
 fn merge_audio_capabilities(current: &mut Vec<i32>, audio: &[i32]) {
-    current.retain(|bit| !matches!(bit, 16 | 17 | 18 | 19 | 20 | 23 | 24));
+    current.retain(|bit| !matches!(bit, 16 | 17 | 18 | 19 | 20 | 23 | 24 | 25 | 26));
     for &bit in audio {
-        if matches!(bit, 16 | 17 | 18 | 19 | 20 | 23 | 24) && !current.contains(&bit) {
+        if matches!(bit, 16 | 17 | 18 | 19 | 20 | 23 | 24 | 25 | 26) && !current.contains(&bit) {
             current.push(bit);
         }
     }
@@ -5328,9 +5328,9 @@ mod audio_capability_tests {
 
     #[test]
     fn audio_publication_preserves_other_capabilities() {
-        let mut current = vec![1, 7, 16, 17, 18, 19, 20, 21, 23, 24];
-        merge_audio_capabilities(&mut current, &[16, 18, 19, 20, 23, 24, 20, 99]);
-        assert_eq!(current, vec![1, 7, 21, 16, 18, 19, 20, 23, 24]);
+        let mut current = vec![1, 7, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26];
+        merge_audio_capabilities(&mut current, &[16, 18, 19, 20, 23, 24, 25, 26, 20, 99]);
+        assert_eq!(current, vec![1, 7, 21, 16, 18, 19, 20, 23, 24, 25, 26]);
         merge_audio_capabilities(&mut current, &[]);
         assert_eq!(current, vec![1, 7, 21]);
     }

@@ -141,7 +141,7 @@ pub fn decode_format(format: &net::AudioFormat) -> Result<keys::Format> {
 macro_rules! reasons {
     ($($variant:ident),+) => {
         fn encode_stop_reason(reason: session_model::Reason) -> i32 {
-            match reason { $(session_model::Reason::$variant => net::AudioStopCode::$variant as i32,)+ }
+            match reason { $(session_model::Reason::$variant => net::AudioStopCode::$variant as i32,)+ session_model::Reason::KeyExpired => net::AudioStopCode::WorkerLost as i32 }
         }
         fn decode_stop_reason(reason: i32) -> Result<session_model::Reason> {
             match net::AudioStopCode::try_from(reason) {
@@ -319,7 +319,10 @@ pub fn decode_control(
             request_id: fixed(&r.request_id)?,
             reason: decode_stop_reason(r.reason)?,
         },
-        Body::Focus(_)
+        Body::ArtworkRequest(_)
+        | Body::Artwork(_)
+        | Body::Rekey(_)
+        | Body::Focus(_)
         | Body::FocusRequest(_)
         | Body::MicControl(_)
         | Body::MicState(_)
@@ -933,6 +936,7 @@ pub fn encode_status(
                         seek: m.commands.seek,
                     }),
                     revision: m.revision,
+                    artwork_id: m.artwork_id.map_or_else(Vec::new, |id| id.to_vec()),
                 }),
                 focus_primary: s.focus_primary,
                 kind: wire::AudioKind::System as i32,
@@ -1582,6 +1586,7 @@ mod tests {
                         ..Default::default()
                     },
                     revision: u64::MAX,
+                    artwork_id: None,
                 }),
                 focus_primary: true,
             }],

@@ -63,6 +63,86 @@ pub enum LinkStyle {
 /// Maximum number of locally hidden LAN identities remembered across restarts.
 pub const HIDDEN_DISCOVERED_LIMIT: usize = 64;
 
+/// The bounds of the player window in logical points, enforced when a file or a drag is read.
+pub const PLAYER_MIN_WIDTH: u16 = 320;
+/// The same, vertically: below this the transport cannot be drawn without overlap.
+pub const PLAYER_MIN_HEIGHT: u16 = 228;
+/// A fresh player: a compact utility card, not a desktop panel.
+pub const PLAYER_DEFAULT_WIDTH: u16 = 368;
+/// The same, tall enough for header, art, timeline, transport and one volume row.
+pub const PLAYER_DEFAULT_HEIGHT: u16 = 264;
+/// The largest a player may be dragged to; larger is a monitor, not a player.
+pub const PLAYER_MAX_WIDTH: u16 = 1600;
+/// The same, vertically.
+pub const PLAYER_MAX_HEIGHT: u16 = 1200;
+
+/// The remembered geometry of the popup player: its compact and expanded sizes, and which of
+/// the two the expand button last chose. A manual resize writes the active slot, so the
+/// toggle always returns to the size the user left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerGeometry {
+    /// Width and height in logical points of the compact player.
+    pub compact: [u16; 2],
+    /// The same for the expanded player.
+    pub expanded: [u16; 2],
+    /// The expand button's state: `true` shows the expanded size.
+    pub expanded_state: bool,
+}
+
+impl Default for PlayerGeometry {
+    fn default() -> Self {
+        PlayerGeometry {
+            compact: [PLAYER_DEFAULT_WIDTH, PLAYER_DEFAULT_HEIGHT],
+            expanded: [560, 680],
+            expanded_state: false,
+        }
+    }
+}
+
+impl PlayerGeometry {
+    /// The size of the state the expand button chose.
+    pub const fn active(&self) -> [u16; 2] {
+        if self.expanded_state {
+            self.expanded
+        } else {
+            self.compact
+        }
+    }
+
+    /// The slot a manual resize writes.
+    pub fn active_mut(&mut self) -> &mut [u16; 2] {
+        if self.expanded_state {
+            &mut self.expanded
+        } else {
+            &mut self.compact
+        }
+    }
+
+    /// The bounds every persisted size obeys, whether it came from a file or a drag.
+    pub fn clamp_size(size: [u16; 2]) -> [u16; 2] {
+        [
+            size[0].clamp(PLAYER_MIN_WIDTH, PLAYER_MAX_WIDTH),
+            size[1].clamp(PLAYER_MIN_HEIGHT, PLAYER_MAX_HEIGHT),
+        ]
+    }
+
+    /// Writes a size into the active slot through the same bounds a loaded file sees, so a
+    /// drag cannot persist a size the next start would silently change.
+    pub fn set_active(&mut self, size: [u16; 2]) {
+        *self.active_mut() = Self::clamp_size(size);
+    }
+
+    /// Keeps every remembered size inside the player's bounds; a hand-edited file cannot
+    /// shrink the window below its own controls.
+    pub fn clamp(&mut self) {
+        for size in [&mut self.compact, &mut self.expanded] {
+            size[0] = size[0].clamp(PLAYER_MIN_WIDTH, PLAYER_MAX_WIDTH);
+            size[1] = size[1].clamp(PLAYER_MIN_HEIGHT, PLAYER_MAX_HEIGHT);
+        }
+    }
+}
+
 /// Bounded canonical node IDs shared by cheap appearance snapshots.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HiddenDiscovered {
@@ -187,6 +267,8 @@ pub struct Look {
     pub skipped_update: Option<[u64; 3]>,
     /// Locally hidden unpaired LAN identities, never written to the core configuration.
     pub hidden_discovered: HiddenDiscovered,
+    /// The popup player's remembered sizes and expand state.
+    pub player: PlayerGeometry,
 }
 
 /// The furthest the map may be panned, in points.
@@ -243,6 +325,7 @@ impl Default for Look {
             check_updates: true,
             skipped_update: None,
             hidden_discovered: HiddenDiscovered::default(),
+            player: PlayerGeometry::default(),
         }
     }
 }
@@ -288,6 +371,8 @@ struct Stored {
     speed: Option<f32>,
     /// The pace, as a file written before the slider still says it.
     pace: Option<Pace>,
+    /// The player's geometry, absent in a file written before the player could be resized.
+    player: PlayerGeometry,
 }
 
 impl Default for Stored {
@@ -308,6 +393,7 @@ impl Default for Stored {
             hidden_discovered: HiddenDiscovered::default(),
             speed: None,
             pace: None,
+            player: PlayerGeometry::default(),
         }
     }
 }
@@ -332,6 +418,7 @@ impl From<Stored> for Look {
             check_updates: stored.check_updates,
             skipped_update: stored.skipped_update,
             hidden_discovered: stored.hidden_discovered,
+            player: stored.player,
         }
     }
 }
@@ -361,6 +448,7 @@ pub fn load(path: &Path) -> Look {
     look.speed = look.speed.clamp(SPEED_MIN, SPEED_MAX);
     look.pan_x = look.pan_x.clamp(-PAN_MAX, PAN_MAX);
     look.pan_y = look.pan_y.clamp(-PAN_MAX, PAN_MAX);
+    look.player.clamp();
     look
 }
 
@@ -417,6 +505,7 @@ mod tests {
             dock_open: false,
             check_updates: false,
             skipped_update: Some([0, 1, 4]),
+            player: PlayerGeometry::default(),
             hidden_discovered: {
                 let mut ids = HiddenDiscovered::default();
                 ids.insert(&"ab".repeat(32));
@@ -590,5 +679,36 @@ mod tests {
             let display = display as f32;
             assert!((zoom_display_percent(zoom_from_display(display)) - display).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn the_player_remembers_both_sizes_and_a_hand_edited_file_is_bounded() {
+        let mut geometry = PlayerGeometry::default();
+        assert_eq!(
+            geometry.active(),
+            [PLAYER_DEFAULT_WIDTH, PLAYER_DEFAULT_HEIGHT]
+        );
+        geometry.expanded_state = true;
+        assert_eq!(geometry.active(), geometry.expanded);
+        *geometry.active_mut() = [9999, 1];
+        geometry.clamp();
+        assert_eq!(
+            geometry.expanded,
+            [PLAYER_MAX_WIDTH, PLAYER_MIN_HEIGHT],
+            "a hand-edited file cannot shrink the window below its controls"
+        );
+        geometry.expanded_state = false;
+        geometry.set_active([9999, 1]);
+        assert_eq!(geometry.compact, [PLAYER_MAX_WIDTH, PLAYER_MIN_HEIGHT]);
+        *geometry.active_mut() = [10, 10];
+        geometry.clamp();
+        assert_eq!(geometry.compact, [PLAYER_MIN_WIDTH, PLAYER_MIN_HEIGHT]);
+
+        // A file written before the player existed has no `player` table: the defaults apply.
+        let look: Look = toml::from_str("theme = \"dark\"").expect("old file");
+        assert_eq!(look.player, PlayerGeometry::default());
+        // And a saved geometry reads back exactly, so the expand button returns to the last size.
+        let text = toml::to_string(&look).expect("write");
+        assert_eq!(toml::from_str::<Look>(&text).unwrap(), look);
     }
 }

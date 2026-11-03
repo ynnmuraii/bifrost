@@ -74,6 +74,10 @@ impl GuiApp {
         // The client thread repaints the window when — and only when — it has something to say.
         let ctx = cc.egui_ctx.clone();
         client.set_wake(move || ctx.request_repaint());
+        view.set_audio_art_wake(std::sync::Arc::new({
+            let ctx = cc.egui_ctx.clone();
+            move || ctx.request_repaint()
+        }));
         let look_file = view
             .config
             .paths
@@ -127,6 +131,9 @@ impl eframe::App for GuiApp {
             crate::audio::consume_navigation(self.bridge.view_mut(), false);
         }
         self.bridge.view_mut().tick(now);
+        if self.bridge.view_mut().drain_artwork() {
+            ui.ctx().request_repaint();
+        }
         self.updater.tick(&mut self.bridge, ui.ctx());
         let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
         if close_requested && self.bridge.view().audio.gui_ptt_held {
@@ -191,14 +198,19 @@ impl eframe::App for GuiApp {
             // Animate only when the viewport positively reports focus and is not minimized.
             animate: !minimized && focused == Some(true),
         };
-        let look = &self.bridge.view().look;
-        let (theme, lang) = (look.theme, look.language);
-        let audio_actions = ui::audio_player::viewport(
-            ui.ctx(),
-            &mut self.bridge.view_mut().audio_player,
-            theme,
-            lang,
-        );
+        let audio_actions = {
+            let view = self.bridge.view_mut();
+            let (theme, lang) = (view.look.theme, view.look.language);
+            let mode = view.audio.player_mode(view.connection.is_connected());
+            ui::audio_player::viewport(
+                ui.ctx(),
+                &mut view.audio_player,
+                &mut view.look.player,
+                theme,
+                lang,
+                mode,
+            )
+        };
         let audio_acted = !audio_actions.is_empty();
         for action in audio_actions {
             if matches!(action, crate::audio_player::AudioPlayerAction::OpenSettings) {

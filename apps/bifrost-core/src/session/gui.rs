@@ -642,6 +642,7 @@ impl Session {
                 | Msg::ListAudioDevices(_)
                 | Msg::SetAudioPeerGain(_)
                 | Msg::SendMediaCommand(_)
+                | Msg::GetAudioArtwork(_)
         );
         if audio_request {
             #[cfg(feature = "audio")]

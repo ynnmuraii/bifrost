@@ -6,7 +6,11 @@ use crate::{
     Error,
 };
 use audio_backend::*;
-use std::{cell::RefCell, sync::mpsc::TryRecvError, time::Instant};
+use std::{
+    cell::RefCell,
+    sync::{mpsc::TryRecvError, Arc},
+    time::Instant,
+};
 
 /// Control-thread adapter. Construction opens no native device, session, or window.
 /// Supply reserved KVM chords to `configure_ptt`; leases use absolute QPC-derived time.
@@ -18,6 +22,7 @@ pub struct WindowsBackend {
     ptt_binding: Option<HotkeyBinding>,
     pending_release: bool,
     media_turn: bool,
+    source_pool: Option<Arc<crate::source_silence::RenderLeasePool>>,
 }
 impl WindowsBackend {
     pub fn new() -> Result<Self, BackendError> {
@@ -36,6 +41,7 @@ impl WindowsBackend {
             ptt_binding: None,
             pending_release: false,
             media_turn: false,
+            source_pool: None,
         })
     }
     fn with_media<T>(
@@ -132,6 +138,8 @@ pub struct WindowsStream {
     native: StreamHandle,
     device: Option<DeviceId>,
     feedback: FeedbackGuarantee,
+    source_silence: Option<crate::source_silence::SourceRenderLease>,
+    source_pool: Option<Arc<crate::source_silence::RenderLeasePool>>,
 }
 impl WindowsStream {
     pub fn native_snapshot(&self) -> stream::StreamSnapshot {
@@ -149,17 +157,41 @@ impl Stream for WindowsStream {
         self.feedback
     }
     fn snapshot(&self) -> StreamSnapshot {
-        stream_snapshot(self.native.snapshot())
+        let mut snapshot = stream_snapshot(self.native.snapshot());
+        if snapshot.status == audio_backend::StreamStatus::Running {
+            if let Some(error) = self.source_silence.as_ref().and_then(|lease| lease.error()) {
+                snapshot.status = audio_backend::StreamStatus::Failed(error);
+            }
+        }
+        snapshot
     }
     fn suppress_local_playback(
         &mut self,
-        _admitted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+        admitted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(), BackendError> {
-        // Process-tree capture has no bound render endpoint; render muting is unqualified.
-        Err(BackendError::Unsupported)
+        if self.feedback != FeedbackGuarantee::OwnProcessTreeExcluded {
+            return Err(BackendError::Unsupported);
+        }
+        if self.native.snapshot().status != StreamStatus::Running {
+            return Err(BackendError::Stopped);
+        }
+        if let Some(lease) = &self.source_silence {
+            return lease.error().map_or(Ok(()), Err);
+        }
+        let pool = self
+            .source_pool
+            .as_deref()
+            .ok_or(BackendError::Unsupported)?;
+        self.source_silence = Some(crate::source_silence::SourceRenderLease::acquire(
+            pool, admitted,
+        )?);
+        Ok(())
     }
     fn stop(&mut self) -> Result<(), BackendError> {
         self.native.stop();
+        if let Some(mut lease) = self.source_silence.take() {
+            lease.stop();
+        }
         match self.native.snapshot().status {
             StreamStatus::Stopped => Ok(()),
             StreamStatus::DeviceInvalidated => Err(BackendError::DeviceGone),
@@ -248,6 +280,14 @@ impl Backend for WindowsBackend {
             native,
             device: None,
             feedback: FeedbackGuarantee::OwnProcessTreeExcluded,
+            source_silence: None,
+            source_pool: Some(
+                self.source_pool
+                    .get_or_insert_with(|| {
+                        Arc::new(crate::source_silence::RenderLeasePool::default())
+                    })
+                    .clone(),
+            ),
         })
     }
     fn start_render(
@@ -272,6 +312,8 @@ impl Backend for WindowsBackend {
             native,
             device: Some(id),
             feedback: FeedbackGuarantee::None,
+            source_silence: None,
+            source_pool: None,
         })
     }
     fn capture_mute(&self, selection: &DeviceSelection) -> Result<MuteSnapshot, BackendError> {

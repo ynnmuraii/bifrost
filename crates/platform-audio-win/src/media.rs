@@ -85,6 +85,7 @@ pub struct MediaSession {
     pub app_id: String,
     pub title: String,
     pub artist: String,
+    pub artwork: Option<audio_backend::artwork::Artwork>,
     /// Native SMTC playback status, including unknown future values.
     pub playback_status: i32,
     pub timeline: Timeline,
@@ -351,12 +352,41 @@ macro_rules! complete {
     }};
 }
 
+fn read_artwork(
+    properties: &GlobalSystemMediaTransportControlsSessionMediaProperties,
+    previous: Option<&audio_backend::artwork::Artwork>,
+) -> Result<Option<audio_backend::artwork::Artwork>, Error> {
+    use audio_backend::artwork::{normalize, MAX_NATIVE_BYTES};
+    use windows::Storage::Streams::{DataReader, InputStreamOptions};
+    let thumbnail = match properties.Thumbnail() {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let stream = complete!(thumbnail.OpenReadAsync());
+    let size = stream.Size()?;
+    if size == 0 || size > MAX_NATIVE_BYTES as u64 {
+        return Ok(None);
+    }
+    let input = stream.GetInputStreamAt(0)?;
+    let reader = DataReader::CreateDataReader(&input)?;
+    reader.SetInputStreamOptions(InputStreamOptions::None)?;
+    let loaded = complete!(reader.LoadAsync(size as u32));
+    if loaded != size as u32 {
+        return Ok(None);
+    }
+    let mut bytes = vec![0; loaded as usize];
+    reader.ReadBytes(&mut bytes)?;
+    Ok(normalize(&bytes, previous))
+}
+
 struct Entry {
     identity: IUnknown,
     session: Session,
     token: SessionToken,
     revision: Arc<AtomicU64>,
     metadata: Option<i64>,
+    artwork_dirty: Arc<AtomicBool>,
+    artwork: std::cell::RefCell<Option<audio_backend::artwork::Artwork>>,
     playback: Option<i64>,
     timeline: Option<i64>,
 }
@@ -462,14 +492,18 @@ impl State {
                     token,
                     revision: Arc::new(AtomicU64::new(1)),
                     metadata: None,
+                    artwork_dirty: Arc::new(AtomicBool::new(true)),
+                    artwork: std::cell::RefCell::new(None),
                     playback: None,
                     timeline: None,
                 };
                 let sink = self.sink.clone();
                 let revision = entry.revision.clone();
+                let artwork_dirty = entry.artwork_dirty.clone();
                 entry.metadata = Some(entry.session.MediaPropertiesChanged(
                     &TypedEventHandler::new(move |_, _| {
                         advance_revision(&revision);
+                        artwork_dirty.store(true, Ordering::Release);
                         sink.emit(MediaChange::Metadata(token));
                         Ok(())
                     }),
@@ -531,6 +565,12 @@ impl State {
             // Capture before reads: a concurrent native change invalidates this snapshot's revision.
             let revision = entry.revision.load(Ordering::Acquire);
             let metadata = complete!(entry.session.TryGetMediaPropertiesAsync());
+            if entry.artwork_dirty.swap(false, Ordering::AcqRel) {
+                let artwork = read_artwork(&metadata, entry.artwork.borrow().as_ref())
+                    .ok()
+                    .flatten();
+                *entry.artwork.borrow_mut() = artwork;
+            }
             let playback = entry.session.GetPlaybackInfo()?;
             let timeline = entry.session.GetTimelineProperties()?;
             sessions.push(MediaSession {
@@ -539,6 +579,7 @@ impl State {
                 app_id: bounded_utf8(&entry.session.SourceAppUserModelId()?, 128),
                 title: bounded_utf8(&metadata.Title()?, 256),
                 artist: bounded_utf8(&metadata.Artist()?, 256),
+                artwork: entry.artwork.borrow().clone(),
                 playback_status: playback.PlaybackStatus()?.0,
                 controls: controls(&entry.session)?,
                 timeline: Timeline {
@@ -789,6 +830,7 @@ mod tests {
             app_id: String::new(),
             title: String::new(),
             artist: String::new(),
+            artwork: None,
             playback_status,
             timeline: Timeline {
                 start: 0,
@@ -898,6 +940,7 @@ mod tests {
             app_id: "private-app".into(),
             title: "private-title".into(),
             artist: "private-artist".into(),
+            artwork: None,
             playback_status: 0,
             timeline: Timeline {
                 start: 0,

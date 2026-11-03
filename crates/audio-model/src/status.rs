@@ -231,6 +231,7 @@ pub struct MediaInfo {
     pub playback: PlaybackState,
     pub commands: MediaCommands,
     pub revision: u64,
+    pub artwork_id: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for MediaInfo {

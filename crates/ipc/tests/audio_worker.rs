@@ -493,6 +493,7 @@ fn media_info(token: u64) -> w::MediaInfo {
         token,
         revision: 1,
         app_id: "player".into(),
+        artwork_id: Vec::new(),
         title: "PRIVATE_TRACK_TITLE".into(),
         subtitle: "PRIVATE_TRACK_ARTIST".into(),
         position_ms: None,

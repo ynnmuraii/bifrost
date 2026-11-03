@@ -16,6 +16,8 @@ fn audio_tags_are_append_only_and_round_trip() {
         Msg::SetAudioPeerGain(wire::SetAudioPeerGain::default()),
         Msg::SendMediaCommand(wire::SendMediaCommand::default()),
         Msg::SetSystemAudioSharing(wire::SetSystemAudioSharing::default()),
+        Msg::GetAudioArtwork(wire::GetAudioArtwork::default()),
+        Msg::AudioArtwork(wire::AudioArtwork::default()),
     ];
     for (index, message) in messages.into_iter().enumerate() {
         let frame = wire::GuiFrame {
@@ -70,8 +72,8 @@ fn media_debug_is_redacted_in_nested_frames_and_presence_survives() {
 }
 #[test]
 fn unknown_future_oneof_is_absent_and_ipc_limit_stays_64k() {
-    // Field 73 remains unknown after the append-only sharing request at 72.
-    assert!(wire::GuiFrame::decode(&[0xca, 0x04, 0x00][..])
+    // Field 2047 is outside the allocated oneof range, including artwork at 73/74.
+    assert!(wire::GuiFrame::decode(&[0xfa, 0x7f, 0x00][..])
         .unwrap()
         .msg
         .is_none());

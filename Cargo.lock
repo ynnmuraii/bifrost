@@ -492,6 +492,10 @@ dependencies = [
 [[package]]
 name = "audio-backend"
 version = "0.5.0"
+dependencies = [
+ "image",
+ "ring",
+]
 
 [[package]]
 name = "audio-codec-algorithms"
@@ -646,6 +650,7 @@ dependencies = [
  "focus-router",
  "geometry",
  "identity",
+ "image",
  "input-model",
  "ipc",
  "logging",
@@ -661,6 +666,8 @@ dependencies = [
  "tracing-subscriber",
  "transport",
  "windows-sys 0.61.2",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -681,6 +688,7 @@ dependencies = [
  "eframe",
  "egui_kittest",
  "flate2",
+ "image",
  "ipc",
  "logging",
  "protocol",
@@ -2165,6 +2173,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3348,6 +3358,7 @@ version = "0.5.0"
 dependencies = [
  "audio-backend",
  "rtrb",
+ "tracing",
  "wasapi",
  "windows",
  "windows-core",

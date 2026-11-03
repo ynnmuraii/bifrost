@@ -1,5 +1,4 @@
 //! Pure IPC/view/render fixtures; no core, native audio, network or input.
-//! Optional offscreen PNGs go to the external BIFROST_PATH_SHOTS directory.
 mod support;
 
 use bifrost_gui::audio;
@@ -117,6 +116,16 @@ fn labels(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
 }
 
 fn frame(ctx: &egui::Context, vm: &ViewModel, width: f32, popup: bool) -> egui::FullOutput {
+    frame_with_events(ctx, vm, width, popup, Vec::new())
+}
+
+fn frame_with_events(
+    ctx: &egui::Context,
+    vm: &ViewModel,
+    width: f32,
+    popup: bool,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
     let palette = Palette::of(vm.look.theme);
     ui::apply_theme(ctx, &palette);
     let mut output = ctx.run_ui(
@@ -125,6 +134,8 @@ fn frame(ctx: &egui::Context, vm: &ViewModel, width: f32, popup: bool) -> egui::
                 egui::Pos2::ZERO,
                 egui::vec2(width, if popup { 600.0 } else { 6000.0 }),
             )),
+            events,
+            time: Some(ctx.input(|input| input.time) + 0.25),
             ..Default::default()
         },
         |ui| {
@@ -135,6 +146,8 @@ fn frame(ctx: &egui::Context, vm: &ViewModel, width: f32, popup: bool) -> egui::
                         &vm.audio_player.cards,
                         vm.look.theme,
                         vm.look.language,
+                        false,
+                        Default::default(),
                     )
                     .is_empty());
                 } else {
@@ -331,6 +344,43 @@ fn settings_and_popup_show_real_failed_path_in_both_languages_themes_and_widths(
                     ctx.enable_accesskit();
                     frame(&ctx, &vm, width, false);
                     let output = frame(&ctx, &vm, width, false);
+                    assert!(
+                        !labels(&output)
+                            .iter()
+                            .any(|(label, _)| label.contains(&observation.ports(lang, PEER))),
+                        "technical ports stay behind the explicit disclosure"
+                    );
+                    let at = labels(&output)
+                        .into_iter()
+                        .find(|(label, _)| label == text(lang, Key::AudioStateDetails))
+                        .unwrap()
+                        .1
+                        .center();
+                    frame_with_events(
+                        &ctx,
+                        &vm,
+                        width,
+                        false,
+                        vec![
+                            egui::Event::PointerMoved(at),
+                            egui::Event::PointerButton {
+                                pos: at,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: Default::default(),
+                            },
+                            egui::Event::PointerButton {
+                                pos: at,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                    for _ in 0..4 {
+                        frame(&ctx, &vm, width, false);
+                    }
+                    let output = frame(&ctx, &vm, width, false);
                     let values = labels(&output);
                     for expected in [
                         observation.reason(lang, PEER),
@@ -405,101 +455,6 @@ fn settings_and_popup_show_real_failed_path_in_both_languages_themes_and_widths(
 }
 
 #[test]
-fn optional_offscreen_failed_path_pngs() {
-    let Some(dir) = std::env::var_os("BIFROST_PATH_SHOTS") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    assert!(
-        dir.is_absolute(),
-        "BIFROST_PATH_SHOTS must be an absolute external directory"
-    );
-    let dir = std::path::absolute(dir).unwrap();
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .unwrap()
-        .canonicalize()
-        .unwrap();
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = dir.canonicalize().unwrap();
-    assert!(
-        !dir.starts_with(repo),
-        "screenshots must stay outside the repository"
-    );
-    for (lang, language) in [(Lang::En, "en"), (Lang::Ru, "ru")] {
-        for (theme, theme_name) in [(Theme::Light, "light"), (Theme::Dark, "dark")] {
-            for (width, layout) in [(320.0, "narrow"), (760.0, "wide")] {
-                for (role, role_name) in [
-                    (ipc::AudioRole::Source, "source"),
-                    (ipc::AudioRole::Listener, "listener"),
-                ] {
-                    let vm = fixture(lang, theme, snapshot(role, 1));
-                    let mut harness = egui_kittest::Harness::builder()
-                        .with_size(egui::vec2(width, 900.0))
-                        .wgpu()
-                        .build_ui(move |ui| {
-                            install_shot_style(ui, theme);
-                            egui::Frame::NONE
-                                .fill(Palette::of(theme).bg)
-                                .show(ui, |ui| {
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            audio_settings::body(
-                                                ui,
-                                                &Palette::of(theme),
-                                                &vm,
-                                                &mut Vec::new(),
-                                            );
-                                        });
-                                });
-                        });
-                    harness.run_steps(3);
-                    harness
-                        .render()
-                        .unwrap()
-                        .save(dir.join(format!(
-                            "path-settings-failed-{role_name}-{language}-{theme_name}-{layout}.png"
-                        )))
-                        .unwrap();
-                }
-            }
-            let vm = fixture(lang, theme, snapshot(ipc::AudioRole::Listener, 1));
-            let size = egui::vec2(320.0, audio_player::height(&vm.audio_player.cards));
-            let mut harness = egui_kittest::Harness::builder()
-                .with_size(size)
-                .wgpu()
-                .build_ui(move |ui| {
-                    install_shot_style(ui, theme);
-                    audio_player::draw(ui, &vm.audio_player.cards, theme, lang);
-                });
-            harness.run_steps(3);
-            harness
-                .render()
-                .unwrap()
-                .save(dir.join(format!(
-                    "path-popup-failed-listener-{language}-{theme_name}-320.png"
-                )))
-                .unwrap();
-        }
-    }
-}
-
-fn install_shot_style(ui: &mut egui::Ui, theme: Theme) {
-    let id = egui::Id::new("path-shot-fonts");
-    if !ui
-        .data_mut(|data| data.get_temp::<bool>(id))
-        .unwrap_or(false)
-    {
-        ui::install_fonts(ui.ctx());
-        ui.data_mut(|data| data.insert_temp(id, true));
-    }
-    ui::apply_theme(ui.ctx(), &Palette::of(theme));
-    ui.set_style(ui.ctx().global_style());
-}
-
-#[test]
 fn unknown_listener_port_does_not_hide_a_known_role_specific_rule() {
     let mut observation = AudioPathObservation {
         diagnostic: ipc::AudioPathDiagnostic::NoAuthenticatedPeerPackets,
@@ -530,48 +485,112 @@ fn unknown_listener_port_does_not_hide_a_known_role_specific_rule() {
 }
 
 #[test]
-fn settings_render_legacy_unknown_and_each_typed_reason_without_stale_identity() {
-    for lang in [Lang::En, Lang::Ru] {
-        for theme in [Theme::Light, Theme::Dark] {
-            for diagnostic in 0..=4 {
-                for degraded in [false, true] {
-                    let mut status = snapshot(ipc::AudioRole::Listener, diagnostic);
-                    if diagnostic == 0 {
-                        status.sessions[0].local_udp_port = 0;
-                        status.sessions[0].peer_udp_port = 0;
-                    }
-                    if degraded {
-                        status.sessions[0].state = ipc::AudioSessionState::Running as i32;
-                    }
-                    let observation = AudioPathObservation::from_wire(&status.sessions[0]);
-                    let vm = fixture(lang, theme, status);
-                    let ctx = egui::Context::default();
-                    ui::install_fonts(&ctx);
-                    frame(&ctx, &vm, 320.0, false);
-                    let output = frame(&ctx, &vm, 320.0, false);
-                    let values = labels(&output);
-                    assert!(!values
-                        .iter()
-                        .any(|(s, _)| s.contains(STALE_NAME) || s.contains(support::PEER_NODE)));
-                    if let Some(observation) = observation {
-                        assert!(values
-                            .iter()
-                            .any(|(s, _)| s.contains(&observation.reason(lang, PEER))));
-                        assert!(values
-                            .iter()
-                            .any(|(s, _)| s.contains(&observation.ports(lang, PEER))));
-                    }
-                    let guidance = fill_named(
-                        lang,
-                        Key::AudioPathFirewall,
-                        &[("port", &"47903"), ("listener", &LOCAL), ("source", &PEER)],
-                    );
-                    assert_eq!(
-                        values.iter().any(|(s, _)| s.contains(&guidance)),
-                        diagnostic != 0
-                    );
-                }
-            }
+fn details_disclosure_updates_legacy_ports_without_exposing_stale_identity() {
+    let mut legacy = snapshot(ipc::AudioRole::Listener, 0);
+    legacy.sessions[0].local_udp_port = 0;
+    legacy.sessions[0].peer_udp_port = 0;
+    let mut vm = fixture(Lang::En, Theme::Dark, legacy);
+    let before_draft = vm.audio.draft.clone();
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    ctx.enable_accesskit();
+    let has_supplied_ports = |output: &egui::FullOutput| {
+        labels(output)
+            .iter()
+            .any(|(label, _)| label.contains("47903") || label.contains("61000"))
+    };
+    let toggle_details = |vm: &ViewModel| {
+        let output = frame(&ctx, vm, 320.0, false);
+        let at = labels(&output)
+            .into_iter()
+            .find(|(label, _)| label == text(Lang::En, Key::AudioStateDetails))
+            .expect("reachable diagnostic disclosure")
+            .1
+            .center();
+        frame_with_events(
+            &ctx,
+            vm,
+            320.0,
+            false,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        for _ in 0..4 {
+            frame(&ctx, vm, 320.0, false);
+        }
+        frame(&ctx, vm, 320.0, false)
+    };
+    frame(&ctx, &vm, 320.0, false);
+    let collapsed = frame(&ctx, &vm, 320.0, false);
+    assert!(!has_supplied_ports(&collapsed));
+    let unknown = toggle_details(&vm);
+    assert!(
+        !has_supplied_ports(&unknown),
+        "legacy zero ports cannot invent a firewall port"
+    );
+    assert!(labels(&unknown)
+        .iter()
+        .any(|(label, _)| label.contains(PEER)));
+
+    let mut current = snapshot(ipc::AudioRole::Listener, 1);
+    current.revision = 9;
+    vm.apply(support::event(Msg::AudioStatus(current.clone())));
+    let output = frame(&ctx, &vm, 320.0, false);
+    let values = labels(&output);
+    for supplied_port in ["47903", "61000"] {
+        assert!(
+            values
+                .iter()
+                .any(|(label, _)| label.contains(supplied_port)),
+            "an open disclosure updates when actual port evidence arrives"
+        );
+    }
+    assert!(values.iter().any(|(label, _)| label.contains(PEER)));
+    let client = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 6000.0));
+    for (label, rect) in &values {
+        assert!(
+            !label.contains(STALE_NAME)
+                && !label.contains(support::PEER_NODE)
+                && !label.contains(support::SELF_NODE)
+        );
+        assert!(
+            client.contains_rect(*rect),
+            "diagnostics stay in the narrow client: {rect:?}"
+        );
+    }
+    let tree = output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .expect("expanded diagnostics remain accessible");
+    for (_, node) in &tree.nodes {
+        for label in node.label().into_iter().chain(node.value()) {
+            assert!(
+                !label.contains(STALE_NAME)
+                    && !label.contains(support::PEER_NODE)
+                    && !label.contains(support::SELF_NODE)
+            );
         }
     }
+    let collapsed_again = toggle_details(&vm);
+    assert!(
+        !has_supplied_ports(&collapsed_again),
+        "closing Details hides technical port data"
+    );
+    assert_eq!(vm.audio.draft, before_draft);
+    assert_eq!(vm.audio.status.as_ref(), Some(&current));
+    assert!(vm.take_outgoing().is_empty(), "disclosure never issues IPC");
 }

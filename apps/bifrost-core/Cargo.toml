@@ -25,6 +25,8 @@ bifrost-desktop = { path = "../bifrost-desktop" }
 platform-probe = { path = "../../crates/platform-probe" }
 protocol = { path = "../../crates/protocol" }
 ring = "0.17"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
 # `portal-restore.toml` is a small TOML document owned by core (serde + toml are
 # already in the tree through `config`, so this adds no new crates).
 serde = { version = "1", features = ["derive"] }
@@ -46,6 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 transport = { path = "../../crates/transport" }
 
 [dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]

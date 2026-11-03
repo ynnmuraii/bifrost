@@ -213,12 +213,12 @@ pub enum Kind {
     Link,
 }
 
-fn brighten(c: Color32, by: f32) -> Color32 {
+pub(super) fn brighten(c: Color32, by: f32) -> Color32 {
     let f = |v: u8| (f32::from(v) * by).min(255.0).round() as u8;
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }
 
-fn dim(c: Color32) -> Color32 {
+pub(super) fn dim(c: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (f32::from(c.a()) * 0.45) as u8)
 }
 
@@ -656,25 +656,19 @@ pub enum Icon {
 enum Prim {
     Rect(f32, f32, f32, f32, f32),
     Line(&'static [(f32, f32)]),
+    /// A circular arc: centre, radius, start and end in degrees, clockwise in screen space.
+    Arc(f32, f32, f32, f32, f32),
 }
 
 fn prims(icon: Icon) -> &'static [Prim] {
-    use Prim::{Line, Rect as R};
+    use Prim::{Arc, Line, Rect as R};
     match icon {
+        // A headband that is one continuous arch, not a faceted loop, and two ear cups that
+        // straddle where the arch ends. 22 grid, inset 3, one stroke weight.
         Icon::Headphones => &[
-            Line(&[
-                (4.0, 14.0),
-                (4.0, 10.0),
-                (5.0, 6.5),
-                (8.0, 4.0),
-                (11.0, 3.5),
-                (14.0, 4.0),
-                (17.0, 6.5),
-                (18.0, 10.0),
-                (18.0, 14.0),
-            ]),
-            R(2.75, 11.0, 4.5, 7.0, 2.0),
-            R(14.75, 11.0, 4.5, 7.0, 2.0),
+            Arc(11.0, 11.5, 6.0, 180.0, 360.0),
+            R(3.2, 10.3, 3.6, 7.2, 1.8),
+            R(15.2, 10.3, 3.6, 7.2, 1.8),
         ],
         Icon::Audio => &[
             Line(&[
@@ -771,7 +765,7 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, c: Pos2, size: f32, color
     let s = size / view;
     let origin = Pos2::new(c.x - size / 2.0, c.y - size / 2.0);
     let at = |x: f32, y: f32| Pos2::new(origin.x + x * s, origin.y + y * s);
-    let stroke = Stroke::new(1.5, color);
+    let stroke = Stroke::new(if icon == Icon::Headphones { 1.7 } else { 1.5 }, color);
     for prim in prims(icon) {
         match prim {
             Prim::Rect(x, y, w, h, r) => {
@@ -787,6 +781,18 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, c: Pos2, size: f32, color
             }
             Prim::Line(points) => {
                 let pts: Vec<Pos2> = points.iter().map(|(x, y)| at(*x, *y)).collect();
+                painter.add(Shape::line(pts, stroke));
+            }
+            Prim::Arc(cx, cy, radius, from, to) => {
+                // One point per two degrees: at the 20 pt rail size that is under a pixel of
+                // chord error, and the arc stays a vector curve rather than a visible polygon.
+                let steps = ((to - from).abs() / 2.0).ceil().max(1.0) as usize;
+                let pts: Vec<Pos2> = (0..=steps)
+                    .map(|i| {
+                        let a = (from + (to - from) * i as f32 / steps as f32).to_radians();
+                        at(cx + radius * a.cos(), cy + radius * a.sin())
+                    })
+                    .collect();
                 painter.add(Shape::line(pts, stroke));
             }
         }

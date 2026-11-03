@@ -88,6 +88,7 @@ mod local {
     mod m5;
     mod m6;
     mod privacy;
+    mod rotation;
     mod scripted;
     use super::*;
     use ipc::{

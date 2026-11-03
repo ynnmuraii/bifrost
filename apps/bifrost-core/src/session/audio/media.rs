@@ -87,7 +87,7 @@ impl Actor {
                 .get(&peer)
                 .is_some_and(|p| p.media_seek_support)
     }
-    fn media_scope(&self, peer: NodeId) -> Option<Scope> {
+    pub(super) fn media_scope(&self, peer: NodeId) -> Option<Scope> {
         self.media_candidate_scope(peer)
             .filter(|scope| scope.live())
     }
@@ -117,6 +117,16 @@ impl Actor {
         };
         candidate_scope(scope).then_some(scope)
     }
+    pub(super) fn media_artwork_identity(&self, peer: NodeId) -> Option<(u64, u64, [u8; 32])> {
+        let scope = self.media_scope(peer)?;
+        let info = self
+            .media
+            .relays
+            .get(&peer)
+            .filter(|relay| relay.view() == Some(scope.view))?
+            .info()?;
+        Some((info.session_token, info.revision, info.artwork_id?))
+    }
     pub(super) fn media_info(&self, peer: NodeId) -> Option<model::MediaInfo> {
         let scope = self.media_scope(peer)?;
         let mut info = self
@@ -130,6 +140,9 @@ impl Actor {
             info.commands.seek = false;
             info.seek_min_ms = None;
             info.seek_max_ms = None;
+        }
+        if !self.artwork_available(peer, info.session_token, info.artwork_id) {
+            info.artwork_id = None;
         }
         Some(info)
     }
@@ -301,6 +314,9 @@ impl Actor {
                 }
                 let mut message =
                     encode_info(scope.view.session, *revision, info.as_ref(), allowed);
+                if !self.artwork_capable(peer) {
+                    message.artwork_id.clear();
+                }
                 if !self.media_seek_capable(peer) {
                     message.can_seek = Some(false);
                     message.seek_min_ms = None;
@@ -876,6 +892,7 @@ fn current_native(sessions: &worker::MediaSessions) -> Result<Option<model::Medi
         return Err(());
     }
     let info = model::MediaInfo {
+        artwork_id: native.artwork_id.as_slice().try_into().ok(),
         app_id: native.app_id.clone(),
         title: native.title.clone(),
         subtitle: native.subtitle.clone(),
@@ -941,6 +958,7 @@ fn encode_info(
         } as i32,
         commands: command_bits(info.commands),
         allow_control,
+        artwork_id: info.artwork_id.map_or_else(Vec::new, |id| id.to_vec()),
     }
 }
 fn decode_info(info: &net::MediaInfo) -> Result<Option<model::MediaInfo>, ()> {
@@ -951,6 +969,7 @@ fn decode_info(info: &net::MediaInfo) -> Result<Option<model::MediaInfo>, ()> {
         return Err(());
     }
     let value = model::MediaInfo {
+        artwork_id: info.artwork_id.as_slice().try_into().ok(),
         app_id: info.app.clone(),
         title: info.title.clone(),
         subtitle: info.subtitle.clone(),

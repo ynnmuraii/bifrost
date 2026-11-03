@@ -265,6 +265,16 @@ fn dry_backend() -> Result<DryBackend, BackendError> {
     media.duration_ms = Some(180_000);
     media.seek_min_ms = Some(0);
     media.seek_max_ms = Some(180_000);
+    // Encoded image belongs only to the explicit Dry fixture, never a native fallback.
+    media.artwork = audio_backend::artwork::normalize(
+        &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
+            8, 2, 0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 22, 73, 68, 65, 84, 120, 156, 99, 80, 241,
+            152, 224, 49, 65, 133, 97, 130, 138, 135, 202, 4, 15, 0, 27, 122, 3, 241, 244, 33, 109,
+            130, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ],
+        None,
+    );
     backend.apply(ScriptEvent::SetMedia {
         session: token,
         info: Some(media),

@@ -92,6 +92,8 @@ enum Capability {
   // Future: 21 mic-stream, 22 virtual-mic.
   CAPABILITY_MEDIA_CONTROL_V1 = 23;
   CAPABILITY_MEDIA_SEEK_V1 = 24;
+  CAPABILITY_AUDIO_REKEY_V1 = 25;
+  CAPABILITY_MEDIA_ARTWORK_V1 = 26;
 }
 
 enum SessionKind {
@@ -202,8 +204,14 @@ message AudioControl {
     AudioStartRequest start_request = 25; // Source asks Listener to create a normal Offer
     AudioStartRefusal start_refusal = 26; // request correlation, never a session stop
     MicControl mic_control = 27;
+    AudioRekey rekey = 28; // capability AUDIO_REKEY_V1 only
+    MediaArtworkChunk artwork = 29; // capability MEDIA_ARTWORK_V1 only
+    MediaArtworkRequest artwork_request = 30; // one request per current thumbnail identity
   }
 }
+// Listener-driven prepare/ready/commit; request permits Source counter exhaustion notification.
+// Nonce is present only for Prepare. Epoch identifies a fresh exporter context, never a counter reset.
+message AudioRekey { bytes session_id = 1; uint32 epoch = 2; uint32 stage = 3; bytes nonce = 4; }
 message AudioFocusSnapshot {
   bytes owner_node_id = 1; //32, authenticated current owner
   uint64 owner_serial = 2; //positive; revision namespace
@@ -435,7 +443,11 @@ message MediaInfo {
   optional bool can_seek = 13;
   optional uint64 seek_min_ms = 14;
   optional uint64 seek_max_ms = 15;
+  bytes artwork_id = 16; // Empty or SHA256; absent for peers without MEDIA_ARTWORK_V1.
 }
+// Bounded low-priority thumbnail only; no locations or generic transfer protocol.
+message MediaArtworkRequest { bytes session_id = 1; uint64 token = 2; bytes artwork_id = 3; }
+message MediaArtworkChunk { bytes session_id = 1; uint64 token = 2; uint64 revision = 3; bytes artwork_id = 4; uint32 total_bytes = 5; uint32 offset = 6; bytes data = 7; uint32 width = 8; uint32 height = 9; }
 message MediaCommand {
   bytes request_id = 1;
   bytes session_id = 2;

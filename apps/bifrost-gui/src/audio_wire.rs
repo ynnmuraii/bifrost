@@ -192,6 +192,13 @@ pub fn decode_status(status: &wire::AudioStatus) -> Result<model::AudioStatus> {
                             seek: commands.seek,
                         },
                         revision: m.revision,
+                        artwork_id: match m.artwork_id.as_slice() {
+                            [] => None,
+                            bytes => Some(
+                                <[u8; 32]>::try_from(bytes)
+                                    .map_err(|_| AudioError("invalid artwork id"))?,
+                            ),
+                        },
                     })
                 })
                 .transpose()?;
@@ -354,6 +361,7 @@ pub fn encode_status(
                     seek: m.commands.seek,
                 }),
                 revision: m.revision,
+                artwork_id: m.artwork_id.map_or_else(Vec::new, |id| id.to_vec()),
             }),
             focus_primary: s.focus_primary,
             path_diagnostic: encode_path_diagnostic(s.path_diagnostic),
@@ -514,6 +522,7 @@ mod tests {
                         next: true,
                         ..Default::default()
                     },
+                    artwork_id: None,
                 }),
                 focus_primary: true,
                 path_diagnostic: model::PathDiagnostic::None,

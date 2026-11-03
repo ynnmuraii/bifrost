@@ -305,6 +305,7 @@ impl<S: Stream + 'static> ListenerGroup<S> {
             receiver: receiver.clone(),
             sealer: keys.send,
             path: PathState::new(start)?,
+            rotation: Rotation::new(),
         };
         let mut inputs = lock(&self.inputs);
         let slot = inputs

@@ -31,64 +31,153 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
     let editable = audio.available && audio.status.is_some() && !audio.pending;
     let mut config = audio.draft.clone();
     let mut apply = false;
-    ui.spacing_mut().item_spacing.y = 10.0;
-    super::audio_summary::draw(ui, pal, vm, actions);
-    let listener_first = audio
-        .status
-        .as_ref()
-        .is_some_and(|status| status.role == AudioRole::Listener as i32);
-    if listener_first {
-        receive_control(ui, pal, vm, editable, actions);
-    }
-    ui.add_space(12.0);
-    let previous_target = config.listener_node_id.as_slice().try_into().ok();
-    ui.add_enabled_ui(editable, |ui| {
-        setting(ui, pal, text(lang, Key::AudioListenerTarget), |ui| {
-            peer_selector(ui, vm, "audio-listener", &mut config.listener_node_id);
-        });
-    });
-    if editable && audio.sharing_requested(AudioRole::Source) {
-        if let Ok(target) = config.listener_node_id.as_slice().try_into() {
-            if previous_target != Some(target) {
-                actions.push(Action::Audio(AudioAction::Retarget(target)));
-            }
+    ui.spacing_mut().item_spacing.y = 12.0;
+    let connected = vm.connection.is_connected();
+    let share = audio.sharing_requested(AudioRole::Source);
+    let receive = audio.sharing_requested(AudioRole::Listener);
+    let locked = share || receive || audio.pending || audio.system_intent.is_some();
+    let mut mode = if receive {
+        AudioRole::Listener
+    } else if share || config.role == AudioRole::Source as i32 {
+        AudioRole::Source
+    } else {
+        AudioRole::Listener
+    };
+
+    // One question: receive or share. The choice is local UI intent until the single control
+    // below sends the existing sharing command; while that command owns the route it stays
+    // locked, so the mode never claims a role the service has not accepted.
+    ui.add_enabled_ui(editable && !locked, |ui| {
+        let labels = [
+            text(lang, Key::AudioReceiveMode),
+            text(lang, Key::AudioShareMode),
+        ];
+        let selected = usize::from(mode == AudioRole::Source);
+        let mut pick = None;
+        if ui.available_width() >= 330.0 {
+            pick = widgets::seg(ui, pal, &labels, selected);
         } else {
-            config
-                .listener_node_id
-                .clone_from(&audio.draft.listener_node_id);
+            // A narrow dialog keeps both choices inside the surface: they wrap as plain pills
+            // instead of painting a segmented control wider than the dialog.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                for (index, label) in labels.iter().enumerate() {
+                    let kind = if index == selected {
+                        widgets::Kind::Solid
+                    } else {
+                        widgets::Kind::Plain
+                    };
+                    if widgets::button(ui, pal, label, kind, true).clicked() {
+                        pick = Some(index);
+                    }
+                }
+            });
+        }
+        if let Some(pick) = pick {
+            mode = if pick == 1 {
+                AudioRole::Source
+            } else {
+                AudioRole::Listener
+            };
+            config.role = mode as i32;
+        }
+    });
+    if locked {
+        widgets::hint(ui, pal, text(lang, Key::AudioModeLocked));
+    }
+
+    if mode == AudioRole::Source {
+        let previous_target = config.listener_node_id.as_slice().try_into().ok();
+        ui.add_enabled_ui(editable, |ui| {
+            setting(ui, pal, text(lang, Key::AudioListenerTarget), |ui| {
+                peer_selector(ui, vm, "audio-listener", &mut config.listener_node_id);
+            });
+        });
+        if config.listener_node_id.len() != 32 {
+            widgets::hint(ui, pal, text(lang, Key::AudioSelectReceiver));
+        }
+        if editable && share {
+            if let Ok(target) = config.listener_node_id.as_slice().try_into() {
+                if previous_target != Some(target) {
+                    actions.push(Action::Audio(AudioAction::Retarget(target)));
+                }
+            } else {
+                config
+                    .listener_node_id
+                    .clone_from(&audio.draft.listener_node_id);
+            }
         }
     }
-    let connected = vm.connection.is_connected();
-    let mut share = audio.sharing_requested(AudioRole::Source);
-    let can_share = if share {
+
+    let on = if mode == AudioRole::Source {
+        share
+    } else {
+        receive
+    };
+    let toggle = if mode == AudioRole::Source {
+        if on {
+            Key::AudioStopShare
+        } else {
+            Key::AudioStartShare
+        }
+    } else if on {
+        Key::AudioStopReceive
+    } else {
+        Key::AudioStartReceive
+    };
+    let can_toggle = if on {
         connected
     } else {
-        editable && config.listener_node_id.len() == 32
+        editable && connected && (mode != AudioRole::Source || config.listener_node_id.len() == 32)
     };
-    if ui
-        .add_enabled(
-            can_share,
-            egui::Checkbox::new(&mut share, text(lang, Key::AudioShareSystem)),
-        )
-        .changed()
-    {
-        actions.push(Action::Audio(AudioAction::Share(share)));
-    }
-    widgets::hint(
-        ui,
-        pal,
-        text(
-            lang,
-            if config.listener_node_id.len() == 32 {
-                Key::AudioShareHint
+    // One large control, then the same state in words. The button is the only hit target here;
+    // its accessible name is the action it sends, so Space/Enter and the screen reader agree.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        if power_button(ui, pal, on, can_toggle, text(lang, toggle)).clicked() {
+            actions.push(Action::Audio(if mode == AudioRole::Source {
+                AudioAction::Share(!on)
             } else {
-                Key::AudioSelectReceiver
-            },
-        ),
-    );
-    if !listener_first {
-        receive_control(ui, pal, vm, editable, actions);
-    }
+                AudioAction::Receive(!on)
+            }));
+        }
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                power_marker(ui, pal, on);
+                widgets::wrapped(
+                    ui,
+                    text(lang, power_heading(mode, on)),
+                    17.0,
+                    super::theme::fam::sans_semibold(),
+                    pal.ink,
+                );
+            });
+            widgets::wrapped(
+                ui,
+                text(lang, Key::AudioPowerHint),
+                12.0,
+                super::theme::fam::sans(),
+                pal.ink2,
+            );
+            // The heading states the requested policy; this line is the authoritative detail.
+            if let Some(state) = power_detail(vm, lang, mode, on) {
+                widgets::wrapped(ui, &state, 13.0, super::theme::fam::sans(), pal.ink);
+            }
+            if let Some(error) = audio.error_message(lang) {
+                widgets::wrapped(ui, error, 12.0, super::theme::fam::sans(), pal.accent_ink);
+            }
+        });
+    });
+
+    // Everything technical stays one level down: path reason, ports and counters are
+    // diagnostic material, not the settings' first sentence.
+    ui.collapsing(text(lang, Key::AudioStateDetails), |ui| {
+        ui.set_width(ui.available_width());
+        super::audio_summary::draw(ui, pal, vm, actions);
+    });
+
     ui.add_space(12.0);
     ui.collapsing(text(lang, Key::AudioAdvanced), |ui| {
         ui.add_enabled_ui(editable, |ui| {
@@ -228,30 +317,208 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
     }
 }
 
-fn receive_control(
+fn audio_state(vm: &ViewModel, lang: Lang, mode: AudioRole, on: bool) -> Option<String> {
+    let audio = &vm.audio;
+    if audio.retargeting {
+        return Some(text(lang, Key::AudioSwitchingReceiver).to_owned());
+    }
+    if let Some((role, enabled)) = audio.system_intent {
+        if !enabled {
+            return Some(text(lang, Key::AudioPending).to_owned());
+        }
+        return Some(
+            text(
+                lang,
+                if role == AudioRole::Source {
+                    Key::AudioSharingRequested
+                } else {
+                    Key::AudioReceivingReady
+                },
+            )
+            .to_owned(),
+        );
+    }
+    if audio.pending {
+        return Some(text(lang, Key::AudioPending).to_owned());
+    }
+    if !on {
+        return Some(text(lang, Key::AudioIdle).to_owned());
+    }
+    let status = audio.status.as_ref()?;
+    let running = status.sessions.iter().find(|session| {
+        session.local_role == mode as i32 && session.state == ipc::AudioSessionState::Running as i32
+    });
+    match running {
+        Some(session) => Some(format!(
+            "{} · {}",
+            text(
+                lang,
+                if mode == AudioRole::Source {
+                    Key::AudioShareOn
+                } else {
+                    Key::AudioReceiveOn
+                },
+            ),
+            super::audio_summary::peer_name(vm, &session.peer)
+        )),
+        None => Some(
+            text(
+                lang,
+                if mode == AudioRole::Source {
+                    Key::AudioSharingRequested
+                } else {
+                    Key::AudioReceivingReady
+                },
+            )
+            .to_owned(),
+        ),
+    }
+}
+
+/// The visible diameter of the settings power control and its one hit target.
+const POWER_BUTTON: f32 = 64.0;
+
+fn power_heading(mode: AudioRole, on: bool) -> Key {
+    match (mode, on) {
+        (AudioRole::Source, true) => Key::AudioPowerShareOn,
+        (AudioRole::Source, false) => Key::AudioPowerShareOff,
+        // The caller already resolves every non-Source role to Listener; Unspecified follows
+        // that same selection instead of inventing a third state.
+        (_, true) => Key::AudioPowerReceiveOn,
+        (_, false) => Key::AudioPowerReceiveOff,
+    }
+}
+
+fn power_detail(vm: &ViewModel, lang: Lang, mode: AudioRole, on: bool) -> Option<String> {
+    let audio = &vm.audio;
+    // Plain OFF is already the heading; the old "no sessions" sentence would only repeat it.
+    let quiet_off = !on && audio.system_intent.is_none() && !audio.pending && !audio.retargeting;
+    if quiet_off {
+        return None;
+    }
+    audio_state(vm, lang, mode, on)
+}
+
+fn power_marker(ui: &mut egui::Ui, pal: &Palette, on: bool) {
+    // A static mark, so the state is not carried by the accent colour alone.
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+    let centre = rect.center();
+    let painter = ui.painter();
+    if on {
+        painter.circle_filled(centre, 3.0, pal.accent);
+    } else {
+        painter.circle_stroke(centre, 2.75, egui::Stroke::new(1.5, pal.ink2));
+    }
+}
+
+fn power_arc(
+    centre: egui::Pos2,
+    radius: f32,
+    from: f32,
+    to: f32,
+    stroke: egui::Stroke,
+) -> egui::epaint::CubicBezierShape {
+    let point = |angle: f32| centre + egui::vec2(angle.cos(), angle.sin()) * radius;
+    let tangent = |angle: f32| egui::vec2(-angle.sin(), angle.cos()) * radius;
+    let start = point(from);
+    let end = point(to);
+    let bend = 4.0 / 3.0 * ((to - from) / 4.0).tan();
+    egui::epaint::CubicBezierShape::from_points_stroke(
+        [
+            start,
+            start + tangent(from) * bend,
+            end - tangent(to) * bend,
+            end,
+        ],
+        false,
+        egui::Color32::TRANSPARENT,
+        stroke,
+    )
+}
+
+fn paint_power_glyph(painter: &egui::Painter, centre: egui::Pos2, ink: egui::Color32) {
+    let stroke = egui::Stroke::new(1.8, ink);
+    let radius = 11.0;
+    // The two arcs meet at the bottom and leave a gap at the top for the stem. The stem and
+    // arc bounds are -12 and +12 from the shifted centre, so the glyph is optically centred.
+    let centre = centre + egui::vec2(0.0, 1.0);
+    let gap = 32.0_f32.to_radians();
+    let top = -std::f32::consts::FRAC_PI_2;
+    let bottom = std::f32::consts::FRAC_PI_2;
+    let left = 3.0 * std::f32::consts::FRAC_PI_2;
+    painter.add(power_arc(centre, radius, top + gap, bottom, stroke));
+    painter.add(power_arc(centre, radius, bottom, left - gap, stroke));
+    painter.line_segment(
+        [
+            centre + egui::vec2(0.0, -radius - 2.0),
+            centre + egui::vec2(0.0, -radius * 0.25),
+        ],
+        stroke,
+    );
+}
+
+fn power_button(
     ui: &mut egui::Ui,
     pal: &Palette,
-    vm: &ViewModel,
-    editable: bool,
-    actions: &mut Vec<Action>,
-) {
-    ui.add_space(12.0);
-    let lang = vm.look.language;
-    let mut receive = vm.audio.sharing_requested(AudioRole::Listener);
-    if ui
-        .add_enabled(
-            if receive {
-                vm.connection.is_connected()
-            } else {
-                editable
-            },
-            egui::Checkbox::new(&mut receive, text(lang, Key::AudioReceiveSystem)),
+    on: bool,
+    enabled: bool,
+    label: &str,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(POWER_BUTTON), sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            enabled && ui.is_enabled(),
+            on,
+            label,
         )
-        .changed()
-    {
-        actions.push(Action::Audio(AudioAction::Receive(receive)));
+    });
+    if enabled {
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
     }
-    widgets::hint(ui, pal, text(lang, Key::AudioReceiveHint));
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let hover = enabled && response.hovered();
+    let down = enabled && response.is_pointer_button_down_on();
+    let (mut fill, mut border, mut ink) = if on {
+        (pal.accent, pal.accent, pal.on_accent)
+    } else {
+        (pal.bg2, pal.line, pal.ink)
+    };
+    if hover {
+        if on {
+            fill = widgets::brighten(fill, 1.08);
+            border = fill;
+        } else {
+            fill = pal.ink;
+            border = pal.ink;
+            ink = pal.bg;
+        }
+    }
+    if down {
+        fill = widgets::brighten(fill, 0.94);
+    }
+    if !enabled {
+        (fill, border, ink) = (widgets::dim(fill), widgets::dim(border), widgets::dim(ink));
+    }
+    let centre = rect.center();
+    let radius = POWER_BUTTON * 0.5;
+    let painter = ui.painter();
+    painter.circle_filled(centre, radius, fill);
+    painter.circle_stroke(centre, radius - 0.5, egui::Stroke::new(1.0, border));
+    if response.has_focus() {
+        painter.circle_stroke(centre, radius + 3.0, egui::Stroke::new(2.0, pal.accent));
+    }
+    paint_power_glyph(painter, centre, ink);
+    response
 }
 
 fn primary_action(ui: &mut egui::Ui, pal: &Palette, label: &str, enabled: bool) -> egui::Response {

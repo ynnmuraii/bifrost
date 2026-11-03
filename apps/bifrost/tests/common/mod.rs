@@ -1878,6 +1878,19 @@ impl Unpaired {
         let [a_port, b_port, a_clipboard_port, b_clipboard_port] = distinct_ports();
         write_config(&a_root, a_port, a_clipboard_port, "left", true, false);
         write_config(&b_root, b_port, b_clipboard_port, "right", true, false);
+        if no_input_events {
+            for root in [&a_root, &b_root] {
+                let path = root.join("config/config.toml");
+                let mut config =
+                    config::schema::Config::load(&path).expect("owned audio fixture config");
+                config.discovery.enabled = false;
+                config.discovery.advertise = false;
+                config.clipboard.enabled = false;
+                config
+                    .save(&path)
+                    .expect("isolated media-only fixture policy");
+            }
+        }
         let a_id = peers(&a_root);
         let b_id = peers(&b_root);
         let a = spawn_node(a_root, a_id.clone(), false, false, "a");

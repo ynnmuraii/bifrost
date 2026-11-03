@@ -187,6 +187,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AudioLink<S> {
                 attach.launch_token.zeroize();
                 token = Some(LaunchToken::new(bytes));
             }
+            w::audio_frame::Msg::RotateSession(rotation) if !rotation.activate => {
+                secrets = Some(SessionSecrets {
+                    forward: DirectionSecrets::from_wire(
+                        rotation.forward.take().ok_or_else(invalid)?,
+                    )?,
+                    reverse: DirectionSecrets::from_wire(
+                        rotation.reverse.take().ok_or_else(invalid)?,
+                    )?,
+                });
+            }
             w::audio_frame::Msg::StartSession(start) => {
                 secrets = Some(SessionSecrets {
                     forward: DirectionSecrets::from_wire(
@@ -260,6 +270,8 @@ fn is_core(message: &w::audio_frame::Msg) -> bool {
         w::audio_frame::Msg::Attach(_)
             | w::audio_frame::Msg::ListDevices(_)
             | w::audio_frame::Msg::StartSession(_)
+            | w::audio_frame::Msg::RotateSession(_)
+            | w::audio_frame::Msg::SetTestClock(_)
             | w::audio_frame::Msg::ReleaseSourceLocalSound(_)
             | w::audio_frame::Msg::StopSession(_)
             | w::audio_frame::Msg::RenewSession(_)
@@ -297,6 +309,8 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
         Msg::Attach(_)
             | Msg::ListDevices(_)
             | Msg::StartSession(_)
+            | Msg::RotateSession(_)
+            | Msg::SetTestClock(_)
             | Msg::StopSession(_)
             | Msg::RenewSession(_)
             | Msg::SetGain(_)
@@ -325,9 +339,11 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
             | Msg::Ping(_)
             | Msg::Pong(_)
             | Msg::SessionEvent(_)
+            | Msg::RotationEvent(_)
             | Msg::Health(_)
             | Msg::BackendEvent(_)
             | Msg::MediaSessions(_)
+            | Msg::MediaArtwork(_)
             | Msg::PttStatus(_)
     );
     if correlated && frame.request_id == 0 || pushed && frame.request_id != 0 {
@@ -415,6 +431,50 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 if material.key.len() != 32 || material.nonce_prefix.len() != 4 {
                     return Err(invalid());
                 }
+            }
+        }
+        Msg::SetTestClock(clock) => {
+            if !cfg!(debug_assertions) || clock.offset_ms > 7 * 24 * 60 * 60 * 1000 {
+                return Err(invalid());
+            }
+        }
+        Msg::RotateSession(rotation) => {
+            session_id(&rotation.session_id)?;
+            if rotation.epoch < 2 {
+                return Err(invalid());
+            }
+            if rotation.activate {
+                if rotation.forward.is_some() || rotation.reverse.is_some() {
+                    return Err(invalid());
+                }
+            } else {
+                for material in [&rotation.forward, &rotation.reverse] {
+                    let material = material.as_ref().ok_or_else(invalid)?;
+                    if material.key.len() != 32 || material.nonce_prefix.len() != 4 {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+        Msg::MediaArtwork(artwork) => {
+            if artwork.token == 0
+                || artwork.revision == 0
+                || artwork.artwork_id.len() != 32
+                || artwork.data.is_empty()
+                || artwork.data.len() > protocol::limits::MAX_AUDIO_ARTWORK_BYTES
+                || !(1..=192).contains(&artwork.width)
+                || !(1..=192).contains(&artwork.height)
+            {
+                return Err(invalid());
+            }
+        }
+        Msg::RotationEvent(event) => {
+            session_id(&event.session_id)?;
+            if event.epoch == 0
+                || !(1..=3).contains(&event.kind)
+                || event.kind != 1 && event.epoch < 2
+            {
+                return Err(invalid());
             }
         }
         Msg::StopSession(stop) => session_id(&stop.session_id)?,
@@ -652,7 +712,8 @@ pub fn validate_frame(frame: &w::AudioFrame) -> Result<(), IpcError> {
                 text(&session.app_id, 128, true)?;
                 text(&session.title, 256, true)?;
                 text(&session.subtitle, 256, true)?;
-                if session.token == 0
+                if !matches!(session.artwork_id.len(), 0 | 32)
+                    || session.token == 0
                     || session.revision == 0
                     || !matches!(session.state, 0..=3)
                     || session.commands & !31 != 0

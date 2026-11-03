@@ -73,6 +73,7 @@ pub mod devices;
 pub mod hotkey;
 pub mod media;
 pub mod render_config;
+mod source_silence;
 pub mod stream;
 
 /// Startup/control errors. Real-time failures are compact [`stream::StreamStatus`] values.

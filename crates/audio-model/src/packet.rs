@@ -8,7 +8,7 @@ pub const MAX_DATAGRAM_LEN: usize = 1200;
 pub const MAX_PAYLOAD_LEN: usize = MAX_DATAGRAM_LEN - HEADER_LEN - TAG_LEN;
 pub const MAGIC: [u8; 4] = *b"BFA1";
 pub const VERSION: u8 = 1;
-/// Exclusive per-direction counter limit: rotate by a new session before reaching it.
+/// Exclusive per-direction, per-key counter limit; rotate before reaching it.
 pub const PACKET_NUMBER_LIMIT: u64 = 1 << 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +39,8 @@ impl TryFrom<u8> for PacketKind {
 /// The 44-byte authenticated additional data, with implicit magic and version.
 ///
 /// Packet numbers start at zero at the sender and never wrap under a key.
-/// This number is the sole nonce counter input; the future media AEAD wrapper
-/// must own its monotonic counter and construct nonces, never accept caller nonces.
+/// The media AEAD owner constructs nonces from its monotonic per-key counter.
+/// Rekey-capable sessions use strictly increasing epochs with distinct keys and replay windows.
 /// Timestamps are opaque modulo-2^32 sample counts, not packet numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -109,7 +109,7 @@ impl Header {
         if self.packet_number >= PACKET_NUMBER_LIMIT {
             return Err(PacketError::RotationRequired);
         }
-        if self.key_epoch != 1 {
+        if self.key_epoch == 0 {
             return Err(PacketError::UnsupportedKeyEpoch(self.key_epoch));
         }
         if usize::from(self.payload_len) > MAX_PAYLOAD_LEN {

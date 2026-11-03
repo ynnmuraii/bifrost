@@ -129,6 +129,14 @@ pub enum AudioSupervisorEvent {
         generation: u64,
         event: w::SessionEvent,
     },
+    RotationEvent {
+        generation: u64,
+        event: w::RotationEvent,
+    },
+    MediaArtwork {
+        generation: u64,
+        artwork: w::MediaArtwork,
+    },
     Health {
         generation: u64,
         health: w::Health,
@@ -421,6 +429,14 @@ impl AudioHandle {
     /// Acknowledges the validated wire write, not native session startup.
     pub async fn start_session(&self, start: w::StartSession) -> Result<u64> {
         self.written(Msg::StartSession(start)).await
+    }
+    #[cfg(debug_assertions)]
+    pub async fn advance_test_clock(&self, offset_ms: u64) -> Result<u64> {
+        self.written(Msg::SetTestClock(w::SetTestClock { offset_ms }))
+            .await
+    }
+    pub async fn rotate_session(&self, rotation: w::RotateSession) -> Result<u64> {
+        self.written(Msg::RotateSession(rotation)).await
     }
     pub async fn stop_session(&self, session_id: [u8; 16]) -> Result<u64> {
         self.written(Msg::StopSession(w::StopSession {
@@ -929,6 +945,10 @@ async fn serve(
                                 pending.insert(id, response);
                             }
                         }
+                        Msg::RotationEvent(event) => {
+                            let session: [u8; 16] = event.session_id.as_slice().try_into().map_err(|_| AudioSupervisorError::InvalidFrame)?;
+                            if sessions.contains(&session) { emit(events, AudioSupervisorEvent::RotationEvent { generation, event })?; }
+                        }
                         Msg::SessionEvent(event) => {
                             let session: [u8; 16] = event.session_id.as_slice().try_into().map_err(|_| AudioSupervisorError::InvalidFrame)?;
                             if !sessions.contains(&session) {
@@ -959,6 +979,7 @@ async fn serve(
                         }
                         Msg::PttStatus(status) => emit(events, AudioSupervisorEvent::PttStatus { generation, status })?,
                         Msg::MediaSessions(sessions) => emit(events, AudioSupervisorEvent::MediaSessions {generation,sessions})?,
+                        Msg::MediaArtwork(artwork) => emit(events, AudioSupervisorEvent::MediaArtwork {generation,artwork})?,
                         Msg::MediaCommandResult(result) => {
                             if pending_controls.remove(&id).map(|control| control.kind) != Some(ControlReply::Media) {return Err(AudioSupervisorError::InvalidFrame);}
                             emit(events, AudioSupervisorEvent::MediaCommandResult {generation,request_id:id,result})?;

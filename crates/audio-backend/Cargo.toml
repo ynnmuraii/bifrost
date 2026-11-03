@@ -7,5 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+ring = "0.17"
+
 [lints]
 workspace = true

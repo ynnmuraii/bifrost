@@ -37,6 +37,7 @@ pub enum Reason {
     VirtualMicMissing,
     ParentLost,
     WorkerLost,
+    KeyExpired,
     Timeout,
     RateLimited,
     Revoked,

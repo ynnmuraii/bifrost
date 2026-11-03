@@ -22,7 +22,7 @@ zeroize = "1"
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "global_shortcuts"] }
 tokio = { version = "1", features = ["rt", "time", "net"] }
-rustix = { version = "1", features = ["time"] }
+rustix = { version = "1", features = ["time", "fs"] }
 toml = "1"
 libloading = "=0.8.9"
 tracing = "0.1"

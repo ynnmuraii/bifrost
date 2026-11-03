@@ -10,7 +10,7 @@
 //! endpoint replies to an unauthenticated datagram; no inbound firewall rule is installed.
 use crate::{
     control::ReceiverReport,
-    crypto::{CryptoError, DirectionMaterial, Opener, Sealer},
+    crypto::{CryptoError, Direction, DirectionMaterial, Opener, Sealer},
     keys::{Endpoint, SessionKeys},
     native_rate::NativeRate,
     pipeline::{MediaError, Receiver, Sender},
@@ -81,6 +81,9 @@ pub enum MediaEvent {
     Degraded,
     DeviceInvalidated,
     RotationRequired,
+    RotationDue { epoch: u32 },
+    RotationPrepared { epoch: u32 },
+    RotationActivated { epoch: u32 },
     Stopped { reason: StopReason },
 }
 /// Observed validation failure, not proof that a particular firewall blocked traffic.
@@ -188,6 +191,108 @@ impl Stats {
         }
     }
 }
+enum RotationCommand {
+    Prepare {
+        epoch: u32,
+        material: SessionMaterial,
+    },
+    Activate {
+        epoch: u32,
+    },
+}
+struct Rotation {
+    pending: Option<Sealer>,
+    notified: bool,
+}
+impl Rotation {
+    fn new() -> Self {
+        Self {
+            pending: None,
+            notified: false,
+        }
+    }
+    fn advance(
+        &mut self,
+        context: &Context,
+        sealer: &mut Sealer,
+        opener: &mut Opener,
+        endpoint: Endpoint,
+    ) -> Result<(), StopReason> {
+        let now = context.now_ms();
+        opener.expire(now).map_err(crypto_reason)?;
+        if sealer.expired(now) {
+            return Err(StopReason::RotationRequired);
+        }
+        let command = if context.shared.rotation_pending.load(Ordering::Acquire) {
+            let mut pending = lock(&context.shared.rotation);
+            let command = pending.take();
+            context
+                .shared
+                .rotation_pending
+                .store(false, Ordering::Release);
+            command
+        } else {
+            None
+        };
+        if context.shared.is_stopped() {
+            return Err(context.shared.reason());
+        }
+        match command {
+            Some(RotationCommand::Prepare { epoch, material }) => {
+                if self.pending.is_some() || sealer.epoch().checked_add(1) != Some(epoch) {
+                    return Err(StopReason::WorkerFailed);
+                }
+                let keys = SessionKeys::new(
+                    endpoint,
+                    sealer.session_id(),
+                    now,
+                    material
+                        .forward
+                        .bind_epoch(sealer.session_id(), epoch, Direction::Forward)
+                        .map_err(crypto_reason)?,
+                    material
+                        .reverse
+                        .bind_epoch(sealer.session_id(), epoch, Direction::Reverse)
+                        .map_err(crypto_reason)?,
+                )
+                .map_err(crypto_reason)?;
+                opener
+                    .prepare(keys.receive, epoch, now)
+                    .map_err(crypto_reason)?;
+                self.pending = Some(keys.send.for_epoch(epoch));
+                context
+                    .events
+                    .try_send(MediaEvent::RotationPrepared { epoch })
+                    .map_err(|_| StopReason::WorkerFailed)?;
+            }
+            Some(RotationCommand::Activate { epoch }) => {
+                let next = self
+                    .pending
+                    .take()
+                    .filter(|key| key.epoch() == epoch)
+                    .ok_or(StopReason::WorkerFailed)?;
+                opener.activate(epoch, now).map_err(crypto_reason)?;
+                *sealer = next;
+                self.notified = false;
+                context
+                    .events
+                    .try_send(MediaEvent::RotationActivated { epoch })
+                    .map_err(|_| StopReason::WorkerFailed)?;
+            }
+            None => {}
+        }
+        if !self.notified && sealer.rotation_due(now) {
+            context
+                .events
+                .try_send(MediaEvent::RotationDue {
+                    epoch: sealer.epoch(),
+                })
+                .map_err(|_| StopReason::WorkerFailed)?;
+            self.notified = true;
+        }
+        Ok(())
+    }
+}
 struct Shared {
     stopped: AtomicBool,
     reason: AtomicU8,
@@ -224,6 +329,10 @@ struct Shared {
     notification: Arc<Notification>,
     socket_rejected: Arc<AtomicU64>,
     stats: Mutex<Stats>,
+    rotation: Mutex<Option<RotationCommand>>,
+    rotation_pending: AtomicBool,
+    #[cfg(debug_assertions)]
+    test_clock_offset_ms: AtomicU64,
 }
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -267,6 +376,10 @@ impl Shared {
             last_send_ms: AtomicU64::new(0),
             notification: Arc::new(Notification::new()),
             socket_rejected: Arc::new(AtomicU64::new(0)),
+            rotation: Mutex::new(None),
+            rotation_pending: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            test_clock_offset_ms: AtomicU64::new(0),
             stats: Mutex::new(Stats {
                 health: AudioHealth::default(),
                 state: StreamHealth::Buffering,
@@ -405,6 +518,37 @@ pub struct MediaSession<S: Stream + 'static> {
     stop_attempted: bool,
 }
 impl<S: Stream + 'static> MediaSession<S> {
+    /// Isolated Dry fixture clock injection. Release builds have no clock override.
+    #[cfg(debug_assertions)]
+    pub fn advance_test_clock(&self, offset_ms: u64) {
+        self.shared
+            .test_clock_offset_ms
+            .fetch_max(offset_ms, Ordering::AcqRel);
+        self.shared.notification.notify();
+    }
+    pub fn prepare_rotation(
+        &self,
+        epoch: u32,
+        material: SessionMaterial,
+    ) -> Result<(), EngineError> {
+        self.rotation_command(RotationCommand::Prepare { epoch, material })
+    }
+    pub fn activate_rotation(&self, epoch: u32) -> Result<(), EngineError> {
+        self.rotation_command(RotationCommand::Activate { epoch })
+    }
+    fn rotation_command(&self, command: RotationCommand) -> Result<(), EngineError> {
+        if self.shared.is_stopped() {
+            return Err(EngineError::Unauthorized);
+        }
+        let mut pending = lock(&self.shared.rotation);
+        if pending.is_some() {
+            return Err(EngineError::Unauthorized);
+        }
+        *pending = Some(command);
+        self.shared.rotation_pending.store(true, Ordering::Release);
+        self.shared.notification.notify();
+        Ok(())
+    }
     /// Enables deterministic Dry pumping or owner-thread platform-specific control only.
     pub fn stream_mut(&mut self) -> Option<&mut S> {
         if let Some(group) = self.group_owner.as_mut() {
@@ -1018,6 +1162,7 @@ where
         frame,
         rate: format.sample_rate,
         path,
+        rotation: Rotation::new(),
     };
     session.workers.push(
         thread::Builder::new()
@@ -1064,7 +1209,15 @@ impl Context {
             ) || cfg!(windows) && error.raw_os_error() == Some(10054))
     }
     fn now_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        #[cfg(debug_assertions)]
+        {
+            elapsed.saturating_add(self.shared.test_clock_offset_ms.load(Ordering::Acquire))
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            elapsed
+        }
     }
     fn send(&self, packet: &[u8]) -> Result<(), StopReason> {
         if self.shared.is_stopped() {
@@ -1251,6 +1404,7 @@ struct SourceWorker {
     frame: usize,
     rate: u32,
     path: PathState,
+    rotation: Rotation,
 }
 impl SourceWorker {
     fn run(mut self) {
@@ -1284,6 +1438,12 @@ impl SourceWorker {
                 .min(2_000_000);
         }
         while !self.context.shared.is_stopped() {
+            self.rotation.advance(
+                &self.context,
+                self.sender.sealer_mut(),
+                &mut self.opener,
+                Endpoint::MediaSender,
+            )?;
             self.context
                 .shared
                 .worker_wakeups
@@ -1337,6 +1497,9 @@ impl SourceWorker {
                     break;
                 };
                 drained += 1;
+                self.opener
+                    .expire(self.context.now_ms())
+                    .map_err(crypto_reason)?;
                 match self.opener.open(&mut packet[..n], |_| true) {
                     Ok((header, payload)) => {
                         if self.path.control(header, payload) {
@@ -1500,6 +1663,7 @@ struct ReceiveWorker {
     receiver: Arc<Mutex<Receiver>>,
     sealer: Sealer,
     path: PathState,
+    rotation: Rotation,
 }
 impl ReceiveWorker {
     fn send_probe(&mut self, outgoing: &mut [u8]) -> Result<(), StopReason> {
@@ -1528,6 +1692,12 @@ impl ReceiveWorker {
         let mut outgoing = [0; MAX_DATAGRAM_LEN];
         let mut next_report = Instant::now();
         while !self.context.shared.is_stopped() {
+            self.rotation.advance(
+                &self.context,
+                &mut self.sealer,
+                lock(&self.receiver).opener_mut(),
+                Endpoint::MediaReceiver,
+            )?;
             self.context
                 .shared
                 .worker_wakeups
@@ -1540,9 +1710,16 @@ impl ReceiveWorker {
                 };
                 drained += 1;
                 let now = self.context.shared.render_clock.load(Ordering::Acquire);
-                let result = lock(&self.receiver).receive(now, &mut packet[..n], |header| {
-                    header.kind != PacketKind::Opus || self.path.validated
-                });
+                let result = {
+                    let mut receiver = lock(&self.receiver);
+                    receiver
+                        .opener_mut()
+                        .expire(self.context.now_ms())
+                        .map_err(crypto_reason)?;
+                    receiver.receive(now, &mut packet[..n], |header| {
+                        header.kind != PacketKind::Opus || self.path.validated
+                    })
+                };
                 match result {
                     Ok(header) => {
                         let payload =
@@ -2077,6 +2254,7 @@ mod path_tests {
                 frame: 480,
                 rate: 48_000,
                 path,
+                rotation: Rotation::new(),
             };
             let worker = thread::spawn(move || worker.run());
             let samples = [0.0; 960];

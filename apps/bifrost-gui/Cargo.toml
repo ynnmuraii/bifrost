@@ -40,6 +40,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 url = "2"
 flate2 = "1"
 tar = "0.4"
+# Bounded JPEG decode of the normalized artwork thumbnail (<= 49 152 B, <= 192x192). The
+# version is already in the workspace graph; only the jpeg codec, so no second image stack.
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 ui-text = { path = "../../crates/ui-text" }
 # The async half of the GUI: one connection task on a dedicated thread, fed by a channel.
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

@@ -20,7 +20,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     prost_build::Config::new()
         .out_dir(&out_dir)
-        .skip_debug([".bifrost.ipc.v1.MediaInfo", ".bifrost.v1.MediaInfo"])
+        .skip_debug([
+            ".bifrost.ipc.v1.MediaInfo",
+            ".bifrost.v1.MediaInfo",
+            ".bifrost.ipc.v1.AudioArtwork",
+            ".bifrost.v1.MediaArtworkChunk",
+        ])
         .compile_fds(fds)?;
 
     let audio_fds = protox::compile(["proto/audio_ipc.proto"], ["proto"])?;
@@ -30,7 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".bifrost.audio_worker.v1.Attach",
             ".bifrost.audio_worker.v1.DirectionMaterial",
             ".bifrost.audio_worker.v1.StartSession",
+            ".bifrost.audio_worker.v1.RotateSession",
             ".bifrost.audio_worker.v1.MediaInfo",
+            ".bifrost.audio_worker.v1.MediaArtwork",
             ".bifrost.audio_worker.v1.MediaSessions",
         ])
         .compile_fds(audio_fds)?;

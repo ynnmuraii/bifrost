@@ -21,6 +21,9 @@ message AudioFrame {
     Shutdown shutdown = 16;
     ProbeBackend probe_backend = 17;
     RenewSession renew_session = 70;
+    RotateSession rotate_session = 74;
+    RotationEvent rotation_event = 75;
+    SetTestClock set_test_clock = 77; // debug-only isolated Dry fixture; never native
     ReleaseSourceLocalSound release_source_local_sound = 73;
     AcquireMicMute acquire_mic_mute = 18;
     SetMicMute set_mic_mute = 19;
@@ -43,6 +46,7 @@ message AudioFrame {
     PttStatus ptt_status = 72;
     MediaSessions media_sessions = 60;
     MediaCommandResult media_command_result = 61;
+    MediaArtwork media_artwork = 76;
   }
   reserved 24 to 29, 32 to 39, 49 to 59, 62 to 69;
 }
@@ -95,6 +99,11 @@ message StartSession {
   uint32 initial_authorization_ms = 14; // Required, 1..1000; zero never grants permission.
   bool source_local_sound_released = 15; // Local user override; never changes transmission.
 }
+// Keys are extracted into zeroizing owners on receive. Preparation never starts native I/O.
+message SetTestClock { uint64 offset_ms = 1; }
+message RotateSession { bytes session_id = 1; uint32 epoch = 2; bool activate = 3; DirectionMaterial forward = 4; DirectionMaterial reverse = 5; }
+// kind: 1 due, 2 installed, 3 activated; emitted only by the media worker.
+message RotationEvent { bytes session_id = 1; uint32 epoch = 2; uint32 kind = 3; }
 message StopSession { bytes session_id = 1; }
 message ReleaseSourceLocalSound { bytes session_id = 1; } // Source only, idempotent; no native wait.
 message RenewSession { bytes session_id = 1; uint32 ttl_ms = 2; } // Exact 16-byte ID, TTL 1..1000; cannot revive a stopped session.
@@ -203,7 +212,9 @@ message MediaInfo {
   optional bool can_seek = 10;
   optional uint64 seek_min_ms = 11;
   optional uint64 seek_max_ms = 12;
+  bytes artwork_id = 13;
 }
+message MediaArtwork { uint64 token = 1; uint64 revision = 2; bytes artwork_id = 3; bytes data = 4; uint32 width = 5; uint32 height = 6; }
 message MediaSessions { repeated MediaInfo sessions = 1; optional uint64 current_token = 2; uint64 revision = 3; } // <=32 unique nonzero tokens, push only.
 enum MediaCommandStatus { MEDIA_COMMAND_STATUS_UNSPECIFIED = 0; MEDIA_COMMAND_STATUS_OK = 1; MEDIA_COMMAND_STATUS_STALE_REVISION = 2; MEDIA_COMMAND_STATUS_UNSUPPORTED = 3; MEDIA_COMMAND_STATUS_TIMEOUT = 4; MEDIA_COMMAND_STATUS_CANCELLED = 5; }
 message MediaCommandResult { MediaCommandStatus result = 1; } // Correlates through AudioFrame.request_id.

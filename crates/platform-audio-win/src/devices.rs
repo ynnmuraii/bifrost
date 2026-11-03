@@ -90,7 +90,7 @@ pub struct EndpointInfo {
     pub mix_format: MixFormat,
 }
 
-fn enumerator() -> Result<IMMDeviceEnumerator, Error> {
+pub(crate) fn enumerator() -> Result<IMMDeviceEnumerator, Error> {
     // SAFETY: every caller holds an MTA apartment until the object is released.
     Ok(unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? })
 }
@@ -103,7 +103,7 @@ impl<T> Drop for TaskMemory<T> {
     }
 }
 
-fn device_id(device: &IMMDevice) -> Result<String, Error> {
+pub(crate) fn device_id(device: &IMMDevice) -> Result<String, Error> {
     let id = TaskMemory(unsafe { device.GetId()? }.0);
     // SAFETY: GetId returns a NUL-terminated CoTaskMem string, held until copied.
     unsafe { PWSTR(id.0).to_string() }

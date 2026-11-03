@@ -64,6 +64,7 @@ fn snapshot(revision: u64) -> ipc::AudioStatus {
                     ..Default::default()
                 },
                 revision: 3,
+                artwork_id: None,
             }),
             focus_primary: false,
             path_diagnostic: model::PathDiagnostic::None,
@@ -95,14 +96,23 @@ fn draw_audio_player(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(240.0, ui::audio_player::height(&vm.audio_player.cards)),
+                egui::vec2(
+                    ui::audio_player::DEFAULT_WIDTH,
+                    ui::audio_player::height(&vm.audio_player.cards),
+                ),
             )),
             events,
             ..Default::default()
         },
         |ui| {
-            actions =
-                ui::audio_player::draw(ui, &vm.audio_player.cards, vm.look.theme, vm.look.language)
+            actions = ui::audio_player::draw(
+                ui,
+                &vm.audio_player.cards,
+                vm.look.theme,
+                vm.look.language,
+                false,
+                vm.audio.player_mode(vm.connection.is_connected()),
+            )
         },
     );
     (output, actions)
@@ -1341,5 +1351,430 @@ fn queued_track_seek_rechecks_current_identity_range_and_permission_before_dispa
             *value = position_ms;
         }
         assert!(audio::player_request(&seekable_snapshot(5), &outside).is_none());
+    }
+}
+
+#[test]
+fn artwork_is_requested_once_per_session_token_and_hash() {
+    let mut vm = view();
+    let mut status = snapshot(1);
+    let media = status.sessions[0].media_info.as_mut().unwrap();
+    media.artwork_id = vec![7; 32];
+    media.session_token = 7;
+    let session_id = status.sessions[0].session_id.clone();
+    vm.apply_audio_status(0, status.clone());
+    let outgoing = vm.take_outgoing();
+    assert_eq!(outgoing.len(), 1, "{outgoing:?}");
+    match &outgoing[0].1 {
+        Msg::GetAudioArtwork(request) => {
+            assert_eq!(request.session_id, session_id);
+            assert_eq!(request.session_token, 7);
+            assert_eq!(request.artwork_id, vec![7; 32]);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // A newer revision or position never re-requests the same current-scope tuple.
+    status.revision += 1;
+    status.sessions[0].media_info.as_mut().unwrap().position_ms = Some(1_000);
+    vm.apply_audio_status(0, status.clone());
+    assert!(vm.take_outgoing().is_empty());
+
+    // A new token scopes a new image: exactly one request, no retry loop.
+    status.revision += 1;
+    status.sessions[0]
+        .media_info
+        .as_mut()
+        .unwrap()
+        .session_token = 8;
+    vm.apply_audio_status(0, status.clone());
+    let outgoing = vm.take_outgoing();
+    assert_eq!(outgoing.len(), 1, "{outgoing:?}");
+    assert!(matches!(&outgoing[0].1, Msg::GetAudioArtwork(request) if request.session_token == 8));
+
+    // An empty id is honest "no image": no request, and the fallback stays.
+    status.revision += 1;
+    status.sessions[0]
+        .media_info
+        .as_mut()
+        .unwrap()
+        .artwork_id
+        .clear();
+    vm.apply_audio_status(0, status);
+    assert!(vm.take_outgoing().is_empty());
+    assert!(vm.audio.artwork.is_empty());
+}
+
+#[test]
+fn player_mode_changes_only_authoritative_config_and_preserves_unsaved_advanced_draft() {
+    let mut vm = view();
+    vm.connection = bifrost_gui::view_model::Connection::Connected;
+    vm.apply(event(Msg::AudioStatus(snapshot(5))));
+    let authoritative = vm.audio.status.as_ref().unwrap().config.clone().unwrap();
+    let mut draft = authoritative.clone();
+    draft.background_gain_db = -37;
+    draft.output_device = "unsaved-output".into();
+    draft.microphone.as_mut().unwrap().muted = false;
+    vm.audio_action(
+        &AudioAction::EditConfig(Box::new(draft.clone())),
+        Instant::now(),
+    );
+    let ctx = bifrost_gui::egui::Context::default();
+    bifrost_gui::ui::install_fonts(&ctx);
+    ctx.enable_accesskit();
+    draw_audio_player(&ctx, &vm, Vec::new())
+        .0
+        .drop_without_applying_deltas();
+    let (output, _) = draw_audio_player(&ctx, &vm, Vec::new());
+    let bounds = output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|(_, node)| {
+            node.label()
+                == Some(ui_text::text(
+                    vm.look.language,
+                    ui_text::Key::AudioFollowFocus,
+                ))
+        })
+        .unwrap()
+        .1
+        .bounds()
+        .unwrap();
+    let at = bifrost_gui::egui::pos2(
+        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+    );
+    output.drop_without_applying_deltas();
+    let (_, actions) = draw_audio_player(
+        &ctx,
+        &vm,
+        vec![
+            bifrost_gui::egui::Event::PointerMoved(at),
+            bifrost_gui::egui::Event::PointerButton {
+                pos: at,
+                button: bifrost_gui::egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            bifrost_gui::egui::Event::PointerButton {
+                pos: at,
+                button: bifrost_gui::egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ],
+    );
+    assert_eq!(
+        actions,
+        [AudioPlayerAction::SetMode(ipc::AudioMode::MixAll)]
+    );
+    vm.audio_action(&AudioAction::Player(actions[0].clone()), Instant::now());
+    let outgoing = vm.take_outgoing();
+    let mut expected = authoritative.clone();
+    expected.mode = ipc::AudioMode::MixAll as i32;
+    assert_eq!(outgoing.len(), 1);
+    assert!(matches!(&outgoing[0].1, Msg::SetAudio(request)
+        if request.expected_revision == 5 && request.config.as_ref() == Some(&expected)));
+    assert!(vm.audio.pending);
+    assert_eq!(
+        vm.audio.player_mode(true).current,
+        Some(ipc::AudioMode::FollowFocus)
+    );
+    assert!(!vm.audio.player_mode(true).enabled);
+    assert_eq!(
+        vm.audio.status.as_ref().unwrap().config.as_ref(),
+        Some(&authoritative)
+    );
+    assert_eq!(vm.audio.draft, draft);
+    vm.audio_result(
+        outgoing[0].0,
+        audio::AudioRequest::Mutation,
+        ipc::OpResult {
+            ok: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        vm.audio.status.as_ref().unwrap().config.as_ref(),
+        Some(&authoritative)
+    );
+    assert!(vm.audio.pending, "persistence ACK is not a published mode");
+    let mut published = snapshot(6);
+    published.config = Some(expected.clone());
+    published.mode = expected.mode;
+    vm.apply(event(Msg::AudioStatus(published)));
+    assert!(!vm.audio.pending);
+    assert_eq!(
+        vm.audio.status.as_ref().unwrap().config.as_ref(),
+        Some(&expected)
+    );
+    assert_eq!(vm.audio.draft, draft);
+    assert!(vm.audio.dirty);
+}
+
+#[test]
+fn rejected_mode_cas_preserves_current_policy_and_draft_and_ignores_unrelated_results() {
+    let mut vm = view();
+    vm.connection = bifrost_gui::view_model::Connection::Connected;
+    vm.apply(event(Msg::AudioStatus(snapshot(5))));
+    let mut draft = vm.audio.draft.clone();
+    draft.output_device = "unsaved".into();
+    vm.audio_action(
+        &AudioAction::EditConfig(Box::new(draft.clone())),
+        Instant::now(),
+    );
+    vm.audio_action(
+        &AudioAction::Player(AudioPlayerAction::SetMode(ipc::AudioMode::MixAll)),
+        Instant::now(),
+    );
+    let id = vm.take_outgoing()[0].0;
+    vm.apply(event(Msg::AudioStatus(snapshot(6))));
+    assert!(
+        vm.audio.pending,
+        "unrelated telemetry is not the requested mode"
+    );
+    vm.audio_result(
+        id + 1,
+        audio::AudioRequest::Mutation,
+        ipc::OpResult {
+            ok: false,
+            error_code: "AUDIO_REVISION_MISMATCH".into(),
+        },
+    );
+    assert!(vm.audio.pending);
+    vm.audio_result(
+        id,
+        audio::AudioRequest::Mutation,
+        ipc::OpResult {
+            ok: false,
+            error_code: "AUDIO_REVISION_MISMATCH".into(),
+        },
+    );
+    assert!(!vm.audio.pending);
+    assert_eq!(
+        vm.audio.player_mode(true).current,
+        Some(ipc::AudioMode::FollowFocus)
+    );
+    assert_eq!(vm.audio.draft, draft);
+    assert!(vm.audio.dirty && vm.audio.error.is_some());
+    assert!(
+        vm.take_outgoing().is_empty(),
+        "no retry/rebase or stream stop"
+    );
+}
+
+#[test]
+fn mode_control_is_global_and_read_only_when_unknown_disconnected_source_or_pending() {
+    for state in [
+        "unknown",
+        "legacy",
+        "disconnected",
+        "source",
+        "pending",
+        "available",
+    ] {
+        let mut vm = view();
+        vm.connection = bifrost_gui::view_model::Connection::Connected;
+        vm.apply(event(Msg::AudioStatus(snapshot(5))));
+        match state {
+            "unknown" => {
+                vm.audio
+                    .status
+                    .as_mut()
+                    .unwrap()
+                    .config
+                    .as_mut()
+                    .unwrap()
+                    .mode = 99
+            }
+            "legacy" => vm.audio.status.as_mut().unwrap().config = None,
+            "disconnected" => {
+                vm.connection =
+                    bifrost_gui::view_model::Connection::Disconnected { why: String::new() }
+            }
+            "source" => vm.audio.status.as_mut().unwrap().role = ipc::AudioRole::Source as i32,
+            "pending" => vm.audio.pending = true,
+            _ => {}
+        }
+        let mut second = vm.audio_player.cards[0].clone();
+        second.stream_id = "second".into();
+        vm.audio_player.cards.push(second);
+        let mode = vm.audio.player_mode(vm.connection.is_connected());
+        assert_eq!(mode.enabled, state == "available");
+        assert_eq!(
+            mode.current.is_none(),
+            matches!(state, "unknown" | "legacy")
+        );
+        let ctx = bifrost_gui::egui::Context::default();
+        bifrost_gui::ui::install_fonts(&ctx);
+        ctx.enable_accesskit();
+        draw_audio_player(&ctx, &vm, Vec::new())
+            .0
+            .drop_without_applying_deltas();
+        let (output, actions) = draw_audio_player(&ctx, &vm, Vec::new());
+        assert!(actions.is_empty());
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        let names = [
+            ui_text::Key::AudioMode,
+            ui_text::Key::AudioMixAll,
+            ui_text::Key::AudioFollowFocus,
+        ]
+        .map(|key| ui_text::text(vm.look.language, key));
+        let controls: Vec<_> = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| names.contains(&node.label().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            controls.len(),
+            1,
+            "one Listener policy control, not one command per card"
+        );
+        assert_eq!(controls[0].1.is_disabled(), state != "available");
+        output.drop_without_applying_deltas();
+        vm.audio_action(
+            &AudioAction::Player(AudioPlayerAction::SetMode(ipc::AudioMode::MixAll)),
+            Instant::now(),
+        );
+        assert_eq!(
+            vm.take_outgoing()
+                .iter()
+                .filter(|(_, message)| matches!(message, Msg::SetAudio(_)))
+                .count(),
+            usize::from(state == "available")
+        );
+    }
+}
+
+#[test]
+fn mode_meaning_tooltip_wraps_inside_the_actual_player_client() {
+    use bifrost_gui::{egui, ui};
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        for mode in [ipc::AudioMode::MixAll, ipc::AudioMode::FollowFocus] {
+            let (mode_key, hint_key) = if mode == ipc::AudioMode::MixAll {
+                (
+                    ui_text::Key::AudioMixAll,
+                    ui_text::Key::AudioPlayerMixAllHint,
+                )
+            } else {
+                (
+                    ui_text::Key::AudioFollowFocus,
+                    ui_text::Key::AudioPlayerFollowFocusHint,
+                )
+            };
+            let mut vm = view();
+            vm.look.language = lang;
+            vm.connection = bifrost_gui::view_model::Connection::Connected;
+            let mut status = snapshot(5);
+            status.mode = mode as i32;
+            status.config.as_mut().unwrap().mode = mode as i32;
+            vm.apply(event(Msg::AudioStatus(status)));
+            let ctx = egui::Context::default();
+            ui::install_fonts(&ctx);
+            ctx.enable_accesskit();
+            let size = egui::vec2(428.0, 339.0);
+            let mut at = None;
+            let mut last = None;
+            for step in 0..8 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        time: Some(f64::from(step) * 0.25),
+                        events: if step == 2 {
+                            at.map(egui::Event::PointerMoved).into_iter().collect()
+                        } else {
+                            Vec::new()
+                        },
+                        focused: true,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui::audio_player::draw(
+                            ui,
+                            &vm.audio_player.cards,
+                            vm.look.theme,
+                            lang,
+                            false,
+                            vm.audio.player_mode(true),
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                if at.is_none() {
+                    at = output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .and_then(|tree| {
+                            tree.nodes
+                                .iter()
+                                .find(|(_, node)| {
+                                    node.label() == Some(ui_text::text(lang, mode_key))
+                                })
+                                .and_then(|(_, node)| node.bounds())
+                                .map(|bounds| {
+                                    egui::pos2(
+                                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                                    )
+                                })
+                        });
+                }
+                last = Some(output);
+            }
+            fn text_bounds(shape: &egui::Shape, expected: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.text() == expected => {
+                        Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    }
+                    egui::Shape::Vec(children) => children
+                        .iter()
+                        .find_map(|shape| text_bounds(shape, expected)),
+                    _ => None,
+                }
+            }
+            let output = last.unwrap();
+            let tooltip_roots: Vec<_> = ctx.memory(|memory| {
+                memory
+                    .areas()
+                    .visible_layer_ids()
+                    .into_iter()
+                    .filter(|layer| layer.order == egui::Order::Tooltip)
+                    .collect()
+            });
+            assert_eq!(
+                tooltip_roots.len(),
+                1,
+                "one mode control presents one tooltip container"
+            );
+            let client = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for root in tooltip_roots {
+                let frame = egui::AreaState::load(&ctx, root.id).unwrap().rect();
+                assert!(
+                    client.contains_rect(frame),
+                    "{lang:?}/{mode:?}: full tooltip frame clipped: {frame:?}"
+                );
+            }
+            let heading = output
+                .shapes
+                .iter()
+                .find_map(|shape| text_bounds(&shape.shape, ui_text::text(lang, mode_key)))
+                .expect("the same tooltip identifies the current authoritative mode");
+            assert!(heading.left() >= 0.0 && heading.right() <= size.x);
+            let bounds = output
+                .shapes
+                .iter()
+                .find_map(|shape| text_bounds(&shape.shape, ui_text::text(lang, hint_key)))
+                .expect("hover shows the current meaning and the next action");
+            assert!(
+                bounds.left() >= 0.0 && bounds.right() <= size.x && bounds.bottom() <= size.y,
+                "{lang:?}: tooltip clipped outside the real client: {bounds:?}"
+            );
+            output.drop_without_applying_deltas();
+        }
     }
 }

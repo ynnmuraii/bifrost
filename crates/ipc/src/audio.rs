@@ -234,6 +234,7 @@ pub fn validate_status(status: &wire::AudioStatus) -> Result<()> {
                     codes::AUDIO_GROUP_MISMATCH,
                     codes::AUDIO_UNSUPPORTED_BACKEND,
                     codes::AUDIO_NO_UDP_PATH,
+                    codes::AUDIO_KEY_EXPIRED,
                     codes::AUDIO_DEVICE_UNAVAILABLE,
                     codes::AUDIO_VIRTUAL_MIC_MISSING,
                     codes::AUDIO_CONFIG_WRITE,
@@ -372,6 +373,7 @@ pub fn validate_status(status: &wire::AudioStatus) -> Result<()> {
                     && media.subtitle.len() <= 256,
                 "audio metadata bounds exceeded",
             )?;
+            id(&media.artwork_id, 32, true)?;
             decode_playback(media.playback)?;
             require(
                 media.commands.is_some(),
@@ -423,6 +425,24 @@ pub fn validate_frame(frame: &wire::GuiFrame) -> Result<()> {
     };
     match message {
         Msg::AudioStatus(status) => return validate_status(status),
+        Msg::GetAudioArtwork(request) => {
+            id(&request.session_id, 16, false)?;
+            id(&request.artwork_id, 32, false)?;
+            require(request.session_token != 0, "invalid artwork token")?;
+        }
+        Msg::AudioArtwork(artwork) => {
+            id(&artwork.session_id, 16, false)?;
+            id(&artwork.artwork_id, 32, false)?;
+            require(
+                artwork.session_token != 0
+                    && artwork.mime == "image/jpeg"
+                    && !artwork.data.is_empty()
+                    && artwork.data.len() <= protocol::limits::MAX_AUDIO_ARTWORK_BYTES
+                    && (1..=192).contains(&artwork.width)
+                    && (1..=192).contains(&artwork.height),
+                "invalid audio artwork",
+            )?;
+        }
         Msg::AudioDevices(devices) => {
             device_kind(devices.kind)?;
             require(devices.devices.len() <= 64, "too many audio devices")?;
@@ -513,6 +533,7 @@ pub mod codes {
     pub const AUDIO_GROUP_MISMATCH: &str = "AUDIO_GROUP_MISMATCH";
     pub const AUDIO_UNSUPPORTED_BACKEND: &str = "AUDIO_UNSUPPORTED_BACKEND";
     pub const AUDIO_NO_UDP_PATH: &str = "AUDIO_NO_UDP_PATH";
+    pub const AUDIO_KEY_EXPIRED: &str = "AUDIO_KEY_EXPIRED";
     pub const AUDIO_DEVICE_UNAVAILABLE: &str = "AUDIO_DEVICE_UNAVAILABLE";
     pub const AUDIO_VIRTUAL_MIC_MISSING: &str = "AUDIO_VIRTUAL_MIC_MISSING";
     pub const AUDIO_CONFIG_WRITE: &str = "AUDIO_CONFIG_WRITE";

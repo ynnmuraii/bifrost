@@ -2,8 +2,10 @@
 //! Native IPC and config writes never run on the KVM dispatch path. Every media lease is
 //! renewed by this actor, not by the supervisor's independent IPC heartbeat.
 mod admission;
+mod artwork;
 mod media;
 mod microphone;
+mod rotation;
 mod safety;
 mod sharing;
 mod wire;
@@ -62,6 +64,7 @@ pub(super) fn is_request(message: &gui::gui_frame::Msg) -> bool {
             | Msg::ListAudioDevices(_)
             | Msg::SetAudioPeerGain(_)
             | Msg::SendMediaCommand(_)
+            | Msg::GetAudioArtwork(_)
     )
 }
 
@@ -85,6 +88,9 @@ struct Peer {
     mic_support: bool,
     media_support: bool,
     media_seek_support: bool,
+    rekey_support: bool,
+    artwork_support: bool,
+    artwork_rejected: u64,
     focus_sent_revision: u64,
     focus_request_at: Option<u64>,
     focus_reply_at: Option<u64>,
@@ -165,6 +171,8 @@ impl Coordinator {
             paths,
             listen,
             test_dry,
+            #[cfg(debug_assertions)]
+            test_clock_offset: 0,
             events,
             commands: rx,
             gui_commands: gui_rx,
@@ -186,6 +194,7 @@ impl Coordinator {
             session_locked: false,
             mic: microphone::State::default(),
             media: media::State::default(),
+            artwork: artwork::State::default(),
             focus_view: CommittedFocus::default(),
             focus_policy,
             focus_revision: 0,
@@ -360,6 +369,9 @@ impl Coordinator {
                     mic_support: hello.mic_control,
                     media_support: hello.media_control,
                     media_seek_support: hello.media_seek,
+                    rekey_support: hello.audio_rekey,
+                    artwork_support: hello.media_artwork,
+                    artwork_rejected: 0,
                     focus_sent_revision: 0,
                     focus_request_at: None,
                     focus_reply_at: None,
@@ -390,6 +402,9 @@ impl Coordinator {
                     capabilities.contains(&(net::Capability::MediaControlV1 as i32));
                 peer.media_seek_support =
                     capabilities.contains(&(net::Capability::MediaSeekV1 as i32));
+                peer.rekey_support = capabilities.contains(&(net::Capability::AudioRekeyV1 as i32));
+                peer.artwork_support =
+                    capabilities.contains(&(net::Capability::MediaArtworkV1 as i32));
             }
         });
     }
@@ -434,6 +449,19 @@ impl Coordinator {
         if let Some(parent) = self.parent(peer, connection) {
             // A valid optional family without its negotiated bit must not enter
             // the lifecycle queue or tear down an unrelated P1 stream.
+            if violation == protocol::validate::AudioViolation::Artwork {
+                self.links.send_modify(|links| {
+                    if let Some(peer) = links
+                        .peers
+                        .get_mut(&peer)
+                        .filter(|peer| peer.parent == parent)
+                    {
+                        peer.artwork_rejected = peer.artwork_rejected.saturating_add(1);
+                    }
+                });
+                count_optional_drop(&self.optional_drops);
+                return;
+            }
             if violation == protocol::validate::AudioViolation::Capability {
                 count_optional_drop(&self.optional_drops);
                 return;
@@ -519,6 +547,7 @@ struct Record {
     capture_active: Option<bool>,
     sending: Option<bool>,
     applied_gain: Option<(u32, bool)>,
+    rotation: rotation::State,
 }
 struct Pending {
     request: Request,
@@ -533,6 +562,8 @@ struct Actor {
     paths: config::Paths,
     listen: SocketAddr,
     test_dry: bool,
+    #[cfg(debug_assertions)]
+    test_clock_offset: u64,
     events: broadcast::Sender<Outgoing>,
     commands: mpsc::Receiver<Command>,
     gui_commands: mpsc::Receiver<safety::Command>,
@@ -554,6 +585,7 @@ struct Actor {
     session_locked: bool,
     mic: microphone::State,
     media: media::State,
+    artwork: artwork::State,
     focus_view: CommittedFocus,
     focus_policy: FocusPolicy,
     focus_revision: u64,
@@ -723,11 +755,13 @@ impl Actor {
         Ok(())
     }
     fn publish_caps(&self) {
-        let mut bits = [0; 7];
+        let mut bits = [0; 9];
         bits[0] = net::Capability::AudioFocusReportV1 as i32;
         let mut len = 1;
         if self.config.enabled {
             bits[len] = net::Capability::AudioControlV1 as i32;
+            len += 1;
+            bits[len] = net::Capability::AudioRekeyV1 as i32;
             len += 1;
             if self
                 .worker
@@ -757,6 +791,8 @@ impl Actor {
                 bits[len] = net::Capability::MediaControlV1 as i32;
                 len += 1;
                 bits[len] = net::Capability::MediaSeekV1 as i32;
+                len += 1;
+                bits[len] = net::Capability::MediaArtworkV1 as i32;
                 len += 1;
             }
         }
@@ -866,6 +902,15 @@ impl Actor {
                                 | net::audio_control::Body::MediaCommand(_)
                                 | net::audio_control::Body::MediaAck(_)) =>
                                     self.media_on_network(parent, &message).await,
+                            Some(net::audio_control::Body::ArtworkRequest(_)) => {
+                                if let Some(net::audio_control::Body::ArtworkRequest(request)) = message.body { self.artwork_on_request(parent, request); }
+                            }
+                            Some(net::audio_control::Body::Artwork(_)) => {
+                                if let Some(net::audio_control::Body::Artwork(artwork)) = message.body { self.artwork_on_network(parent, artwork); }
+                            }
+                            Some(net::audio_control::Body::Rekey(_)) => {
+                                if let Some(net::audio_control::Body::Rekey(rekey)) = message.body { self.rotation_on_network(parent, rekey).await; }
+                            }
                             _ => self.on_network(parent, message),
                         },
                         Err(violation) if self.current(parent) => {
@@ -967,6 +1012,11 @@ impl Actor {
             self.admitted.remove(&id);
         }
         for (id, mut peer) in snapshot.peers {
+            if self.peers.get(&id).is_some_and(|previous| {
+                previous.parent == peer.parent && previous.artwork_rejected != peer.artwork_rejected
+            }) {
+                self.artwork_drop_transfer(id);
+            }
             let support_changed = self
                 .peers
                 .get(&id)
@@ -1205,6 +1255,7 @@ impl Actor {
                                 capture_active: None,
                                 sending: None,
                                 applied_gain: None,
+                                rotation: rotation::State::default(),
                             },
                         );
                         let mut transcript_sha256 = [0; 32];
@@ -1238,6 +1289,7 @@ impl Actor {
                 }
                 fsm::Effect::StartChild { view } => self.start_child(view).await,
                 fsm::Effect::InvalidateSession { view } => {
+                    self.artwork_invalidate(NodeId::new(view.parent.peer));
                     self.retry.retain(|(parent, message)| {
                         *parent != view.parent || control_session(message) != Some(view.session)
                     });
@@ -1247,6 +1299,7 @@ impl Actor {
                         .filter(|r| r.view.session == view.session)
                     {
                         record.material = None;
+                        record.rotation = rotation::State::default();
                         record.capture_active = None;
                         record.sending = None;
                     }
@@ -1316,6 +1369,10 @@ impl Actor {
         if agreement.offer.parent_connection_id != parent.connection_id || !self.current(parent) {
             return None;
         }
+        self.derive_context(parent, &agreement.context().encode())
+            .await
+    }
+    async fn derive_context(&self, parent: fsm::Parent, context: &[u8]) -> Option<Materials> {
         let secret = self
             .manager
             .auxiliary_secret(&NodeId::new(parent.peer))
@@ -1327,16 +1384,11 @@ impl Actor {
         {
             return None;
         }
-        let context = agreement.context().encode();
         let material = Materials {
-            forward: secret.derive(AuxPurpose::AudioForwardKey, &context).ok()?,
-            reverse: secret.derive(AuxPurpose::AudioReverseKey, &context).ok()?,
-            forward_nonce: secret
-                .derive(AuxPurpose::AudioForwardNonce, &context)
-                .ok()?,
-            reverse_nonce: secret
-                .derive(AuxPurpose::AudioReverseNonce, &context)
-                .ok()?,
+            forward: secret.derive(AuxPurpose::AudioForwardKey, context).ok()?,
+            reverse: secret.derive(AuxPurpose::AudioReverseKey, context).ok()?,
+            forward_nonce: secret.derive(AuxPurpose::AudioForwardNonce, context).ok()?,
+            reverse_nonce: secret.derive(AuxPurpose::AudioReverseNonce, context).ok()?,
         };
         self.current(parent).then_some(material)
     }
@@ -1649,6 +1701,13 @@ impl Actor {
             self.media_on_worker(&event).await;
         }
         match event {
+            AudioSupervisorEvent::RotationEvent { generation, event } => {
+                self.rotation_on_worker(generation, event).await
+            }
+            AudioSupervisorEvent::MediaArtwork {
+                generation,
+                artwork,
+            } => self.artwork_on_worker(generation, artwork),
             AudioSupervisorEvent::Ready {
                 generation: gen,
                 pid,
@@ -1843,7 +1902,7 @@ impl Actor {
                     Ok(worker::EventKind::RotationRequired) => {
                         let _ = self.feed(fsm::Input::ChildFailed {
                             view,
-                            reason: fsm::Reason::Timeout,
+                            reason: fsm::Reason::KeyExpired,
                         });
                     }
                     Ok(worker::EventKind::Degraded) => {
@@ -2048,6 +2107,7 @@ impl Actor {
     async fn tick(&mut self) {
         self.sync_links();
         if !self.config.enabled {
+            self.artwork = artwork::State::default();
             return;
         }
         if let Some(worker) = &self.worker {
@@ -2060,6 +2120,26 @@ impl Actor {
             }
         }
         let _ = self.feed(fsm::Input::Tick);
+        #[cfg(debug_assertions)]
+        if self.test_dry {
+            if let Some(runtime) = self.paths.runtime_dir() {
+                if let Ok(value) =
+                    std::fs::read_to_string(runtime.join("test-audio-clock-offset-ms"))
+                {
+                    if let Ok(offset_ms) = value.trim().parse::<u64>() {
+                        if offset_ms > self.test_clock_offset && offset_ms <= 604_800_000 {
+                            self.test_clock_offset = offset_ms;
+                            if let Some(worker) = self.worker.as_ref().filter(|worker| worker.alive)
+                            {
+                                let _ = worker.handle.advance_test_clock(offset_ms).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.rotation_tick();
+        self.artwork_tick().await;
         let retry = std::mem::take(&mut self.retry);
         for (parent, message) in retry {
             self.send_control(parent, message).await;
@@ -2535,6 +2615,7 @@ impl Actor {
             }
             Msg::SetMicrophoneMute(_) | Msg::SetPtt(_) => self.mic_on_gui(request).await,
             Msg::SendMediaCommand(_) => self.media_on_gui(request).await,
+            Msg::GetAudioArtwork(_) => self.artwork_on_gui(request).await,
             _ => reply(&request, Err(ipc::audio::codes::AUDIO_UNAVAILABLE)).await,
         }
     }
@@ -3158,6 +3239,7 @@ fn reason_code(reason: fsm::Reason) -> Code {
         fsm::Reason::DeviceUnavailable => c::AUDIO_DEVICE_UNAVAILABLE,
         fsm::Reason::VirtualMicMissing => c::AUDIO_VIRTUAL_MIC_MISSING,
         fsm::Reason::Timeout => c::AUDIO_NO_UDP_PATH,
+        fsm::Reason::KeyExpired => c::AUDIO_KEY_EXPIRED,
         fsm::Reason::RateLimited => c::AUDIO_START_RATE_LIMITED,
         _ => c::AUDIO_UNAVAILABLE,
     }
@@ -3700,6 +3782,9 @@ mod observation_tests {
                     mic_support: false,
                     media_support: false,
                     media_seek_support: false,
+                    rekey_support: false,
+                    artwork_support: false,
+                    artwork_rejected: 0,
                     focus_sent_revision: 0,
                     focus_request_at: None,
                     focus_reply_at: None,
@@ -3732,6 +3817,17 @@ mod observation_tests {
                 peer,
                 connection,
                 protocol::validate::AudioViolation::Capability,
+            );
+        }
+        assert!(matches!(
+            incoming.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        for _ in 0..COMMANDS * 2 {
+            coordinator.rejected(
+                peer,
+                connection,
+                protocol::validate::AudioViolation::Artwork,
             );
         }
         assert!(matches!(

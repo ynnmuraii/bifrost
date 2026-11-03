@@ -53,6 +53,8 @@ pub(crate) const IMPLEMENTED_CAPABILITIES: &[i32] = &[
     wire::Capability::MicControlV1 as i32,
     wire::Capability::MediaControlV1 as i32,
     wire::Capability::MediaSeekV1 as i32,
+    wire::Capability::AudioRekeyV1 as i32,
+    wire::Capability::MediaArtworkV1 as i32,
 ];
 
 /// A message that cannot be expressed on the wire.
@@ -1119,6 +1121,8 @@ pub struct PeerInfo {
     pub media_control: bool,
     /// Whether the peer supports guarded absolute media seeks (24).
     pub media_seek: bool,
+    pub audio_rekey: bool,
+    pub media_artwork: bool,
 }
 
 impl PeerInfo {
@@ -1202,6 +1206,12 @@ impl PeerInfo {
             media_control: hello
                 .capabilities
                 .contains(&(wire::Capability::MediaControlV1 as i32)),
+            audio_rekey: hello
+                .capabilities
+                .contains(&(wire::Capability::AudioRekeyV1 as i32)),
+            media_artwork: hello
+                .capabilities
+                .contains(&(wire::Capability::MediaArtworkV1 as i32)),
             media_seek: hello
                 .capabilities
                 .contains(&(wire::Capability::MediaSeekV1 as i32)),
@@ -1249,6 +1259,8 @@ pub fn capabilities_from_wire(bits: &[i32]) -> fr::Capabilities {
             | WireCapability::MicControlV1
             | WireCapability::MediaControlV1
             | WireCapability::MediaSeekV1
+            | WireCapability::AudioRekeyV1
+            | WireCapability::MediaArtworkV1
             | WireCapability::ClipboardSession => {}
         }
     }
