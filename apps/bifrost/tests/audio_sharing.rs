@@ -950,12 +950,75 @@ fn windows_process_source_reverses_roles_and_mode_change_keeps_owned_media_runni
         wire::AudioRole::Source,
         &pair.source_id,
     );
-    let reversed = audio::healthy(
-        &mut pair.source,
-        &mut pair.listener,
-        &pair.source_id,
-        &pair.listener_id,
-    );
+    let reversed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        audio::healthy(
+            &mut pair.source,
+            &mut pair.listener,
+            &pair.source_id,
+            &pair.listener_id,
+        )
+    })) {
+        Ok(session) => session,
+        Err(failure) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pair.listener.status()))
+            {
+                Ok(status) => {
+                    let observed_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .ok();
+                    eprintln!(
+                        "ROLE_REVERSAL_SOURCE_FAILURE unix_ms={observed_at:?} role={} enabled={} requested={:?} error={:?} sessions={}",
+                        status.role,
+                        status.enabled,
+                        status.system_sharing_requested,
+                        status.system_sharing_error,
+                        status.sessions.len(),
+                    );
+                    for backend in &status.backend {
+                        eprintln!(
+                            "ROLE_REVERSAL_SOURCE_BACKEND capability={:?} availability={:?} reason={:?}",
+                            wire::AudioBackendCapability::try_from(backend.capability),
+                            wire::AudioAvailability::try_from(backend.availability),
+                            wire::AudioUnavailableReason::try_from(backend.reason),
+                        );
+                    }
+                    if let Some(config) = status.config.as_ref() {
+                        eprintln!(
+                            "ROLE_REVERSAL_SOURCE_CONFIG group={:?} group_override={:?} listener={:?} system_sharing={:?}",
+                            config.group_id,
+                            config.group_id_override,
+                            config.listener_node_id,
+                            config.system_sharing,
+                        );
+                        if let Some(peer) = config
+                            .peers
+                            .iter()
+                            .find(|peer| peer.node_id == config.listener_node_id)
+                        {
+                            eprintln!(
+                                "ROLE_REVERSAL_SOURCE_PEER send={} receive={} send_override={:?} receive_override={:?}",
+                                peer.allow_system_send,
+                                peer.allow_system_receive,
+                                peer.system_send_override,
+                                peer.system_receive_override,
+                            );
+                        } else {
+                            eprintln!("ROLE_REVERSAL_SOURCE_PEER selected_peer_config_absent");
+                        }
+                    }
+                    for session in &status.sessions {
+                        eprintln!(
+                            "ROLE_REVERSAL_SOURCE_SESSION id={:?} state={} consent={:?}",
+                            session.session_id, session.state, session.consent,
+                        );
+                    }
+                }
+                Err(_) => eprintln!("ROLE_REVERSAL_SOURCE_FAILURE public_status_unavailable"),
+            }
+            std::panic::resume_unwind(failure);
+        }
+    };
     assert_ne!(
         first, reversed,
         "role reversal negotiates a fresh media session"
