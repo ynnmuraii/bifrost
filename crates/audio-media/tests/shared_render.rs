@@ -22,10 +22,58 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+// This fixture stops and catches up its Dry device explicitly. It has no
+// independently advancing native device clock to extrapolate between pumps.
+struct ToneStream {
+    inner: DryStream,
+    manual_render_clock: bool,
+}
+impl std::ops::Deref for ToneStream {
+    type Target = DryStream;
+    fn deref(&self) -> &DryStream {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for ToneStream {
+    fn deref_mut(&mut self) -> &mut DryStream {
+        &mut self.inner
+    }
+}
+impl Stream for ToneStream {
+    fn format(&self) -> AudioFormat {
+        self.inner.format()
+    }
+    fn device(&self) -> Option<&DeviceId> {
+        self.inner.device()
+    }
+    fn feedback_guarantee(&self) -> FeedbackGuarantee {
+        self.inner.feedback_guarantee()
+    }
+    fn snapshot(&self) -> StreamSnapshot {
+        let mut snapshot = self.inner.snapshot();
+        if self.manual_render_clock {
+            snapshot.device_position = None;
+            snapshot.clock_frequency = None;
+            snapshot.host_time_100ns = None;
+        }
+        snapshot
+    }
+    fn suppress_local_playback(
+        &mut self,
+        admitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), BackendError> {
+        self.inner.suppress_local_playback(admitted)
+    }
+    fn stop(&mut self) -> Result<(), BackendError> {
+        self.inner.stop()
+    }
+}
+
 struct ToneBackend {
     dry: DryBackend,
     frequency: f64,
     render_opens: usize,
+    manual_render_clock: bool,
     silent_until: u64,
     onset: Option<(Instant, Arc<AtomicU64>)>,
 }
@@ -61,13 +109,14 @@ impl ToneBackend {
             dry,
             frequency,
             render_opens: 0,
+            manual_render_clock: false,
             silent_until: 0,
             onset: None,
         }
     }
 }
 impl Backend for ToneBackend {
-    type Stream = DryStream;
+    type Stream = ToneStream;
     type Mute = DryMuteGuard;
     fn capabilities(&self) -> Capabilities {
         self.dry.capabilities()
@@ -85,13 +134,13 @@ impl Backend for ToneBackend {
         &mut self,
         request: CaptureSpec,
         mut callback: CaptureCallback,
-    ) -> Result<DryStream, BackendError> {
+    ) -> Result<ToneStream, BackendError> {
         let frequency = self.frequency;
         let silent_until = self.silent_until;
         let onset = self.onset.clone();
         let mut scratch = [0.0; MAX_CAPTURE_BLOCK_FRAMES * 2];
         let mut position = 0u64;
-        self.dry.start_capture(
+        let stream = self.dry.start_capture(
             request,
             Box::new(move |block| {
                 if position <= silent_until && position + block.frames as u64 > silent_until {
@@ -123,16 +172,23 @@ impl Backend for ToneBackend {
                     ..block
                 });
             }),
-        )
+        )?;
+        Ok(ToneStream {
+            inner: stream,
+            manual_render_clock: false,
+        })
     }
     fn start_render(
         &mut self,
         request: RenderRequest,
         callback: RenderCallback,
-    ) -> Result<DryStream, BackendError> {
+    ) -> Result<ToneStream, BackendError> {
         let stream = self.dry.start_render(request, callback)?;
         self.render_opens += 1;
-        Ok(stream)
+        Ok(ToneStream {
+            inner: stream,
+            manual_render_clock: self.manual_render_clock,
+        })
     }
     fn capture_mute(&self, selection: &DeviceSelection) -> Result<MuteSnapshot, BackendError> {
         self.dry.capture_mute(selection)
@@ -230,6 +286,7 @@ fn exercise(rate: u32, shared_source: bool) {
     }
     let frequencies = [600.0, 1100.0, 1700.0];
     let mut output_backend = ToneBackend::new(0.0, rate);
+    output_backend.manual_render_clock = true;
     let mut group = ListenerGroup::new(&mut output_backend, request()).unwrap();
     let mut sources = Vec::new();
     let mut listeners = Vec::new();
