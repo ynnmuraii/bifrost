@@ -1,46 +1,138 @@
 # Bifrost
 
-**A rainbow bridge between your computers.**
+**One keyboard and mouse for your Windows and Linux computers, a shared clipboard, and optional system audio in one headset.**
 
-Bifrost is a software KVM: share one keyboard, mouse and text clipboard—and, optionally, system audio—across Windows and Linux computers on your LAN. Control connections use mutual TLS, and you pair computers by comparing a six-digit code on both screens. This is my personal project and an early release—not a polished replacement for every hardware KVM.
+Keep your computers separate. Move between their screens over your LAN without changing the keyboard under your hands.
 
-![Bifrost in dark mode](assets/readme/main-dark.png)
-![Bifrost in light mode](assets/readme/main-light.png)
+**[Download Bifrost 0.5.0](https://github.com/ynnmuraii/bifrost/releases/latest)** · [Get started](#get-started) · [Platform support](#platform-support) · [Русская инструкция](packaging/README_RU.txt)
 
-*Screenshots rendered from the actual UI with example computers; no personal network data.*
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/main-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/readme/main-light.png">
+  <img alt="Bifrost monitor map with example WORKSTATION, LAPTOP and HTPC computers and linked display edges" src="assets/readme/main-light.png">
+</picture>
 
-## What it does
+*The actual Bifrost 0.5.0 interface, rendered offscreen with example computers. The map illustrates a setup, not a live network.*
 
-- Mutual TLS, pairing requests accepted before six-digit confirmation on both computers, and synchronized unpairing.
-- LAN discovery with dotted, gently animated cards for unpaired computers (**Connect / Hide**), plus rediscovery of trusted computers after address changes; manual addresses remain available.
-- Live RTT p95 and jitter on the status screen, with latency pills on the monitor map.
-- A freely arranged monitor map, edge links across gaps and an animated ASCII bridge.
-- Edge glow to show where input is going.
-- Shared **text** clipboard with history, follow-cursor/broadcast policies and **Send to…**; separately opt-in **PNG images on Windows, X11 and KDE Wayland (data-control)** (images are never kept in history; no files).
-- Optional **shared audio**: one headset on a Listener, with system sound from authorized Sources; mix all sources or follow input focus.
-- A popup audio mini-player with now-playing information, local per-source volume/mute and separately permitted media buttons; optional system-wide mute/PTT control of the Listener's physical microphone.
-- Game mode guards against accidental edge switches in fullscreen apps; manual mode is available on Wayland.
-- Configurable switching hotkeys and an emergency release shortcut.
-- Russian and English, light and dark themes.
-- System tray and a per-user **Start at login** toggle in Settings.
-- One executable for the window, core, input agent and optional isolated audio worker—no separate service to install.
-- Version badges on the map and coordinated updates of trusted computers, with the requesting computer updated last.
+## Make room on your desk
 
-The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–1000 ms). Challenges run every `min(TTL/5, 100 ms)`, or 100 ms by default. This fixed budget accommodates a 500 ms TCP stall when renewals resume in time; it cannot guarantee survival through unlimited loss. There is no grace period or adaptive extension: core and agent deadlines stay anchored to challenge issuance plus TTL. The control-return bound is TTL + 100 ms scheduling allowance (1100 ms by default); repeat guard (150 ms) and agent core-silence timeout (300 ms) are unchanged.
+- **Desktop and laptop, one set of controls.** Arrange their displays on the map, link the edges, and move across with your mouse. Use a switching hotkey when you prefer.
+- **Copy here, paste there.** Opt into text clipboard sharing that follows the computer you use, or send a history item to a chosen trusted computer. PNG images have a separate opt-in on supported desktops; files are not transferred.
+- **Keep the headset plugged in.** Opt into system audio from up to three authorized computers on one Listener. Mix them together or let input focus decide which is louder.
 
-### Input reliability in 0.4.0
+Bifrost is a personal project and an early release, not a replacement for every hardware KVM. Windows 11 and Linux X11 are supported; Wayland depends on your desktop and its portals. There is no macOS support or microphone streaming.
 
-The newest absolute pointer position is kept outside the bounded input queue, rather than dropping it when that queue is full. A button, key or wheel event freezes the preceding position first; discrete events and lease boundaries keep their order. Pending motion is cleared at lease end and cannot carry into another lease.
+The app has English and Russian interfaces, light and dark themes, a system tray and optional start at login. One executable includes the window, core, input agent and isolated audio worker; no separate service to install.
 
-Reading and coordination run independently of the single TLS writer. Lease/control messages and Pong have bounded frame-level priority. A **pending frame**, not an idle healthy connection, closes the link after 600 ms without write progress or 1000 ms total; a partially written frame is never reused. Shutdown shares a 100 ms budget. These limits do not extend the lease or change its control-return bound.
+## Get started
 
-The receiving core admits at most 64 native input batches and keeps at most 64 more in a local FIFO, advancing on exact local completions matched by lease and sequence. It no longer evicts an outstanding offer and mistakes a successful burst for a partial injection. Lease/deadline controls remain independent of this input backlog; input does not wait for network `InjectAck` credit.
+1. [Install Bifrost](#download--install) on both computers and open it on the same trusted LAN.
+2. Select a discovered computer and choose **Connect**. **Accept** the request on the other screen, then compare the six-digit codes and confirm on **both** computers only if they match.
+3. Arrange the screens on the map and connect their edges. Take control from the computer whose keyboard you want to use, then move across a linked edge.
+4. Test **Emergency release** before relying on remote input. Enable clipboard sharing if you want it; system audio remains off until you set it up separately.
 
-Bounded diagnostics report p50/p95/p99, durations and counters for capture-receipt age, queue waiting, TLS writes, inbound dispatch, local injection and send-to-`InjectAck` round trips—never input coordinates, keys or content. The source's monotonic capture-receipt timestamp is not a hardware HID timestamp; no clocks are synchronized across computers. The RTT shown in the UI remains Ping RTT, not input latency.
+<details>
+<summary>How pairing works</summary>
 
-Input still shares one reliable TLS/TCP stream: packet loss can cause retransmission and head-of-line stalls. The controlled [two-core Docker benchmark](apps/bifrost/tests/bench_b/README.md) checks delivery, ordering and release safety; its variable loss tails are **not a claim of reduced Wi-Fi p99**.
+```mermaid
+flowchart TD
+    A["Open Bifrost on both computers"] --> B["Connect, then accept the request"]
+    B --> C{"Six-digit codes match?"}
+    C -->|"No"| D["Cancel pairing"]
+    C -->|"Yes: confirm on both"| E["Arrange screens and link edges"]
+    E --> F["Take control and cross a linked edge"]
+    F --> G["Control the other computer"]
+    G --> H["Return here or use Emergency release"]
+```
 
-**Game mode** (Settings) blocks only edge switching: `auto` detects fullscreen apps on Windows/X11 and cursor confinement on Windows; `always` requires an explicit switch, and `off` disables the guard. Per-app allow/block lists match executable basenames or X11 WM_CLASS, case-insensitively; allow takes precedence in auto. **Ctrl+Alt+Shift+G** toggles auto/always (configurable under hotkeys), and the tray offers the same toggle. Explicit switches and emergency release always work, including while input is already remote. Wayland cannot expose foreground apps: use manual mode there. `[game_guard]` defaults to `mode = "auto"`, `block_apps = []`, `allow_apps = []`.
+</details>
+
+If discovery is empty, enter the address manually; this cannot bypass firewall or network isolation. Keep a local keyboard available, especially while setting up Wayland permissions.
+
+## Download & install
+
+**[Get the 0.5.0 release](https://github.com/ynnmuraii/bifrost/releases/latest)** for both computers. Choose the same version on each.
+
+- **Windows 11 · x86_64:** download `bifrost-0.5.0-windows-x86_64.exe`, keep it in a permanent folder, and run it. No administrator account or installer is needed. The executable is not Authenticode-signed; check the download before bypassing SmartScreen.
+- **Linux · x86_64:** extract `bifrost-0.5.0-linux-x86_64.tar.gz`, run `./install.sh` without `sudo`, then open Bifrost from the applications menu. The release requires glibc 2.35 or newer.
+
+On a firewall prompt, allow **private networks only**. Bifrost does not add firewall rules. [Installation, firewall and upgrade details](#technical-details) include ports, signed-checksum verification and older-version migration.
+
+## Shared audio
+
+Use the headset already connected to your **Listener** to hear your other computers. On the Listener, enable receiving; on each **Source**, select that trusted Listener and enable sharing. Pairing alone never grants audio permission.
+
+![Bifrost Audio settings with a trusted laptop selected as the destination and system audio sharing still off](assets/readme/audio-settings-dark.png)
+
+<details>
+<summary>See the audio mini-player</summary>
+
+<img alt="Bifrost audio mini-player with now-playing information, timeline and volume controls" src="assets/readme/audio-player-dark.png" width="360">
+
+</details>
+
+*Audio views rendered from the actual 0.5.0 interface with example computers, invented media metadata and synthetic cover art; no live audio session.*
+
+```mermaid
+flowchart TD
+    S["Up to 3 Sources<br/>Windows / Linux"]
+    S -->|"Both sides consent<br/>Encrypted LAN audio"| L["Listener<br/>Mix All / Follow Focus"]
+    L --> H["One headset"]
+```
+
+Audio is off by default. Media buttons and physical microphone mute/PTT each need separate permission; **microphone audio is never streamed**. Device buffers, Wi-Fi and Bluetooth can add delay. Use headphones: there is no acoustic echo cancellation.
+
+## Trust comes first
+
+Pair by comparing the six-digit code on **both screens**. Control connections use pinned mutual TLS; a discovery card is not proof of identity or permission to connect.
+
+Clipboard and audio sharing are opt-in. Text clipboard items are capped at 1 MiB; PNG images need a second opt-in, default to a 16 MiB limit (up to 32 MiB), and never enter history. Pairing does not grant audio, media-control or microphone-control permission.
+
+Use a trusted LAN. Discovery announces computer names and connection metadata to that LAN without encryption; it never advertises pairing codes, keystrokes or clipboard content. You can disable discovery or use manual addresses.
+
+Closing the window does not stop the core or an active session. Use the app's explicit controls to return input or stop sharing.
+
+## Platform support
+
+| Platform | Input sharing | Shared audio |
+| --- | --- | --- |
+| Windows 11 | Capture and receive input | WASAPI system audio; process-tree exclusion and native media/mic/PTT controls where available |
+| Linux X11 | Capture and receive input | Pulse-compatible monitor audio/MPRIS; focused GUI PTT, not native global X11 PTT |
+| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible audio/MPRIS; current zero portal timestamps cannot prove native PTT freshness; GUI hold-to-talk remains available |
+| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible audio/MPRIS; native PTT requires a present portal with verifiable fresh timestamps, not GNOME 46 |
+| wlroots-based Wayland desktops | Not supported | Not a supported Bifrost desktop |
+| macOS | Not supported | Not supported |
+
+
+## Before you rely on it
+
+- Keep a local keyboard available and test Emergency release. On Wayland, check the shortcut status in **Keys**: a running app does not mean the portal supports that shortcut.
+- GNOME Wayland cannot share PNG clipboard images; GNOME 46 can receive input but cannot capture it for another computer. wlroots desktops and macOS are unsupported.
+- This is not a hard-realtime audio link. Linux monitor capture cannot exclude individual apps; microphone mute affects every app using that physical microphone.
+
+## Technical details
+
+<details>
+<summary>Platform limitations and emergency-key precautions</summary>
+
+## Known limitations
+
+- Early software: keep access to a local keyboard and test emergency release before relying on remote input.
+- The Windows executable has no Authenticode signature and may trigger SmartScreen; release checksums have a separate Ed25519 signature. Linux desktops may need explicit portal approval.
+- Wayland shows a desktop-portal permission dialog on first use. Support depends on your compositor and portal backend.
+- The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
+- Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
+- Shared audio is off by default and requires explicit permissions on both computers; pairing does not grant audio consent. A Source selects one Listener.
+- Linux monitor capture cannot exclude individual applications. Native portal PTT fails closed on unverifiable clocks or conservative event age over 250 ms, including delayed first events; use GUI hold-to-talk. Microphone streaming, virtual-microphone routing and dependent target UX are deferred; native global X11 PTT is unsupported.
+- Endpoint mute affects every app using that microphone. Linux mute restoration has best-effort ownership, not an atomic guarantee against other mute writers; native portal PTT additionally requires the verifiable clocks described above.
+- Audio includes driver/device buffering and is not a hard-realtime or studio-monitoring link. Wi-Fi and Bluetooth can add delay; there is no AEC, so headphones are recommended.
+
+</details>
+
+<details>
+<summary>Installation, firewall, upgrades, pairing and clipboard</summary>
+
+### Installation & upgrades
 
 ## Download & install
 
@@ -77,13 +169,16 @@ No `sudo`: this installs `~/.local/bin/bifrost`, an application-menu entry and i
 
 Runtime: X11 works too; Wayland input sharing needs `xdg-desktop-portal` with RemoteDesktop/InputCapture and a compatible backend (KDE Plasma ≥6.1 or GNOME ≥45). The GitHub Linux build targets **glibc 2.35 or newer** (Ubuntu 22.04 baseline); older distributions should build from source. Allow **TCP 47901/47902 + UDP 47902 (discovery)** on your LAN firewall. UDP 47902 is separate from TCP 47902 clipboard; discovery does not require enabling clipboard. Shared audio usually needs no extra UDP rule on stateful LAN firewalls after the pinned TCP link; TCP 47901 must be reachable in at least one direction. If path validation fails, allow **UDP 47903 from the Source's LAN address on the Listener** (or `audio.media_port`). Bifrost adds no firewall rules; AP/client isolation and VPN policy still apply.
 
-## Quick start
+## Pairing & clipboard
 
 1. Run Bifrost on both computers, on the same trusted LAN. On a fresh setup, the window starts its core and creates the settings automatically.
 2. Select a discovered computer and click **Connect**, then **Accept** its pairing request on the other screen. Incoming requests can be disabled in **Settings → Accept pairing requests** (`[pairing] accept_requests = false`). With older versions or a manual address, first open the pairing window on the other computer, then connect as before.
 3. Compare the six-digit codes and confirm on **both** computers. Only confirm if the codes match.
    A request grants no trust. Accept opens a temporary window restricted to the requesting certificate; declining mutes that identity for ten minutes.
 4. Arrange the screens on the map and connect their edges. Right-click a display-edge pair to allow or forbid crossing it (forbidden edges are dashed); a very short shared span is left off automatically and can be enabled the same way. Take control on the computer whose keyboard you want to use, then move across a linked edge. Enable the shared clipboard if you want it, and test your emergency shortcut first.
+
+<details>
+<summary>Pairing, clipboard destinations, image limits and discovery privacy</summary>
 
 Pairing requests and synchronized unpairing require **0.3.1 on both computers**. Unpairing removes trust on the other computer immediately if online, or on its next connection within 30 days. Older versions keep manual pairing windows and may show a manual **Remove** suggestion instead of synchronized removal.
 
@@ -103,7 +198,12 @@ For routed input, capable peers acknowledge application before the first press i
 
 Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited to selected LAN adapters; VPN adapters are used only when explicitly selected. Wi-Fi multicast filtering, guest/client isolation or separate VLANs may hide computers. **Enter the address manually** if the list is empty; TCP connectivity is still required, so manual entry cannot bypass network isolation.
 
-## Shared audio
+</details>
+
+</details>
+
+<details>
+<summary>Audio setup, player controls, permissions, local silence and compatibility</summary>
 
 One headset on a single **Listener**, system sound from up to three authorized **Sources**. **Mix All** plays them together; **Follow Focus** makes the focused computer primary and quietens the others. Audio is off by default.
 The independent, always-on-top mini-player shows now-playing information where the Source's player supports it, plus local per-source volume/mute. It opens automatically after an observed running stream; an empty player has no playback controls. Each Source separately permits its Listener's media commands; sharing system audio does not enable them.
@@ -151,28 +251,30 @@ Normal stop restores the previous output mute state **best-effort**: an already-
 - **No microphone streaming or virtual microphone yet:** a Listener's headset mic does not appear on a Source; dependent microphone-target routing/UX is also deferred.
 - **No macOS or AEC:** headphones are recommended to avoid acoustic feedback. See the [commented configuration example](crates/config/examples-data/config.example.toml) for defaults and downgrade precautions.
 
-## Platform support
+</details>
+<details>
+<summary>Input reliability, diagnostics and game mode</summary>
 
-| Platform | Input sharing | Shared audio |
-| --- | --- | --- |
-| Windows 11 | Capture and receive input | WASAPI system audio; process-tree exclusion and native media/mic/PTT controls where available |
-| Linux X11 | Capture and receive input | Pulse-compatible monitor audio/MPRIS; focused GUI PTT, not native global X11 PTT |
-| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible audio/MPRIS; current zero portal timestamps cannot prove native PTT freshness; GUI hold-to-talk remains available |
-| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible audio/MPRIS; native PTT requires a present portal with verifiable fresh timestamps, not GNOME 46 |
-| wlroots-based Wayland desktops | Not supported | Not a supported Bifrost desktop |
-| macOS | Not supported | Not supported |
+The input lease defaults to `timing.lease_ttl_ms = 1000` (allowed range 300–1000 ms). Challenges run every `min(TTL/5, 100 ms)`, or 100 ms by default. This fixed budget accommodates a 500 ms TCP stall when renewals resume in time; it cannot guarantee survival through unlimited loss. There is no grace period or adaptive extension: core and agent deadlines stay anchored to challenge issuance plus TTL. The control-return bound is TTL + 100 ms scheduling allowance (1100 ms by default); repeat guard (150 ms) and agent core-silence timeout (300 ms) are unchanged.
 
-## Known limitations
+### Input reliability in 0.4.0
 
-- Early software: keep access to a local keyboard and test emergency release before relying on remote input.
-- The Windows executable has no Authenticode signature and may trigger SmartScreen; release checksums have a separate Ed25519 signature. Linux desktops may need explicit portal approval.
-- Wayland shows a desktop-portal permission dialog on first use. Support depends on your compositor and portal backend.
-- The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
-- Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
-- Shared audio is off by default and requires explicit permissions on both computers; pairing does not grant audio consent. A Source selects one Listener.
-- Linux monitor capture cannot exclude individual applications. Native portal PTT fails closed on unverifiable clocks or conservative event age over 250 ms, including delayed first events; use GUI hold-to-talk. Microphone streaming, virtual-microphone routing and dependent target UX are deferred; native global X11 PTT is unsupported.
-- Endpoint mute affects every app using that microphone. Linux mute restoration has best-effort ownership, not an atomic guarantee against other mute writers; native portal PTT additionally requires the verifiable clocks described above.
-- Audio includes driver/device buffering and is not a hard-realtime or studio-monitoring link. Wi-Fi and Bluetooth can add delay; there is no AEC, so headphones are recommended.
+The newest absolute pointer position is kept outside the bounded input queue, rather than dropping it when that queue is full. A button, key or wheel event freezes the preceding position first; discrete events and lease boundaries keep their order. Pending motion is cleared at lease end and cannot carry into another lease.
+
+Reading and coordination run independently of the single TLS writer. Lease/control messages and Pong have bounded frame-level priority. A **pending frame**, not an idle healthy connection, closes the link after 600 ms without write progress or 1000 ms total; a partially written frame is never reused. Shutdown shares a 100 ms budget. These limits do not extend the lease or change its control-return bound.
+
+The receiving core admits at most 64 native input batches and keeps at most 64 more in a local FIFO, advancing on exact local completions matched by lease and sequence. It no longer evicts an outstanding offer and mistakes a successful burst for a partial injection. Lease/deadline controls remain independent of this input backlog; input does not wait for network `InjectAck` credit.
+
+Bounded diagnostics report p50/p95/p99, durations and counters for capture-receipt age, queue waiting, TLS writes, inbound dispatch, local injection and send-to-`InjectAck` round trips—never input coordinates, keys or content. The source's monotonic capture-receipt timestamp is not a hardware HID timestamp; no clocks are synchronized across computers. The RTT shown in the UI remains Ping RTT, not input latency.
+
+Input still shares one reliable TLS/TCP stream: packet loss can cause retransmission and head-of-line stalls. The controlled [two-core Docker benchmark](apps/bifrost/tests/bench_b/README.md) checks delivery, ordering and release safety; its variable loss tails are **not a claim of reduced Wi-Fi p99**.
+
+**Game mode** (Settings) blocks only edge switching: `auto` detects fullscreen apps on Windows/X11 and cursor confinement on Windows; `always` requires an explicit switch, and `off` disables the guard. Per-app allow/block lists match executable basenames or X11 WM_CLASS, case-insensitively; allow takes precedence in auto. **Ctrl+Alt+Shift+G** toggles auto/always (configurable under hotkeys), and the tray offers the same toggle. Explicit switches and emergency release always work, including while input is already remote. Wayland cannot expose foreground apps: use manual mode there. `[game_guard]` defaults to `mode = "auto"`, `block_apps = []`, `allow_apps = []`.
+
+</details>
+
+<details>
+<summary>Command line and building from source</summary>
 
 ## Windows command line
 
@@ -220,8 +322,8 @@ permission on that desktop. Their reported timing is not synchronized physical
 end-to-end latency. Microphone lease tests use Dry targets; registration-only
 hotkey checks do not establish physical-key or real-microphone acceptance.
 
+</details>
+
 ## License
 
 [MIT](LICENSE). Distributed third-party components are listed in [THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).
-
-Bifrost was formerly called MultiDeskFlow; the repository URL has not changed.
