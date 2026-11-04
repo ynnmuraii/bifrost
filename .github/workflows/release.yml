@@ -54,9 +54,13 @@ jobs:
           Compress-Archive -Path "$stage/*" -DestinationPath "$out/$name.zip"
           $info = (Get-Item "$out/$name.exe").VersionInfo
           if ($info.FileVersion -ne $version -or $info.ProductVersion -ne $version) { throw 'Wrong Windows version metadata' }
-          $printed = & "$out/$name.exe" --version
-          if ($LASTEXITCODE -ne 0 -or $printed.Trim() -ne "Bifrost $version") { throw 'Wrong Windows executable version' }
+          $versionOut = Join-Path $env:RUNNER_TEMP 'bifrost-version.stdout'
+          $versionErr = Join-Path $env:RUNNER_TEMP 'bifrost-version.stderr'
+          $versionProcess = Start-Process -FilePath "$out/$name.exe" -ArgumentList '--version' -Wait -NoNewWindow -PassThru -RedirectStandardOutput $versionOut -RedirectStandardError $versionErr
+          $printed = [string](Get-Content -LiteralPath $versionOut -Raw)
+          Get-Content -LiteralPath $versionErr
           $printed
+          if ($versionProcess.ExitCode -ne 0 -or $printed.Trim() -ne "Bifrost $version") { throw 'Wrong Windows executable version' }
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
