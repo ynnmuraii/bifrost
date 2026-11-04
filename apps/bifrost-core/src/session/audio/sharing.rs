@@ -271,6 +271,15 @@ impl Actor {
             .as_ref()
             .is_some_and(|start| start.request_id == Some(id))
         {
+            eprintln!(
+                "BIFROST_ROLE_DIAG MATCHED_START_RESULT local={} now_ms={} request_id={id:?} result={result:?} current_parent={:?}",
+                self.local,
+                self.now(),
+                self.system_start
+                    .as_ref()
+                    .and_then(|start| self.peers.get(&start.peer))
+                    .map(|peer| &peer.parent),
+            );
             self.system_start = None;
             match result {
                 Ok(session) => self.system_session = Some(session),
@@ -348,6 +357,14 @@ impl Actor {
             return;
         }
         if let Some(code) = self.start_refusal(peer) {
+            eprintln!(
+                "BIFROST_ROLE_DIAG LOCAL_START_REFUSAL local={} now_ms={} peer={peer} local_role={:?} local_group={:?} peer_state={:?} code={code}",
+                self.local,
+                self.now(),
+                self.config.role,
+                self.config.group_id,
+                self.peers.get(&peer).map(|peer| (&peer.parent, &peer.hello)),
+            );
             self.system_failed(code);
             return;
         }
@@ -389,6 +406,11 @@ impl Actor {
             kind: keys::StreamKind::System,
             profile,
         }) {
+            eprintln!(
+                "BIFROST_ROLE_DIAG LOCAL_REQUEST_START_REJECTED local={} now_ms={} parent={parent:?} request_id={request_id:?} code={code}",
+                self.local,
+                self.now(),
+            );
             self.system_failed(code);
         }
         self.drain().await;

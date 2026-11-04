@@ -517,6 +517,20 @@ pub struct ControlPlane {
     last_worker_generation: Option<[u8; 16]>,
     now: u64,
 }
+/// Diagnostic branch only: a pure borrowed projection for Core-owned tracing.
+#[derive(Debug)]
+pub struct DiagnosticHello<'a> {
+    pub local_role: Option<AudioRole>,
+    pub local_group: Option<&'a [u8; 16]>,
+    pub enabled: bool,
+    pub matching_parent: Option<&'a Parent>,
+    pub trusted: Option<bool>,
+    pub control: Option<bool>,
+    pub accepted_hello: Option<&'a Hello>,
+    pub remote_revision: Option<u32>,
+    pub remote_allowed: Option<bool>,
+}
+
 impl ControlPlane {
     pub fn new(local: NodeId) -> Self {
         Self {
@@ -550,6 +564,22 @@ impl ControlPlane {
             .as_ref()
             .map(|session| session.view)
     }
+    /// Diagnostic branch only; no I/O, clock, mutation, or owned peer copy.
+    pub fn diagnostic_hello(&self, parent: Parent) -> DiagnosticHello<'_> {
+        let peer = self.peer_index(parent).ok().map(|index| &self.peers[index]);
+        DiagnosticHello {
+            local_role: self.settings.role,
+            local_group: self.settings.group.as_ref(),
+            enabled: self.enabled(),
+            matching_parent: peer.map(|peer| &peer.parent),
+            trusted: peer.map(|peer| peer.trusted),
+            control: peer.map(|peer| peer.support.control),
+            accepted_hello: peer.and_then(|peer| peer.hello.as_ref()),
+            remote_revision: peer.map(|peer| peer.remote_revision),
+            remote_allowed: peer.map(|peer| peer.remote_allowed),
+        }
+    }
+
     pub fn handle(&mut self, now: u64, input: Input, out: &mut Vec<Effect>) -> Result<(), Error> {
         // Stale network callbacks cannot mutate a replacement link; local callers need an error.
         match input {

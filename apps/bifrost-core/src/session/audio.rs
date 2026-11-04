@@ -1144,7 +1144,17 @@ impl Actor {
                         }
                     }
                 }
-                fsm::Effect::Send { parent, message } => self.send_control(parent, message).await,
+                fsm::Effect::Send { parent, message } => {
+                    if let fsm::Control::Hello(hello) = message {
+                        eprintln!(
+                            "BIFROST_ROLE_DIAG HELLO_SEND_EFFECT local={} now_ms={} parent={parent:?} local_role={:?} hello={hello:?}",
+                            self.local,
+                            self.now(),
+                            self.config.role,
+                        );
+                    }
+                    self.send_control(parent, message).await;
+                }
                 fsm::Effect::GenerateSourceNonce { parent, session } => {
                     if self.current(parent) {
                         let now = self.now();
@@ -1354,12 +1364,27 @@ impl Actor {
         ) else {
             return;
         };
-        if self
+        let failed = self
             .manager
             .send_audio_control(&NodeId::new(parent.peer), encoded)
             .await
-            .is_err()
-        {
+            .is_err();
+        match message {
+            fsm::Control::Hello(hello) => eprintln!(
+                "BIFROST_ROLE_DIAG HELLO_TX_ACK local={} now_ms={} parent={parent:?} accepted={} hello={hello:?}",
+                self.local,
+                self.now(),
+                !failed,
+            ),
+            fsm::Control::StartRefusal { request_id, reason } => eprintln!(
+                "BIFROST_ROLE_DIAG START_REFUSAL_TX_ACK local={} now_ms={} parent={parent:?} accepted={} request_id={request_id:?} reason={reason:?}",
+                self.local,
+                self.now(),
+                !failed,
+            ),
+            _ => {}
+        }
+        if failed {
             // A local capability announcement becomes usable only after its writer ACK.
             // Keep bounded metadata for that transient, never bypass the wire gate.
             enqueue_retry(&mut self.retry, parent, message);
@@ -2448,6 +2473,22 @@ impl Actor {
         };
         match wire::decode_control(&message, remote_role, parent.connection_id) {
             Ok(wire::DecodedControl::Control { message, .. }) => {
+                match message {
+                    fsm::Control::Hello(hello) => eprintln!(
+                        "BIFROST_ROLE_DIAG HELLO_RX local={} now_ms={} input_parent={parent:?} current_parent_and_cached_hello={:?} local_role={:?} local_group={:?} incoming={hello:?}",
+                        self.local,
+                        self.now(),
+                        self.peers.get(&peer).map(|peer| (&peer.parent, &peer.hello)),
+                        self.config.role,
+                        self.config.group_id,
+                    ),
+                    fsm::Control::StartRefusal { request_id, reason } => eprintln!(
+                        "BIFROST_ROLE_DIAG START_REFUSAL_RX local={} now_ms={} parent={parent:?} request_id={request_id:?} reason={reason:?}",
+                        self.local,
+                        self.now(),
+                    ),
+                    _ => {}
+                }
                 if let Some(p) = self.peers.get_mut(&peer) {
                     match message {
                         fsm::Control::Hello(mut hello) => {
@@ -2480,7 +2521,24 @@ impl Actor {
                         _ => {}
                     }
                 }
-                let _ = self.feed(fsm::Input::Receive { parent, message });
+                let observe_hello = matches!(message, fsm::Control::Hello(_));
+                if observe_hello {
+                    eprintln!(
+                        "BIFROST_ROLE_DIAG HELLO_MODEL_SNAPSHOT local={} now_ms={} phase=before parent={parent:?} state={:?}",
+                        self.local,
+                        self.now(),
+                        self.model.diagnostic_hello(parent),
+                    );
+                }
+                let result = self.feed(fsm::Input::Receive { parent, message });
+                if observe_hello {
+                    eprintln!(
+                        "BIFROST_ROLE_DIAG HELLO_MODEL_SNAPSHOT local={} now_ms={} phase=after parent={parent:?} observed_result={result:?} state={:?}",
+                        self.local,
+                        self.now(),
+                        self.model.diagnostic_hello(parent),
+                    );
+                }
             }
             Ok(wire::DecodedControl::Report(_)) => {}
             Err(wire::Error::Unsupported) => count_optional_drop(&self.optional_drops),
