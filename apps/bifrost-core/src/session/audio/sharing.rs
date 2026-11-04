@@ -271,15 +271,23 @@ impl Actor {
             .as_ref()
             .is_some_and(|start| start.request_id == Some(id))
         {
-            eprintln!(
-                "BIFROST_ROLE_DIAG MATCHED_START_RESULT local={} now_ms={} request_id={id:?} result={result:?} current_parent={:?}",
-                self.local,
-                self.now(),
-                self.system_start
+            if matches!(result, Err(fsm::Reason::RoleConflict)) {
+                let peer = self
+                    .system_start
                     .as_ref()
-                    .and_then(|start| self.peers.get(&start.peer))
-                    .map(|peer| &peer.parent),
-            );
+                    .and_then(|start| self.peers.get(&start.peer));
+                eprintln!(
+                    "BIFROST_ROLE_DIAG MATCHED_START_RESULT local={} now_ms={} request_id={id:?} result={result:?} local_role={:?} local_group={:?} group_override={:?} requested={} current_parent_and_actor_hello={:?} model={:?}",
+                    self.local,
+                    self.now(),
+                    self.config.role,
+                    self.config.group_id,
+                    self.config.group_override,
+                    self.system_requested,
+                    peer.map(|peer| (&peer.parent, &peer.hello)),
+                    peer.map(|peer| self.model.diagnostic_hello(peer.parent)),
+                );
+            }
             self.system_start = None;
             match result {
                 Ok(session) => self.system_session = Some(session),
@@ -357,14 +365,20 @@ impl Actor {
             return;
         }
         if let Some(code) = self.start_refusal(peer) {
-            eprintln!(
-                "BIFROST_ROLE_DIAG LOCAL_START_REFUSAL local={} now_ms={} peer={peer} local_role={:?} local_group={:?} peer_state={:?} code={code}",
-                self.local,
-                self.now(),
-                self.config.role,
-                self.config.group_id,
-                self.peers.get(&peer).map(|peer| (&peer.parent, &peer.hello)),
-            );
+            if code == ipc::audio::codes::AUDIO_ROLE_CONFLICT {
+                let peer_state = self.peers.get(&peer);
+                eprintln!(
+                    "BIFROST_ROLE_DIAG LOCAL_START_REFUSAL local={} now_ms={} peer={peer} code={code} local_role={:?} local_group={:?} group_override={:?} requested={} current_parent_and_actor_hello={:?} model={:?}",
+                    self.local,
+                    self.now(),
+                    self.config.role,
+                    self.config.group_id,
+                    self.config.group_override,
+                    self.system_requested,
+                    peer_state.map(|peer| (&peer.parent, &peer.hello)),
+                    peer_state.map(|peer| self.model.diagnostic_hello(peer.parent)),
+                );
+            }
             self.system_failed(code);
             return;
         }
@@ -406,11 +420,20 @@ impl Actor {
             kind: keys::StreamKind::System,
             profile,
         }) {
-            eprintln!(
-                "BIFROST_ROLE_DIAG LOCAL_REQUEST_START_REJECTED local={} now_ms={} parent={parent:?} request_id={request_id:?} code={code}",
-                self.local,
-                self.now(),
-            );
+            if code == ipc::audio::codes::AUDIO_ROLE_CONFLICT {
+                let peer = self.peers.get(&NodeId::new(parent.peer));
+                eprintln!(
+                    "BIFROST_ROLE_DIAG LOCAL_REQUEST_START_REJECTED local={} now_ms={} parent={parent:?} request_id={request_id:?} code={code} local_role={:?} local_group={:?} group_override={:?} requested={} current_parent_and_actor_hello={:?} model={:?}",
+                    self.local,
+                    self.now(),
+                    self.config.role,
+                    self.config.group_id,
+                    self.config.group_override,
+                    self.system_requested,
+                    peer.map(|peer| (&peer.parent, &peer.hello)),
+                    self.model.diagnostic_hello(parent),
+                );
+            }
             self.system_failed(code);
         }
         self.drain().await;
