@@ -1372,7 +1372,7 @@ impl Actor {
                 !failed,
                 self.config.role,
                 self.config.group_id,
-                self.config.group_override,
+                self.config.group_id_override,
                 self.system_requested,
                 peer.map(|peer| (&peer.parent, &peer.hello)),
                 self.model.diagnostic_hello(parent),
