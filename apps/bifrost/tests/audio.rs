@@ -199,6 +199,16 @@ fn source_gui_start_negotiates_real_media_and_retry_uses_fresh_session_id() {
     // authenticated StartRequest -> Offer/Answer path, not a harness shortcut.
     source.start(&listener_id);
     let first = audio::healthy(&mut listener, &mut source, &listener_id, &source_id);
+    // Admission precedes observed native media. Keep this session and its real
+    // receive progress healthy through the one-second trusted-identity interval.
+    let sustained_until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < sustained_until {
+        assert_eq!(
+            audio::healthy(&mut listener, &mut source, &listener_id, &source_id),
+            first,
+            "first session retains native media through the admission interval"
+        );
+    }
     source.stop(&listener_id, &first);
     source.stopped(&first);
     listener.stopped(&first);

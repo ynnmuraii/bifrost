@@ -54,7 +54,9 @@ jobs:
           Compress-Archive -Path "$stage/*" -DestinationPath "$out/$name.zip"
           $info = (Get-Item "$out/$name.exe").VersionInfo
           if ($info.FileVersion -ne $version -or $info.ProductVersion -ne $version) { throw 'Wrong Windows version metadata' }
-          & "$out/$name.exe" --version
+          $printed = & "$out/$name.exe" --version
+          if ($LASTEXITCODE -ne 0 -or $printed.Trim() -ne "Bifrost $version") { throw 'Wrong Windows executable version' }
+          $printed
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |

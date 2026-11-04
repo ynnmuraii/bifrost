@@ -335,11 +335,9 @@ impl Actor {
         }
         // Disabled audio intentionally does not advertise control. This is pending
         // discovery, not a remote consent refusal; no StartRequest has been sent.
-        if self
-            .peers
-            .get(&peer)
-            .is_none_or(|peer| !peer.support.control || peer.hello.is_none())
-        {
+        if self.peers.get(&peer).is_none_or(|peer| {
+            !peer.support.control || self.model.remote_hello(peer.parent).is_none()
+        }) {
             return;
         }
         // An automatic Source still awaits its selected Listener's authenticated
@@ -891,11 +889,32 @@ mod tests {
                         }
                     }
                 }
-                loop {
-                    let (request_id, message) = replies.recv().await.unwrap();
-                    if request_id == 92 {
-                        assert!(matches!(message, gui::gui_frame::Msg::AudioStatus(_)));
-                        break;
+                if mic_contention {
+                    let mut off_replied = false;
+                    let mut status_replied = false;
+                    while !off_replied || !status_replied {
+                        let (request_id, message) = replies.recv().await.unwrap();
+                        match (request_id, message) {
+                            (91, gui::gui_frame::Msg::OpResult(result)) if !off_replied => {
+                                assert!(result.ok, "public OFF completes successfully: {result:?}");
+                                off_replied = true;
+                            }
+                            (92, gui::gui_frame::Msg::AudioStatus(status)) if !status_replied => {
+                                assert_eq!(status.system_sharing_requested, Some(false));
+                                status_replied = true;
+                            }
+                            (request_id, _) => {
+                                panic!("unexpected public reply for request {request_id}");
+                            }
+                        }
+                    }
+                } else {
+                    loop {
+                        let (request_id, message) = replies.recv().await.unwrap();
+                        if request_id == 92 {
+                            assert!(matches!(message, gui::gui_frame::Msg::AudioStatus(_)));
+                            break;
+                        }
                     }
                 }
             })
@@ -1360,6 +1379,500 @@ mod tests {
         (Arc::new(manager), events, trust)
     }
 
+    #[tokio::test]
+    async fn receiver_applies_published_source_support_before_start_request() {
+        source_capability_ordering(CapabilityOrder::ReceiverWatch).await;
+    }
+
+    #[tokio::test]
+    async fn source_waits_for_current_publication_across_capability_aba() {
+        source_capability_ordering(CapabilityOrder::OldPositiveReceipt).await;
+    }
+
+    #[tokio::test]
+    async fn source_old_withdrawal_completion_cannot_release_new_source_intent() {
+        source_capability_ordering(CapabilityOrder::OldWithdrawalReceipt).await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CapabilityOrder {
+        ReceiverWatch,
+        OldPositiveReceipt,
+        OldWithdrawalReceipt,
+    }
+
+    async fn source_capability_ordering(order: CapabilityOrder) {
+        let publication_aba = order != CapabilityOrder::ReceiverWatch;
+        let root = std::env::temp_dir().join(format!(
+            "bifrost-receiver-order-{}",
+            u128::from_be_bytes(identity::random16().unwrap())
+        ));
+        let listener_root = root.join("listener");
+        let source_root = root.join("source");
+        let listener_identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(
+                &listener_root,
+            ))
+            .unwrap()
+            .0,
+        );
+        let source_identity = Arc::new(
+            identity::NodeIdentity::load_or_create(&identity::IdentityPaths::rooted_at(
+                &source_root,
+            ))
+            .unwrap()
+            .0,
+        );
+        let listener_id = listener_identity.node_id();
+        let source_id = source_identity.node_id();
+        let (listener_manager, mut listener_events, listener_trust) = manager_for(
+            listener_identity,
+            source_id,
+            None,
+            vec![
+                net::Capability::AudioControlV1 as i32,
+                net::Capability::AudioListener as i32,
+            ],
+        );
+        let listener_task = tokio::spawn({
+            let manager = Arc::clone(&listener_manager);
+            async move { manager.run().await.unwrap() }
+        });
+        let listener_address = listener_manager
+            .rebind_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (source_manager, mut source_events, source_trust) = manager_for(
+            source_identity,
+            listener_id,
+            Some(listener_address),
+            vec![net::Capability::AudioControlV1 as i32],
+        );
+        let source_task = tokio::spawn({
+            let manager = Arc::clone(&source_manager);
+            async move { manager.run().await.unwrap() }
+        });
+        let (peer_source, listener_generation, connection, source_hello, source_remote) =
+            next_up(&mut listener_events).await;
+        let (peer_listener, source_generation, source_connection, listener_hello, listener_remote) =
+            next_up(&mut source_events).await;
+        assert_eq!(peer_source, source_id);
+        assert_eq!(peer_listener, listener_id);
+        assert_eq!(connection, source_connection);
+        assert!(!source_hello.system_audio_source);
+        let [(listener_coordinator, mut listener_actor, listener_native), (mut source_coordinator, mut source_actor, source_native)] =
+            std::array::from_fn::<_, 2, _>(|index| {
+                let (directory, local, peer, generation, hello, remote, manager, trust) =
+                    if index == 0 {
+                        (
+                            &listener_root,
+                            listener_id,
+                            source_id,
+                            listener_generation,
+                            &source_hello,
+                            source_remote,
+                            &listener_manager,
+                            &listener_trust,
+                        )
+                    } else {
+                        (
+                            &source_root,
+                            source_id,
+                            listener_id,
+                            source_generation,
+                            &listener_hello,
+                            listener_remote,
+                            &source_manager,
+                            &source_trust,
+                        )
+                    };
+                let paths = config::Paths::new(
+                    directory,
+                    directory,
+                    directory,
+                    Some(directory.to_path_buf()),
+                );
+                let mut stored = config::Config {
+                    audio: config::AudioConfig {
+                        enabled: true,
+                        system_sharing: Some(true),
+                        role: config::AudioRole::Listener,
+                        group_id: Some(config::audio::HexId(if index == 0 {
+                            [3; 16]
+                        } else {
+                            [4; 16]
+                        })),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                stored.network.listen_address = "127.0.0.1".into();
+                stored.save(paths.config_file()).unwrap();
+                let (events, _) = broadcast::channel(32);
+                let (coordinator, mut actor) = Coordinator::prepare(
+                    stored.audio,
+                    local,
+                    Arc::clone(manager),
+                    paths,
+                    if index == 0 {
+                        listener_address
+                    } else {
+                        source_remote
+                    },
+                    true,
+                    events,
+                );
+                coordinator.trusted(trust);
+                coordinator.link_up(peer, generation, connection, hello, remote, true);
+                actor.configure().unwrap();
+                actor.sync_links();
+                let (handle, _stops, _shutdown, native) = AudioHandle::controlled_stop(1);
+                actor.worker = Some(Worker {
+                    handle,
+                    generation: 1,
+                    alive: true,
+                    model_ready: false,
+                    pid: 0,
+                    probe_ack: 0,
+                });
+                actor.probed(
+                    1,
+                    1,
+                    worker::Ready {
+                        backend: worker::BackendKind::Dry as i32,
+                        probed: true,
+                        capabilities: [
+                            worker::Capability::SystemCapture,
+                            worker::Capability::Render,
+                        ]
+                        .into_iter()
+                        .map(|capability| worker::CapabilityAvailability {
+                            capability: capability as i32,
+                            availability: worker::Availability::Available as i32,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    },
+                );
+                (coordinator, actor, native)
+            });
+        let mut source_header = net::Hello {
+            node_id: source_id.as_bytes().to_vec(),
+            display_name: "fixture".into(),
+            session_kind: net::SessionKind::X11 as i32,
+            ..Default::default()
+        };
+        let withdrawal = if publication_aba {
+            source_coordinator
+                .publish_capabilities(&source_manager, &mut source_header)
+                .await;
+            let ready = source_actor.ready.clone().unwrap();
+            let mut unavailable = ready.clone();
+            let capture = unavailable
+                .capabilities
+                .iter_mut()
+                .find(|capability| {
+                    capability.capability == worker::Capability::SystemCapture as i32
+                })
+                .unwrap();
+            capture.availability = worker::Availability::Unavailable as i32;
+            capture.reason = worker::UnavailableReason::DeviceGone as i32;
+            source_actor.probed(1, 2, unavailable);
+            let revision = prepare_capabilities(&mut source_coordinator.caps, &mut source_header);
+            source_actor.probed(1, 3, ready);
+            // The main publisher captured an old withdrawal before the newer
+            // qualification; enqueue it but pause before completing its receipt.
+            source_manager
+                .update_local_hello(source_header.clone())
+                .await;
+            Some(revision)
+        } else {
+            None
+        };
+        listener_actor.drain().await;
+        source_actor.drain().await;
+        let mut source_status = source_actor.events.subscribe();
+        let source_runner = tokio::spawn(source_actor.run());
+        let (out, mut replies) = mpsc::channel(4);
+        source_coordinator
+            .submit(Request {
+                request_id: 1,
+                connection_id: [11; 16],
+                message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                out: out.clone(),
+            })
+            .unwrap();
+        let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, 1);
+        let gui::gui_frame::Msg::AudioStatus(initial) = reply else {
+            panic!("public initial Source status")
+        };
+        source_coordinator
+            .submit(Request {
+                request_id: 2,
+                connection_id: [11; 16],
+                message: gui::gui_frame::Msg::SetSystemAudioSharing(gui::SetSystemAudioSharing {
+                    enabled: true,
+                    role: gui::AudioRole::Source as i32,
+                    listener_node_id: listener_id.as_bytes().to_vec(),
+                    expected_revision: initial.revision,
+                }),
+                out: out.clone(),
+            })
+            .unwrap();
+        let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, 2);
+        assert!(matches!(reply, gui::gui_frame::Msg::OpResult(result) if result.ok));
+        // This public barrier follows ON's normal publish/reconcile turn. The
+        // original authenticated Listener Hello is still queued, not repaired.
+        source_coordinator
+            .submit(Request {
+                request_id: 3,
+                connection_id: [11; 16],
+                message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                out: out.clone(),
+            })
+            .unwrap();
+        let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, 3);
+        assert!(
+            matches!(reply, gui::gui_frame::Msg::AudioStatus(status) if status.system_sharing_requested == Some(true) && status.system_sharing_error.is_empty())
+        );
+        let capabilities = source_coordinator.capabilities();
+        assert!(capabilities.contains(&(net::Capability::SystemAudioSource as i32)));
+        if !publication_aba {
+            source_coordinator
+                .publish_capabilities(&source_manager, &mut source_header)
+                .await;
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    match listener_events.recv().await.unwrap() {
+                        transport::LinkEvent::Message {
+                            peer,
+                            message: transport::convert::Inbound::CapabilitiesChanged(capabilities),
+                        } => {
+                            assert_eq!(peer, source_id);
+                            assert!(
+                                capabilities.contains(&(net::Capability::SystemAudioSource as i32))
+                            );
+                            listener_coordinator.capabilities_changed(peer, &capabilities);
+                            break;
+                        }
+                        transport::LinkEvent::Message {
+                            peer,
+                            message:
+                                transport::convert::Inbound::Audio {
+                                    message,
+                                    connection_id,
+                                },
+                        } => {
+                            listener_coordinator.receive(peer, connection_id, message);
+                            let command = listener_actor.commands.recv().await.unwrap();
+                            listener_actor.on_network(command.parent, command.message.unwrap());
+                            listener_actor.drain().await;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("positive Source capability arrives over actual TLS first");
+            {
+                let links = listener_actor.links.borrow();
+                let peer = links.peers.get(&source_id).unwrap();
+                assert_eq!(peer.parent.connection_id, connection);
+                assert_eq!(peer.parent.generation, listener_generation);
+                assert!(peer.trusted && peer.support.control && peer.support.system_source);
+            }
+            assert!(listener_actor.links.has_changed().unwrap());
+        }
+        if let (CapabilityOrder::OldWithdrawalReceipt, Some(revision)) = (order, withdrawal) {
+            capabilities_published(&source_coordinator.caps, revision);
+        }
+        // Release the same original readiness in the selected legal ordering.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
+                let ready = matches!(&message.body, Some(net::audio_control::Body::Hello(hello)) if hello.listener_available);
+                source_coordinator.receive(peer, envelope_connection, message);
+                if ready {
+                    break;
+                }
+            }
+        }).await.expect("original Listener readiness arrives within one deadline");
+        if let Some(withdrawal) = withdrawal {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let (_, message) = source_status.recv().await.unwrap();
+                    if let gui::gui_frame::Msg::AudioStatus(status) = message {
+                        if status.role == gui::AudioRole::Source as i32
+                            && status
+                                .config
+                                .as_ref()
+                                .is_some_and(|config| config.group_id == [3; 16])
+                        {
+                            assert_eq!(status.system_sharing_requested, Some(true));
+                            assert!(status.system_sharing_error.is_empty());
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("public Source scope resolves while current publication is pending");
+            source_coordinator
+                .submit(Request {
+                    request_id: 4,
+                    connection_id: [11; 16],
+                    message: gui::gui_frame::Msg::GetAudioStatus(gui::GetAudioStatus {}),
+                    out: out.clone(),
+                })
+                .unwrap();
+            let (id, reply) = timeout(Duration::from_secs(5), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(id, 4);
+            let gui::gui_frame::Msg::AudioStatus(status) = reply else {
+                panic!("public pending-publication status");
+            };
+            assert_eq!(status.system_sharing_requested, Some(true));
+            assert!(status.system_sharing_error.is_empty());
+            assert_eq!(status.config.unwrap().group_id, [3; 16]);
+            if order == CapabilityOrder::OldPositiveReceipt {
+                capabilities_published(&source_coordinator.caps, withdrawal);
+            }
+            source_coordinator
+                .publish_capabilities(&source_manager, &mut source_header)
+                .await;
+        }
+        let mut source_advertised_at_request = false;
+        let request_id = timeout(Duration::from_secs(5), async {
+            loop {
+                let (peer, envelope_connection, message) =
+                    match listener_events.recv().await.unwrap() {
+                        transport::LinkEvent::Message {
+                            peer,
+                            message: transport::convert::Inbound::CapabilitiesChanged(capabilities),
+                        } => {
+                            listener_coordinator.capabilities_changed(peer, &capabilities);
+                            continue;
+                        }
+                        transport::LinkEvent::Message {
+                            peer,
+                            message:
+                                transport::convert::Inbound::Audio {
+                                    message,
+                                    connection_id,
+                                },
+                        } => (peer, connection_id, message),
+                        transport::LinkEvent::Down { .. } => {
+                            panic!("current authenticated parent closed before SYSTEM request")
+                        }
+                        _ => continue,
+                    };
+                let request = match &message.body {
+                    Some(net::audio_control::Body::StartRequest(request)) => {
+                        assert_eq!(request.source_node_id.as_slice(), source_id.as_bytes());
+                        assert_eq!(request.group_id.as_slice(), &[3; 16]);
+                        source_advertised_at_request = listener_actor
+                            .links
+                            .borrow()
+                            .peers
+                            .get(&source_id)
+                            .unwrap()
+                            .support
+                            .system_source;
+                        Some(<[u8; 16]>::try_from(request.request_id.as_slice()).unwrap())
+                    }
+                    _ => None,
+                };
+                listener_coordinator.receive(peer, envelope_connection, message);
+                let command = listener_actor.commands.recv().await.unwrap();
+                assert_eq!(command.parent.connection_id, connection);
+                assert_eq!(command.parent.generation, listener_generation);
+                // The legal command-first Actor dispatch intentionally precedes
+                // consuming links.changed. No model support is assigned here.
+                listener_actor.on_network(command.parent, command.message.unwrap());
+                listener_actor.drain().await;
+                if let Some(request_id) = request {
+                    break request_id;
+                }
+            }
+        })
+        .await
+        .expect("real public Source ON produces a SYSTEM request");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, _, response) = next_audio(&mut source_events).await;
+                match response.body {
+                    Some(net::audio_control::Body::Offer(offer)) => {
+                        assert_eq!(offer.request_id.as_slice(), request_id);
+                        assert_eq!(offer.group_id.as_slice(), &[3; 16]);
+                        break;
+                    }
+                    Some(net::audio_control::Body::StartRefusal(refusal)) => {
+                        assert_eq!(refusal.request_id.as_slice(), request_id);
+                        panic!("published Source support must yield same-ID Offer, got StartRefusal reason={}", refusal.reason);
+                    }
+                    _ => {}
+                }
+            }
+        }).await.expect("same-ID Offer arrives within one deadline");
+        assert!(
+            source_advertised_at_request,
+            "authenticated Source capability must precede SYSTEM request"
+        );
+        listener_manager.kill_all().await;
+        let mut offers = 1;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await.unwrap() {
+                    transport::LinkEvent::Message {
+                        message: transport::convert::Inbound::Audio { message, .. },
+                        ..
+                    } => {
+                        if let Some(net::audio_control::Body::Offer(offer)) = message.body {
+                            assert_eq!(offer.request_id.as_slice(), request_id);
+                            offers += 1;
+                        }
+                    }
+                    transport::LinkEvent::Down { peer, .. } if peer == listener_id => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            offers, 1,
+            "one real same-ID Offer, without fake native playback"
+        );
+        println!("RECEIVER_CAP_ORDER source_on=accepted source_capability=authenticated offers=1 same_request=true");
+        source_coordinator.stopping.send_replace(true);
+        source_runner.await.unwrap();
+        source_native.await.unwrap();
+        drop(listener_actor);
+        listener_native.await.unwrap();
+        source_manager.kill_all().await;
+        listener_task.abort();
+        source_task.abort();
+        let _ = listener_task.await;
+        let _ = source_task.await;
+        drop(listener_coordinator);
+        drop(source_coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum SourceSetup {
         Restart,
@@ -1368,14 +1881,35 @@ mod tests {
         WaitingLocalDeny,
         WaitingUnpair,
         RoleFlip,
+        StaleScope,
         KnownWrongRole,
+    }
+
+    async fn run_published_actor(actor: Actor, mut caps: watch::Receiver<Capabilities>) {
+        let manager = Arc::clone(&actor.manager);
+        let mut hello = net::Hello {
+            node_id: actor.local.as_bytes().to_vec(),
+            display_name: "fixture".into(),
+            session_kind: net::SessionKind::X11 as i32,
+            ..Default::default()
+        };
+        tokio::select! {
+            _ = actor.run() => {},
+            _ = async {
+                loop {
+                    publish_capabilities(&mut caps, &manager, &mut hello).await;
+                    if caps.changed().await.is_err() { break; }
+                }
+            } => {},
+        }
     }
 
     async fn unsolicited_offer_with_stored_consent(setup: SourceSetup) {
         let terminal_failure = setup == SourceSetup::TerminalFailure;
         let legacy = matches!(setup, SourceSetup::Legacy | SourceSetup::KnownWrongRole);
         let unpaired = setup == SourceSetup::WaitingUnpair;
-        let role_flip = setup == SourceSetup::RoleFlip;
+        let stale_scope = setup == SourceSetup::StaleScope;
+        let role_flip = matches!(setup, SourceSetup::RoleFlip | SourceSetup::StaleScope);
         let known_wrong_role = setup == SourceSetup::KnownWrongRole;
         let root = std::env::temp_dir().join(format!(
             "bifrost-sharing-offer-{}",
@@ -1512,6 +2046,45 @@ mod tests {
             let command = actor.commands.recv().await.unwrap();
             actor.on_network(command.parent, command.message.unwrap());
             actor.drain().await;
+            if stale_scope {
+                let parent = actor.peers.get(&listener_id).unwrap().parent;
+                for hello in [
+                    fsm::Hello {
+                        role: model::AudioRole::Listener,
+                        group: Some([4; 16]),
+                        listener: *listener_id.as_bytes(),
+                        available: true,
+                        allowed: true,
+                        consent_revision: 20,
+                    },
+                    fsm::Hello {
+                        role: model::AudioRole::Source,
+                        group: Some([3; 16]),
+                        listener: *source_id.as_bytes(),
+                        available: true,
+                        allowed: true,
+                        consent_revision: 19,
+                    },
+                ] {
+                    let message = wire::encode_control(
+                        &fsm::Control::Hello(hello),
+                        hello.role,
+                        44913,
+                        connection,
+                    )
+                    .unwrap();
+                    listener_manager
+                        .send_audio_control(&source_id, message)
+                        .await
+                        .unwrap();
+                    let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
+                    coordinator.receive(peer, envelope_connection, message);
+                    let command = actor.commands.recv().await.unwrap();
+                    assert_eq!(command.parent, parent, "same authenticated Parent");
+                    actor.on_network(command.parent, command.message.unwrap());
+                    actor.drain().await;
+                }
+            }
             // Only the native IPC boundary is controlled; public intent, the
             // actual Actor and authenticated peer messages remain real.
             let (handle, _stops, shutdown, native) = AudioHandle::controlled_stop(1);
@@ -1544,7 +2117,7 @@ mod tests {
             );
             actor.drain().await;
             let (out, mut replies) = mpsc::channel(4);
-            let runner = tokio::spawn(actor.run());
+            let runner = tokio::spawn(run_published_actor(actor, coordinator.caps.clone()));
             coordinator
                 .submit(Request {
                     request_id: 0,
@@ -1609,33 +2182,43 @@ mod tests {
             );
             let mut requests = 0;
             if role_flip {
-                assert_eq!(status.system_sharing_requested, Some(true), "new intent survives the previous peer role while the automatic group is unresolved");
+                assert_eq!(
+                    status.system_sharing_requested,
+                    Some(true),
+                    "new intent survives unresolved scope or a stale peer role"
+                );
                 assert!(status.system_sharing_error.is_empty());
-                assert!(status.config.unwrap().group_id.is_empty());
+                if stale_scope {
+                    assert_eq!(status.config.unwrap().group_id.as_slice(), &[4; 16]);
+                } else {
+                    assert!(status.config.unwrap().group_id.is_empty());
+                }
                 assert!(
                     !*shutdown.borrow(),
                     "pending Source keeps its controlled worker"
                 );
-                let fresh = wire::encode_control(
-                    &fsm::Control::Hello(fsm::Hello {
-                        role: model::AudioRole::Listener,
-                        group: Some([4; 16]),
-                        listener: *listener_id.as_bytes(),
-                        available: true,
-                        allowed: true,
-                        consent_revision: 2,
-                    }),
-                    model::AudioRole::Listener,
-                    44913,
-                    connection,
-                )
-                .unwrap();
-                listener_manager
-                    .send_audio_control(&source_id, fresh)
-                    .await
+                if !stale_scope {
+                    let fresh = wire::encode_control(
+                        &fsm::Control::Hello(fsm::Hello {
+                            role: model::AudioRole::Listener,
+                            group: Some([4; 16]),
+                            listener: *listener_id.as_bytes(),
+                            available: true,
+                            allowed: true,
+                            consent_revision: 2,
+                        }),
+                        model::AudioRole::Listener,
+                        44913,
+                        connection,
+                    )
                     .unwrap();
-                let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
-                coordinator.receive(peer, envelope_connection, message);
+                    listener_manager
+                        .send_audio_control(&source_id, fresh)
+                        .await
+                        .unwrap();
+                    let (peer, envelope_connection, message) = next_audio(&mut source_events).await;
+                    coordinator.receive(peer, envelope_connection, message);
+                }
                 timeout(Duration::from_secs(5), async {
                     loop {
                         let (_, _, message) = next_audio(&mut listener_events).await;
@@ -1946,6 +2529,11 @@ mod tests {
     #[tokio::test]
     async fn source_scope_role_flip_waits_for_current_listener_before_start() {
         unsolicited_offer_with_stored_consent(SourceSetup::RoleFlip).await;
+    }
+
+    #[tokio::test]
+    async fn source_scope_stale_peer_role_cannot_cancel_new_intent() {
+        unsolicited_offer_with_stored_consent(SourceSetup::StaleScope).await;
     }
 
     #[tokio::test]

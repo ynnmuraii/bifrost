@@ -107,11 +107,14 @@ impl Actor {
             view: record.view,
             current_parent: self.current(record.view.parent) && remote.parent == record.view.parent,
             consented: self.allowed(peer)
-                && remote.hello.is_some_and(|h| {
-                    h.allowed
-                        && h.group == self.config.group_id.map(|g| g.0)
-                        && h.role != record.role
-                }),
+                && self
+                    .model
+                    .remote_hello(record.view.parent)
+                    .is_some_and(|h| {
+                        h.allowed
+                            && h.group == self.config.group_id.map(|g| g.0)
+                            && h.role != record.role
+                    }),
             capable,
             worker_generation: generation(worker.generation, self.worker_epoch),
         };

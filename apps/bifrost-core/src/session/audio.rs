@@ -114,6 +114,34 @@ struct Command {
     message: Result<net::AudioControl, protocol::validate::AudioViolation>,
 }
 
+#[derive(Default)]
+struct Capabilities {
+    revision: u64,
+    bits: Vec<i32>,
+    // Local capability-queue publication completion, not a writer or peer ACK.
+    published: AtomicU64,
+}
+
+fn prepare_capabilities(caps: &mut watch::Receiver<Capabilities>, hello: &mut net::Hello) -> u64 {
+    let desired = caps.borrow_and_update();
+    super::merge_audio_capabilities(&mut hello.capabilities, &desired.bits);
+    desired.revision
+}
+fn capabilities_published(caps: &watch::Receiver<Capabilities>, revision: u64) {
+    caps.borrow()
+        .published
+        .fetch_max(revision, Ordering::Release);
+}
+async fn publish_capabilities(
+    caps: &mut watch::Receiver<Capabilities>,
+    manager: &LinkManager,
+    hello: &mut net::Hello,
+) {
+    let revision = prepare_capabilities(caps, hello);
+    manager.update_local_hello(hello.clone()).await;
+    capabilities_published(caps, revision);
+}
+
 pub(super) struct Coordinator {
     source_sound: watch::Sender<Option<u64>>,
     commands: mpsc::Sender<Command>,
@@ -123,7 +151,7 @@ pub(super) struct Coordinator {
     links: watch::Sender<Links>,
     focus: watch::Sender<CommittedFocus>,
     control: watch::Sender<ControlContext>,
-    caps: watch::Receiver<Vec<i32>>,
+    caps: watch::Receiver<Capabilities>,
     optional_drops: Arc<AtomicU64>,
     stopping: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -154,7 +182,7 @@ impl Coordinator {
         let (links, link_rx) = watch::channel(Links::default());
         let (focus_tx, focus_rx) = watch::channel(CommittedFocus::default());
         let (control, control_rx) = watch::channel(ControlContext::default());
-        let (caps_tx, caps) = watch::channel(Vec::new());
+        let (caps_tx, caps) = watch::channel(Capabilities::default());
         let (stopping, stop_rx) = watch::channel(false);
         let focus_policy = FocusPolicy::new(
             u64::from(config.focus_debounce_ms),
@@ -485,8 +513,16 @@ impl Coordinator {
     pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.caps.changed().await
     }
-    pub(super) fn capabilities(&self) -> Vec<i32> {
-        self.caps.borrow().clone()
+    pub(super) async fn publish_capabilities(
+        &mut self,
+        manager: &LinkManager,
+        hello: &mut net::Hello,
+    ) {
+        publish_capabilities(&mut self.caps, manager, hello).await;
+    }
+    #[cfg(test)]
+    fn capabilities(&self) -> Vec<i32> {
+        self.caps.borrow().bits.clone()
     }
     pub(super) async fn shutdown(&mut self) {
         self.stopping.send_replace(true);
@@ -591,7 +627,7 @@ struct Actor {
     focus_revision: u64,
     focus_snapshot: Option<Snapshot>,
     focus_received: bool,
-    caps: watch::Sender<Vec<i32>>,
+    caps: watch::Sender<Capabilities>,
     model: fsm::ControlPlane,
     peers: BTreeMap<NodeId, Peer>,
     admitted: BTreeSet<NodeId>,
@@ -798,11 +834,13 @@ impl Actor {
         }
         let bits = &bits[..len];
         self.caps.send_if_modified(|old| {
-            if old.as_slice() == bits {
+            if old.bits.as_slice() == bits {
                 false
             } else {
-                old.clear();
-                old.extend_from_slice(bits);
+                // Saturation is never eligible to release a new SYSTEM start.
+                old.revision = old.revision.saturating_add(1);
+                old.bits.clear();
+                old.bits.extend_from_slice(bits);
                 true
             }
         });
@@ -2408,6 +2446,11 @@ impl Actor {
         if !self.config.enabled || self.configuration_error.is_some() || !self.current(parent) {
             return;
         }
+        // Authenticated capability updates may precede this command in the
+        // Coordinator watch even when select! has not consumed links.changed().
+        if self.links.has_changed().unwrap_or(true) {
+            self.sync_links();
+        }
         let peer = NodeId::new(parent.peer);
         if let Some(net::audio_control::Body::StartRequest(request)) = &message.body {
             let now = self.now();
@@ -2426,15 +2469,6 @@ impl Actor {
                 return;
             }
         }
-        let remote_role = self
-            .peers
-            .get(&peer)
-            .and_then(|p| p.hello)
-            .map(|h| h.role)
-            .unwrap_or(match self.role() {
-                model::AudioRole::Source => model::AudioRole::Listener,
-                model::AudioRole::Listener => model::AudioRole::Source,
-            });
         // Hello announces a role transition on an existing authenticated link;
         // the previous cached role must not prevent learning its replacement.
         let remote_role = if let Some(net::audio_control::Body::Hello(hello)) = &message.body {
@@ -2444,7 +2478,15 @@ impl Actor {
                 _ => return,
             }
         } else {
-            remote_role
+            let hello = if self.system_enabled() {
+                self.model.remote_hello(parent)
+            } else {
+                self.peers.get(&peer).and_then(|peer| peer.hello)
+            };
+            hello.map(|hello| hello.role).unwrap_or(match self.role() {
+                model::AudioRole::Source => model::AudioRole::Listener,
+                model::AudioRole::Listener => model::AudioRole::Source,
+            })
         };
         match wire::decode_control(&message, remote_role, parent.connection_id) {
             Ok(wire::DecodedControl::Control { message, .. }) => {
@@ -2824,7 +2866,7 @@ impl Actor {
         if !peer.support.control {
             return Some(ipc::audio::codes::AUDIO_CONSENT_REQUIRED);
         }
-        let hello = peer.hello?;
+        let hello = self.model.remote_hello(peer.parent)?;
         if hello.role == self.role()
             || (self.role() == model::AudioRole::Listener
                 && hello.listener != *self.local.as_bytes())
@@ -2842,10 +2884,21 @@ impl Actor {
                 .worker
                 .as_ref()
                 .is_some_and(|w| w.alive && w.model_ready)
+            && {
+                let desired = self.caps.borrow();
+                desired.revision != u64::MAX
+                    && desired.published.load(Ordering::Acquire) == desired.revision
+                    && desired.bits.contains(
+                        &(match self.role() {
+                            model::AudioRole::Source => net::Capability::SystemAudioSource,
+                            model::AudioRole::Listener => net::Capability::AudioListener,
+                        } as i32),
+                    )
+            }
             && self.admitted.contains(&peer)
             && self.peers.get(&peer).is_some_and(|p| {
                 self.current(p.parent)
-                    && p.hello.is_some_and(|hello| {
+                    && self.model.remote_hello(p.parent).is_some_and(|hello| {
                         peer_setup_ready(self.role(), hello)
                             && hello.group == self.config.group_id.map(|group| group.0)
                     })
@@ -3030,10 +3083,9 @@ impl Actor {
                 continue;
             }
             let remote = self
-                .peers
-                .get(peer)
-                .and_then(|p| p.hello)
-                .is_some_and(|h| h.allowed)
+                .model
+                .remote_hello(record.view.parent)
+                .is_some_and(|hello| hello.allowed)
                 && self.current(record.view.parent);
             let local = self.allowed(*peer) && self.current(record.view.parent);
             let (gain_percent, muted) = self.gain(*peer);
@@ -3796,7 +3848,7 @@ mod observation_tests {
         });
         let (focus, _focus) = watch::channel(CommittedFocus::default());
         let (control, _control) = watch::channel(ControlContext::default());
-        let (_caps, caps) = watch::channel(Vec::new());
+        let (_caps, caps) = watch::channel(Capabilities::default());
         let (stopping, _stopping) = watch::channel(false);
         let coordinator = Coordinator {
             source_sound: watch::channel(None).0,

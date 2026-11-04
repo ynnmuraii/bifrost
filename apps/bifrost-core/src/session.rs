@@ -1261,11 +1261,8 @@ impl Session {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "audio")]
-        if let Some(audio) = &self.audio {
-            merge_audio_capabilities(&mut self.local_hello.capabilities, &audio.capabilities());
-            self.manager
-                .update_local_hello(self.local_hello.clone())
-                .await;
+        if self.audio.is_some() {
+            self.publish_local_hello().await;
         }
         let outputs = self.router.on_start(self.now_ms());
         self.apply(outputs).await;
@@ -1377,24 +1374,18 @@ impl Session {
                 Step::Audio(changed) => {
                     #[cfg(feature = "audio")]
                     {
-                        let capabilities = if changed {
-                            self.audio
-                                .as_ref()
-                                .map_or_else(Vec::new, |audio| audio.capabilities())
-                        } else {
-                            Vec::new()
-                        };
-                        merge_audio_capabilities(&mut self.local_hello.capabilities, &capabilities);
-                        self.manager
-                            .update_local_hello(self.local_hello.clone())
-                            .await;
                         if !changed {
                             self.audio = None;
                         }
+                        if self.audio.is_none() {
+                            merge_audio_capabilities(&mut self.local_hello.capabilities, &[]);
+                        }
+                        self.publish_local_hello().await;
                     }
                     #[cfg(not(feature = "audio"))]
                     let _ = changed;
                 }
+
                 Step::Tick => {
                     self.arm_observation().await;
                     self.clipboard_on_focus().await;
@@ -3214,9 +3205,16 @@ impl Session {
         self.local_hello
             .capabilities
             .push(protocol::wire::Capability::RemoteUpdate as i32);
+        self.publish_local_hello().await;
+    }
+
+    async fn publish_local_hello(&mut self) {
         #[cfg(feature = "audio")]
-        if let Some(audio) = &self.audio {
-            merge_audio_capabilities(&mut self.local_hello.capabilities, &audio.capabilities());
+        if let Some(audio) = &mut self.audio {
+            audio
+                .publish_capabilities(&self.manager, &mut self.local_hello)
+                .await;
+            return;
         }
         self.manager
             .update_local_hello(self.local_hello.clone())
@@ -3761,9 +3759,7 @@ impl Session {
                 self.agent_displays_known = true;
                 self.local_hello.displays_revision = revision;
                 self.local_hello.displays = displays.clone();
-                self.manager
-                    .update_local_hello(self.local_hello.clone())
-                    .await;
+                self.publish_local_hello().await;
                 self.rebuild_topology();
                 let message =
                     transport::convert::LayoutMessage::DisplaysChanged { revision, displays };

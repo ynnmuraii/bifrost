@@ -279,8 +279,6 @@ fn suspended_owned_source_expires_actual_listener_ptt_before_parent_link_timeout
         1
     );
     drop(resume);
-    ptt(&mut source, false);
-    agree(&mut listener, &mut source, true, false);
     audio::disable(&two.b, &mut source);
     audio::disable(&two.a, &mut listener);
 }

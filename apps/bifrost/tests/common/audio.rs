@@ -528,10 +528,103 @@ pub fn start_group(nodes: &[&Node]) {
 
 /// Disable through the GUI, then await actual worker and media-socket teardown.
 pub fn disable(node: &Node, window: &mut Window) {
-    let mut config = window.status().config.expect("live config");
-    let port = u16::try_from(config.udp_port).expect("UDP port");
-    config.enabled = false;
-    window.configure(config);
+    let deadline = Instant::now() + TIMEOUT;
+    let exchange = |window: &mut Window, message: gui_frame::Msg| {
+        assert!(Instant::now() < deadline, "OFF intent exchange deadline");
+        let id = window.next_request;
+        window.next_request += 1;
+        window
+            .runtime
+            .block_on(async {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    window.link.send(id, message),
+                )
+                .await
+            })
+            .expect("OFF request before deadline")
+            .expect("GUI request write");
+        loop {
+            assert!(Instant::now() < deadline, "OFF acknowledgement deadline");
+            let frame = window.recv(deadline);
+            let message = frame.msg.expect("GUI message");
+            if frame.request_id == id {
+                break message;
+            }
+            assert_eq!(
+                frame.request_id, 0,
+                "unexpected cleanup request correlation"
+            );
+            window.events.push(message);
+        }
+    };
+    let mut status = match exchange(
+        window,
+        gui_frame::Msg::GetAudioStatus(wire::GetAudioStatus {}),
+    ) {
+        gui_frame::Msg::AudioStatus(status) => {
+            ipc::audio::validate_status(&status).expect("authoritative valid audio status");
+            status
+        }
+        other => panic!("GetAudioStatus answered {other:?}"),
+    };
+    let port = loop {
+        assert!(
+            Instant::now() < deadline,
+            "OFF intent did not converge before deadline"
+        );
+        let revision = status.revision;
+        assert_ne!(revision, 0, "authoritative cleanup snapshot revision");
+        let mut config = status.config.take().expect("live config");
+        let port = u16::try_from(config.udp_port).expect("UDP port");
+        config.enabled = false;
+        match exchange(
+            window,
+            gui_frame::Msg::SetAudio(wire::SetAudio {
+                config: Some(config),
+                expected_revision: revision,
+            }),
+        ) {
+            gui_frame::Msg::OpResult(result)
+                if !result.ok && result.error_code == "AUDIO_REVISION_CONFLICT" =>
+            {
+                // Rebase only the OFF intent, never an old full configuration.
+                status = loop {
+                    let newer = window
+                        .events
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, event)| match event {
+                            gui_frame::Msg::AudioStatus(status) if status.revision > revision => {
+                                Some((status.revision, index))
+                            }
+                            _ => None,
+                        })
+                        .max();
+                    if let Some((_, index)) = newer {
+                        let gui_frame::Msg::AudioStatus(status) = window.events.remove(index)
+                        else {
+                            unreachable!("selected authoritative status");
+                        };
+                        ipc::audio::validate_status(&status)
+                            .expect("authoritative valid audio status");
+                        break status;
+                    }
+                    assert!(Instant::now() < deadline, "newer OFF snapshot deadline");
+                    let frame = window.recv(deadline);
+                    assert_eq!(
+                        frame.request_id, 0,
+                        "unexpected cleanup request correlation"
+                    );
+                    window.events.push(frame.msg.expect("GUI message"));
+                };
+            }
+            other => {
+                assert_ok(other);
+                break port;
+            }
+        }
+    };
     window.wait("authoritative disabled state", |status| !status.enabled);
     window.closed();
     #[cfg(target_os = "linux")]

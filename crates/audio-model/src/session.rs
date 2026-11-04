@@ -542,6 +542,16 @@ impl ControlPlane {
             ..self.settings
         }
     }
+    /// Current SYSTEM Hello and effective remote consent for this exact parent.
+    pub fn remote_hello(&self, parent: Parent) -> Option<Hello> {
+        let peer = &self.peers[self.peer_index(parent).ok()?];
+        let hello = peer.hello?;
+        Some(Hello {
+            allowed: peer.remote_allowed,
+            consent_revision: peer.remote_revision,
+            ..hello
+        })
+    }
     pub fn session(&self, peer: NodeId) -> Option<SessionView> {
         self.peers
             .iter()
