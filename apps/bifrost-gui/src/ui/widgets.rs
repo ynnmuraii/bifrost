@@ -303,6 +303,9 @@ fn button_sized(
     if enabled {
         response.clone().on_hover_cursor(CursorIcon::PointingHand);
     }
+    if response.gained_focus() {
+        response.scroll_to_me(None);
+    }
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -451,6 +454,9 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
                 items[i],
             )
         });
+        if response.gained_focus() {
+            response.scroll_to_me(None);
+        }
         if response.clicked() {
             clicked = Some(i);
         }
@@ -467,6 +473,14 @@ pub fn seg(ui: &mut Ui, pal: &Palette, items: &[&str], on: usize) -> Option<usiz
             cell.center().y - galley.size().y / 2.0,
         );
         painter.add(egui::epaint::TextShape::new(at, Arc::clone(galley), ink));
+        if response.has_focus() {
+            painter.rect_stroke(
+                cell,
+                pal.rad_btn(cell.height()),
+                Stroke::new(2.0, pal.accent),
+                StrokeKind::Inside,
+            );
+        }
     }
     clicked
 }

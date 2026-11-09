@@ -17,7 +17,15 @@ pub(crate) type Pump<S> = Box<dyn FnMut(&mut S) -> Result<(), BackendError> + Se
 const MAX_STARTS: usize = 256;
 const RETIRE_STARTS: usize = MAX_STARTS - COMMAND_CAPACITY;
 
-fn admit_start(used_ids: &[[u8; 16]], id: &[u8; 16], active: usize) -> Result<(), i32> {
+fn admit_start(
+    used_ids: &[[u8; 16]],
+    id: &[u8; 16],
+    active: usize,
+    retiring: usize,
+) -> Result<(), i32> {
+    if retiring != 0 {
+        return Err(3);
+    }
     if used_ids.contains(id) {
         return Err(4);
     }
@@ -332,11 +340,11 @@ where
             }),
         );
     }
-    fn active_source(&mut self) -> bool {
-        self.sessions.iter_mut().any(|session| {
+    fn active_source(&self) -> bool {
+        self.sessions.iter().any(|session| {
             session.role == 1
                 && session.authorized.load(Ordering::Acquire)
-                && session.media.snapshot().sending
+                && session.media.is_sending()
         })
     }
     fn control_command(
@@ -526,7 +534,8 @@ where
         admit_start(
             &self.used_ids,
             &id,
-            self.sessions.len() + self.retiring_sources.len(),
+            self.sessions.len(),
+            self.retiring_sources.len(),
         )?;
         let fingerprint = |key: &[u8]| -> [u8; 32] {
             digest(&SHA256, key)
@@ -852,7 +861,7 @@ where
                 && !session.source_silence_attempted
                 && session.role == 1
                 && self.shared.source_local_sound(&session.id)
-                && session.media.snapshot().sending
+                && session.media.is_sending()
             {
                 session.source_silence_attempted = true;
                 let authorized = session.authorized.clone();
@@ -1111,13 +1120,22 @@ mod admission_tests {
             })
             .collect();
         assert_eq!(
-            admit_start(&history[..RETIRE_STARTS - 1], &[255; 16], 0),
+            admit_start(&history[..RETIRE_STARTS - 1], &[255; 16], 0, 0),
             Ok(())
         );
-        assert_eq!(admit_start(&history, &[255; 16], 0), Err(9));
-        assert_eq!(admit_start(&history, &history[0], 0), Err(4));
+        assert_eq!(admit_start(&history, &[255; 16], 0, 0), Err(9));
+        assert_eq!(admit_start(&history, &history[0], 0, 0), Err(4));
         history.resize(MAX_STARTS, [254; 16]);
-        assert_eq!(admit_start(&history, &[255; 16], 0), Err(9));
-        assert_eq!(admit_start(&[], &[255; 16], contract::MAX_SESSIONS), Err(3));
+        assert_eq!(admit_start(&history, &[255; 16], 0, 0), Err(9));
+        assert_eq!(
+            admit_start(&[], &[255; 16], contract::MAX_SESSIONS, 0),
+            Err(3)
+        );
+    }
+
+    #[test]
+    fn start_waits_for_native_retirement_even_below_capacity() {
+        assert_eq!(admit_start(&[], &[1; 16], 0, 1), Err(3));
+        assert_eq!(admit_start(&[], &[1; 16], 0, 0), Ok(()));
     }
 }

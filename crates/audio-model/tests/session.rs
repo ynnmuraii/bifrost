@@ -1,3 +1,6 @@
+#[path = "session/retirement.rs"]
+mod retirement;
+
 use audio_model::{
     jitter::Profile,
     keys::{Aead, Codec, Format},
@@ -1666,9 +1669,16 @@ fn pending_user_stop_does_not_mask_real_revocation_or_worker_loss() {
         assert_eq!(
             pair.listener
                 .handle(22, Input::ChildStopped(view), &mut Vec::new()),
-            Err(Error::InvalidState),
-            "a late positive stop must not erase genuine failure"
+            if failure % 4 == 3 {
+                Err(Error::InvalidState)
+            } else {
+                Ok(())
+            },
+            "native cleanup may retire ownership but must not erase genuine failure"
         );
+        let completed = pair.listener.session(SOURCE).unwrap();
+        assert_eq!(completed.phase, Phase::Failed, "failure case {failure}");
+        assert_eq!(completed.reason, Some(reason), "failure case {failure}");
     }
 }
 

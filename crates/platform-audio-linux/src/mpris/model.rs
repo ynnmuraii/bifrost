@@ -17,6 +17,8 @@ pub(super) struct Player {
     pub revision: u64,
     pub playing_order: u64,
     pub next_poll: Instant,
+    artwork_pending: bool,
+    previous_artwork: Option<audio_backend::artwork::Artwork>,
     desktop: String,
     identity: String,
     title: String,
@@ -25,6 +27,7 @@ pub(super) struct Player {
     artwork: Option<audio_backend::artwork::Artwork>,
     track: Option<String>,
     duration: Option<u64>,
+    pub position_refresh: bool,
     pub state: PlaybackState,
     rate: f64,
     position: Option<u64>,
@@ -84,12 +87,15 @@ impl Player {
             subtitle: String::new(),
             artwork_url: None,
             artwork: None,
+            artwork_pending: false,
+            previous_artwork: None,
             track: None,
             duration: None,
             state: PlaybackState::Unknown,
             rate: 1.0,
             position: None,
             position_at: now,
+            position_refresh: false,
             controls: Controls::default(),
         }
     }
@@ -250,13 +256,13 @@ impl Player {
                 if replace(&mut self.track, track) || uncertain {
                     self.position = None;
                     self.position_at = now;
+                    self.position_refresh = true;
+                    self.next_poll = now;
                     changed = true;
                 }
                 if artwork_changed || old_title != self.title || old_track != self.track {
-                    self.artwork = self
-                        .artwork_url
-                        .as_deref()
-                        .and_then(|url| cached_artwork(url, self.artwork.as_ref()));
+                    self.previous_artwork = self.artwork.take();
+                    self.artwork_pending = true;
                     changed = true;
                 }
             }
@@ -269,6 +275,7 @@ impl Player {
     }
     pub fn correct_position(&mut self, position: Option<u64>, now: Instant) -> bool {
         let changed = self.position(now) != position;
+        self.position_refresh = false;
         self.position = position;
         self.position_at = now;
         changed
@@ -303,6 +310,34 @@ impl Player {
                 .map_err(|_| BackendError::Unsupported)?;
         Ok((track, position))
     }
+    pub fn take_artwork(&mut self) -> Option<ArtworkRequest> {
+        if !std::mem::take(&mut self.artwork_pending) {
+            return None;
+        }
+        Some(ArtworkRequest {
+            owner: self.owner.clone(),
+            token: self.token,
+            revision: self.revision,
+            track: self.track.clone(),
+            url: self.artwork_url.clone(),
+            previous: self.previous_artwork.take(),
+        })
+    }
+    pub fn publish_artwork(
+        &mut self,
+        request: &ArtworkRequest,
+        artwork: Option<audio_backend::artwork::Artwork>,
+    ) -> bool {
+        if self.owner != request.owner
+            || self.token != request.token
+            || self.revision != request.revision
+            || self.track != request.track
+            || self.artwork_url != request.url
+        {
+            return false;
+        }
+        replace(&mut self.artwork, artwork)
+    }
     pub fn advance_revision(&mut self) -> bool {
         if let Some(next) = self.revision.checked_add(1) {
             self.revision = next;
@@ -310,6 +345,21 @@ impl Player {
         } else {
             false
         }
+    }
+}
+pub(super) struct ArtworkRequest {
+    owner: String,
+    token: MediaSessionToken,
+    revision: u64,
+    track: Option<String>,
+    url: Option<String>,
+    previous: Option<audio_backend::artwork::Artwork>,
+}
+impl ArtworkRequest {
+    pub fn load(&self) -> Option<audio_backend::artwork::Artwork> {
+        self.url
+            .as_deref()
+            .and_then(|url| cached_artwork(url, self.previous.as_ref()))
     }
 }
 fn cached_artwork(
@@ -342,21 +392,24 @@ fn cached_artwork_in(
     ) {
         return None;
     }
-    let cache = cache.canonicalize().ok()?;
-    let canonical = path.canonicalize().ok()?;
-    if !canonical.starts_with(&cache) || path.symlink_metadata().ok()?.file_type().is_symlink() {
-        return None;
-    }
-    let fd = rustix::fs::open(
-        &canonical,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    )
-    .ok()?;
+    // Hold the trust root and resolve every child relative to that fd. NOFOLLOW
+    // on every directory prevents an intermediate rename-to-symlink escape.
+    let root = std::fs::File::from(
+        rustix::fs::open(
+            cache,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .ok()?,
+    );
+    let relative = path.strip_prefix(cache).ok()?;
+    let fd = confined_file(&root, relative)?;
     let file = std::fs::File::from(fd);
     let metadata = file.metadata().ok()?;
     if !metadata.is_file()
-        || metadata.uid() != cache.metadata().ok()?.uid()
+        || metadata.uid() != root.metadata().ok()?.uid()
         || metadata.len() > MAX_NATIVE_BYTES as u64
     {
         return None;
@@ -366,6 +419,34 @@ fn cached_artwork_in(
         .read_to_end(&mut bytes)
         .ok()?;
     normalize(&bytes, previous)
+}
+fn confined_file(root: &std::fs::File, relative: &std::path::Path) -> Option<std::os::fd::OwnedFd> {
+    use rustix::fs::{openat, Mode, OFlags};
+    use std::path::Component;
+    let mut directory = None;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        let flags = if components.peek().is_some() {
+            flags | OFlags::DIRECTORY
+        } else {
+            flags
+        };
+        let fd = if let Some(parent) = &directory {
+            openat(parent, name, flags, Mode::empty())
+        } else {
+            openat(root, name, flags, Mode::empty())
+        }
+        .ok()?;
+        if components.peek().is_none() {
+            return Some(fd);
+        }
+        directory = Some(fd);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -442,6 +523,29 @@ mod tests {
         assert!(
             cached_artwork_in(&cache, &format!("file://{}", symlink.display()), None).is_none()
         );
+        let album = cache.join("album");
+        std::fs::create_dir(&album).unwrap();
+        std::fs::copy(&image, album.join("cover.png")).unwrap();
+        let outside_dir = root.join("outside");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::copy(&image, outside_dir.join("cover.png")).unwrap();
+        let cache_fd = std::fs::File::open(&cache).unwrap();
+        // Swap an intermediate directory after pinning the root, before resolution.
+        let moved = cache.join("moved");
+        std::fs::rename(&album, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, &album).unwrap();
+        assert!(confined_file(&cache_fd, std::path::Path::new("album/cover.png")).is_none());
+        assert!(cached_artwork_in(
+            &cache,
+            &format!("file://{}", album.join("cover.png").display()),
+            None,
+        )
+        .is_none());
+        assert!(confined_file(&cache_fd, std::path::Path::new("../outside/cover.png")).is_none());
+        assert!(confined_file(&cache_fd, std::path::Path::new("moved/cover.png")).is_some());
+        std::fs::remove_file(album).unwrap();
+        std::fs::remove_dir_all(moved).unwrap();
+        std::fs::remove_dir_all(outside_dir).unwrap();
         std::fs::write(
             &image,
             vec![0; audio_backend::artwork::MAX_NATIVE_BYTES + 1],

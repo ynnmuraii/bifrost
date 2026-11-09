@@ -794,17 +794,19 @@ fn actual_audio_modal_scrolls_to_apply_without_horizontal_clipping() {
                     ]);
                     let output = draw(Vec::new());
                     let values = labels(&output);
+                    let modal_right = width * 0.5 + ((width - 48.0).min(680.0)) * 0.5;
                     let title = values
                         .iter()
-                        .find(|(s, _)| {
-                            s == if width < 568.0 {
-                                text(lang, Key::AudioDiagnostics)
-                            } else {
-                                Modal::Audio.title(lang)
-                            }
+                        // The rail also paints the full title, outside the dialog.
+                        .find(|(s, bounds)| {
+                            bounds.min.x < modal_right
+                                && s == if width < 568.0 {
+                                    text(lang, Key::AudioDiagnostics)
+                                } else {
+                                    Modal::Audio.title(lang)
+                                }
                         })
                         .unwrap();
-                    let modal_right = width * 0.5 + ((width - 48.0).min(680.0)) * 0.5;
                     assert!(title.1.max.x <= modal_right - 60.0, "title overlaps close");
                     let apply = values
                         .iter()

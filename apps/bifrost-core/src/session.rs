@@ -10,11 +10,10 @@
 //!
 //! # The clock
 //!
-//! `focus_router` is sans-IO and every deadline it returns is on the caller's
-//! millisecond scale, so the loop keeps one monotonic origin ([`std::time::Instant`])
-//! and passes `elapsed().as_millis()` as `now_ms` everywhere. Timers are armed from
-//! the same scale, which is what makes `ArmDeadline` and the lease watchdog line up
-//! with the agent's own monotonic clock.
+//! `focus_router` returns deadlines on this loop's monotonic millisecond scale.
+//! [`ipc::clock::SystemClock`] also captures a fixed same-host monotonic origin;
+//! IPC carries the resulting absolute deadlines, never a duration restarted by
+//! the agent after queueing or delivery.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
@@ -1620,7 +1619,7 @@ impl Session {
     ///
     /// This ownership check is the boundary that makes the flag inert on receivers.
     fn agent_frame(&self, command: &fr::AgentCommand) -> protocol::ipc::agent_frame::Msg {
-        let mut frame = routing::agent_command(command);
+        let mut frame = routing::agent_command(command, self.clock.host_origin_us());
         if let Msg::BeginCapture(begin) = &mut frame {
             begin.dev_capture_injected = source_owner_may_capture_injected(
                 self.dev_capture_injected,
@@ -1718,20 +1717,10 @@ impl Session {
                 },
                 Effect::Arm { timer, deadline_ms } => {
                     self.timers.arm(timer, deadline_ms);
-                    // Rule 4: the agent enforces the receiver's lease deadline on its own
-                    // clock, and its `ArmDeadline` from `EnterCommit` is a one-shot. Every
-                    // re-arm here — each valid `LeaseRenew` moves it — has to travel, or
-                    // the agent's deadline fires `lease_ttl_ms` after the commit while
-                    // renewals keep arriving.
-                    let rearm = routing::deadline_rearm_ms(timer, deadline_ms, self.now_ms())
-                        .and_then(|remaining_ms| {
-                            self.router
-                                .lease()
-                                .receiver()
-                                .map(|lease| (lease.lease_id, remaining_ms))
-                        });
-                    if let Some((lease_id, remaining_ms)) = rearm {
-                        self.send_agent_deadline(lease_id, remaining_ms).await;
+                    if timer == fr::Timer::ReceiverLeaseDeadline {
+                        if let Some(lease) = self.router.lease().receiver() {
+                            self.send_agent_deadline(lease.lease_id, deadline_ms).await;
+                        }
                     }
                 }
                 Effect::Cancel { timer } => {
@@ -1792,13 +1781,11 @@ impl Session {
 
     /// Arms (or re-arms) the agent's own lease deadline.
     ///
-    /// Rule 4 puts the deadline on the agent's monotonic clock and bounds the frame at
-    /// `1..=1000` ms; the core owns the deadline itself, so this is the translation step of
-    /// the IPC mapping table, not a second source of truth.
-    async fn send_agent_deadline(&mut self, lease_id: fr::LeaseId, remaining_ms: u32) {
+    /// Forward the receiver's original absolute FSM deadline on the fixed host epoch.
+    async fn send_agent_deadline(&mut self, lease_id: fr::LeaseId, deadline_ms: u64) {
         let frame = Msg::ArmDeadline(protocol::ipc::ArmDeadline {
             lease_id: lease_id.to_vec(),
-            remaining_ms,
+            deadline_us: routing::host_deadline_us(deadline_ms, self.clock.host_origin_us()),
         });
         if let Err(error) = self.agent.send(frame).await {
             tracing::warn!(%error, "cannot reach the agent");
@@ -2754,7 +2741,8 @@ impl Session {
                 tracing::info!(ownership = state.as_str(), "ownership")
             }
             fr::Notice::SwitchRefused { trigger, reason } => {
-                tracing::warn!(?trigger, ?reason, "switch refused")
+                self.refusal = Some(reason.as_str().to_owned());
+                tracing::warn!(?trigger, reason = reason.as_str(), "switch refused")
             }
             fr::Notice::Rejected { peer, code } => {
                 if self.transition_retry.reasons().any(|(failed_peer, _)| {
@@ -3327,7 +3315,7 @@ impl Session {
                 _,
                 crate::clipboard::Inbound::Sent {
                     peer,
-                    history: Some((text, payload)),
+                    history: Some(text),
                     sha256,
                     secret,
                     ..
@@ -3337,7 +3325,6 @@ impl Session {
                     peer,
                     direction: protocol::ipc::ClipboardHistoryDirection::Sent,
                     text,
-                    payload,
                     sha256,
                     secret,
                 }]
@@ -3486,7 +3473,6 @@ impl Session {
                     peer,
                     direction,
                     text,
-                    payload,
                     sha256,
                     secret,
                 } => {
@@ -3500,7 +3486,7 @@ impl Session {
                                 .unwrap_or_else(|| peer.to_string())
                         };
                         self.clipboard_history
-                            .record_prepared(direction, name, text, payload, sha256, false);
+                            .record_prepared(direction, name, text, sha256, false);
                         self.publish(protocol::ipc::gui_frame::Msg::ClipboardHistory(
                             self.clipboard_history.entries(),
                         ));
@@ -3582,7 +3568,7 @@ impl Session {
             self.disarm_observation();
             if matches!(&message, Msg::Emergency(_) | Msg::LocalInput(_))
                 || matches!(&message, Msg::Error(error) if matches!(error.code.as_str(),
-                    "CAPTURE_FAILED" | "QUEUE_OVERFLOW" | "INJECTION_FAILED" | "AGENT_LOST"))
+                    "CAPTURE_FAILED" | "QUEUE_OVERFLOW" | "PORTAL_SESSION_LOST" | "INJECTION_FAILED" | "AGENT_LOST"))
             {
                 self.discard_clipboard_input();
             }
@@ -3643,6 +3629,12 @@ impl Session {
         match routing::agent_signal(&message, &mut self.context) {
             AgentSignal::Fsm(event) => {
                 if accept_agent_ready(&event, &mut self.refusal, &mut self.agent_degraded_reason) {
+                    self.feed(fr::Input::Agent(fr::AgentEvent::PressedState {
+                        keys: Vec::new(),
+                        buttons: Vec::new(),
+                        known: false,
+                    }))
+                    .await;
                     self.agent.mark_ready();
                     self.agent_lost_reported = false;
                     self.agent_restart_due = None;
@@ -4054,7 +4046,7 @@ impl Session {
             // An observation has no lease; `agent_command` sends an empty `lease_id` for
             // it, so its `CaptureReady` answer is ignored by the FSM.
             lease_id: [0u8; 16],
-            self_timeout_ms: 0,
+            self_deadline_ms: 0,
         };
         let frame = self.agent_frame(&command);
         match self.agent.send(frame).await {
@@ -4429,8 +4421,9 @@ impl Session {
         if self.agent_restart_circuit.is_open() {
             return;
         }
-        let keys: Vec<input_model::HidKey> = self.router.pressed().keys().collect();
-        let buttons: Vec<input_model::MouseButton> = self.router.pressed().buttons().collect();
+        let keys: Vec<input_model::HidKey> = self.context.recovery().keys.iter().copied().collect();
+        let buttons: Vec<input_model::MouseButton> =
+            self.context.recovery().buttons.iter().copied().collect();
         tracing::info!(
             keys = keys.len(),
             buttons = buttons.len(),
@@ -4438,6 +4431,7 @@ impl Session {
         );
         match self.agent.restart_recovery(&keys, &buttons).await {
             Ok(_) => {
+                self.context.recovery_complete();
                 self.agent_lost_reported = false;
             }
             Err(error) => {
@@ -4461,6 +4455,7 @@ impl Session {
         tracing::error!(reason, "agent restart circuit breaker opened");
     }
     async fn retry_agent(&mut self) -> protocol::ipc::OpResult {
+        self.on_agent_lost().await;
         self.agent_restart_circuit.close();
         self.agent_restart_backoff = RESTART_BACKOFF;
         self.agent_restart_due = None;
@@ -4469,10 +4464,12 @@ impl Session {
         self.agent_degraded_reason.clear();
         self.refusal = None;
         self.portal_state.clear();
-        let keys: Vec<input_model::HidKey> = self.router.pressed().keys().collect();
-        let buttons: Vec<input_model::MouseButton> = self.router.pressed().buttons().collect();
+        let keys: Vec<input_model::HidKey> = self.context.recovery().keys.iter().copied().collect();
+        let buttons: Vec<input_model::MouseButton> =
+            self.context.recovery().buttons.iter().copied().collect();
         match self.agent.restart_recovery(&keys, &buttons).await {
             Ok(_) => {
+                self.context.recovery_complete();
                 self.agent_lost_reported = false;
                 protocol::ipc::OpResult {
                     ok: true,
@@ -4801,7 +4798,7 @@ impl Session {
         }
         let refusal = outputs.iter().find_map(|output| match output {
             fr::Output::Notice(fr::Notice::SwitchRefused { reason, .. }) => {
-                Some(format!("{reason:?}"))
+                Some(reason.as_str().to_owned())
             }
             _ => None,
         });
@@ -6105,6 +6102,14 @@ mod game_guard_tests {
         .with_persisted_ownership(1, Some((1, node)));
         router.handle(
             0,
+            fr::Input::Agent(fr::AgentEvent::PressedState {
+                keys: vec![],
+                buttons: vec![],
+                known: true,
+            }),
+        );
+        router.handle(
+            0,
             fr::Input::Hello {
                 peer,
                 hello: fr::PeerHello {
@@ -6150,8 +6155,7 @@ mod game_guard_tests {
 mod link_generation_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn replaced_links_stale_down_preserves_clipboard_and_input() {
+    fn session_fixture() -> (Session, NodeId, std::net::SocketAddr, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "bifrost-session-generation-{}-{}",
             std::process::id(),
@@ -6250,6 +6254,108 @@ mod link_generation_tests {
             false,
             pairing_gate,
         );
+        session.router.handle(
+            0,
+            fr::Input::Agent(fr::AgentEvent::PressedState {
+                keys: Vec::new(),
+                buttons: Vec::new(),
+                known: true,
+            }),
+        );
+        (session, peer, address, root)
+    }
+
+    #[tokio::test]
+    async fn manual_retry_retires_remote_routing_and_preserves_uncertain_recovery() {
+        let (mut session, peer, _, root) = session_fixture();
+        let caps = fr::Capabilities {
+            capture: true,
+            inject: true,
+            absolute_pointer: true,
+            emergency_hotkey: true,
+        };
+        session.router.handle(
+            0,
+            fr::Input::Hello {
+                peer,
+                hello: fr::PeerHello {
+                    can_own: true,
+                    capabilities: caps,
+                    owner_serial: 1,
+                    owner: Some(session.node_id),
+                },
+            },
+        );
+        session.router.handle(
+            1,
+            fr::Input::Local(fr::LocalInput::SwitchRequest {
+                trigger: fr::SwitchTrigger::Hotkey,
+                target: peer,
+                entry_position: geometry::Position::new("target", 0.0, 0.0),
+                topology_revision: 0,
+            }),
+        );
+        let lease_id = match session.router.lease() {
+            fr::LeaseSlot::Source(lease) => lease.lease_id,
+            other => panic!("source preparation expected: {other:?}"),
+        };
+        session.router.handle(
+            2,
+            fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }),
+        );
+        session.router.handle(
+            3,
+            fr::Input::Net {
+                from: peer,
+                message: fr::Message::EnterAck {
+                    lease_id,
+                    accepted: true,
+                    reason: None,
+                },
+            },
+        );
+        session.router.handle(
+            4,
+            fr::Input::Agent(fr::AgentEvent::CaptureReady { lease_id }),
+        );
+        assert_eq!(session.router.focus(), fr::FocusState::Remote);
+        let key = input_model::HidKey::keyboard(4);
+        session
+            .context
+            .on_command(fr::AgentCommand::PrepareInject { lease_id: [3; 16] })
+            .unwrap();
+        session
+            .context
+            .on_command(fr::AgentCommand::Inject {
+                lease_id: [3; 16],
+                input_batch_seq: 1,
+                events: vec![input_model::InputEvent::Key {
+                    key,
+                    state: input_model::KeyState::Down,
+                }],
+            })
+            .unwrap();
+        // The fixture's nonexistent agent program forces a genuine restart failure.
+        let result = session.retry_agent().await;
+        assert!(!result.ok);
+        assert_eq!(session.router.focus(), fr::FocusState::Blocked);
+        assert!(matches!(session.router.lease(), fr::LeaseSlot::Idle));
+        assert!(session.context.recovery().keys.contains(&key));
+        assert!(matches!(
+            routing::agent_signal(
+                &protocol::ipc::agent_frame::Msg::Ready(Default::default()),
+                &mut session.context
+            ),
+            routing::AgentSignal::Fsm(fr::AgentEvent::AgentReady)
+        ));
+        assert_eq!(session.router.focus(), fr::FocusState::Blocked);
+        drop(session);
+        std::fs::remove_dir_all(root).expect("remove test state");
+    }
+
+    #[tokio::test]
+    async fn replaced_links_stale_down_preserves_clipboard_and_input() {
+        let (mut session, peer, address, root) = session_fixture();
         let hello = transport::PeerInfo::from_hello(&protocol::wire::Hello {
             node_id: peer.as_bytes().to_vec(),
             capabilities: vec![

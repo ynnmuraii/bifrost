@@ -17,7 +17,6 @@
 //!   device is paused). [`WaylandInjector::pump`] keeps that state current, and
 //!   [`WaylandInjector::inject`] refuses to emit on a paused device.
 
-use std::collections::BTreeSet;
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -131,7 +130,7 @@ pub struct WaylandCapabilities {
 /// Result of one [`WaylandInjector::inject`] batch.
 #[derive(Debug)]
 pub struct InjectOutcome {
-    /// How many events were handed to the EIS server before the first failure.
+    /// How many events were queued before the first failure; not a compositor ACK.
     pub applied_count: usize,
     /// The failure that stopped the batch, if any.
     pub os_error: Option<WaylandError>,
@@ -213,6 +212,101 @@ fn route_event(selection: DeviceSelection, event: InputEvent) -> Option<usize> {
     }
 }
 
+/// Queued ups are not evidence of delivery until the entire socket flush succeeds.
+#[derive(Default)]
+struct InjectionLedger {
+    held: input_model::PressedState,
+    queued_ups: input_model::PressedState,
+}
+
+impl InjectionLedger {
+    fn remember_releases(&mut self, events: &[InputEvent]) {
+        for event in events {
+            match *event {
+                InputEvent::Key {
+                    key,
+                    state: KeyState::Up,
+                } => {
+                    self.held.keys.insert(key);
+                }
+                InputEvent::Button {
+                    button,
+                    state: KeyState::Up,
+                } => {
+                    self.held.buttons.insert(button);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn queued(&mut self, event: InputEvent) {
+        match event {
+            InputEvent::Key { key, state } => {
+                self.held.keys.insert(key);
+                if state.is_down() {
+                    self.queued_ups.keys.remove(&key);
+                } else {
+                    self.queued_ups.keys.insert(key);
+                }
+            }
+            InputEvent::Button { button, state } => {
+                self.held.buttons.insert(button);
+                if state.is_down() {
+                    self.queued_ups.buttons.remove(&button);
+                } else {
+                    self.queued_ups.buttons.insert(button);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn flushed(&mut self, succeeded: bool) {
+        if succeeded {
+            self.held
+                .keys
+                .retain(|key| !self.queued_ups.keys.contains(key));
+            self.held
+                .buttons
+                .retain(|button| !self.queued_ups.buttons.contains(button));
+        }
+        self.queued_ups.keys.clear();
+        self.queued_ups.buttons.clear();
+    }
+
+    fn paused(&mut self, selection: DeviceSelection, index: usize) {
+        if selection.keyboard == Some(index) {
+            self.held.keys.clear();
+            self.queued_ups.keys.clear();
+        }
+        if selection.button == Some(index) {
+            self.held.buttons.clear();
+            self.queued_ups.buttons.clear();
+        }
+    }
+
+    fn holds_on(&self, selection: DeviceSelection, index: usize) -> bool {
+        (selection.keyboard == Some(index) && !self.held.keys.is_empty())
+            || (selection.button == Some(index) && !self.held.buttons.is_empty())
+    }
+
+    fn releases(&self) -> Vec<InputEvent> {
+        self.held
+            .keys
+            .iter()
+            .map(|key| InputEvent::Key {
+                key: *key,
+                state: KeyState::Up,
+            })
+            .chain(self.held.buttons.iter().map(|button| InputEvent::Button {
+                button: *button,
+                state: KeyState::Up,
+            }))
+            .collect()
+    }
+}
+
 /// EIS sender that merges independently advertised interfaces from one seat.
 pub struct WaylandInjector {
     session: Option<Session<RemoteDesktop>>,
@@ -234,8 +328,8 @@ pub struct WaylandInjector {
     compositor: Option<Compositor>,
     versions: PortalVersions,
     restore_token: Option<String>,
-    pressed_keys: BTreeSet<u16>,
-    pressed_buttons: BTreeSet<u16>,
+    ledger: InjectionLedger,
+    release_target_lost: bool,
     scroll_remainder: (i32, i32),
     cursor: Option<Position>,
     started: Instant,
@@ -454,8 +548,8 @@ impl WaylandInjector {
             compositor,
             versions,
             restore_token,
-            pressed_keys: BTreeSet::new(),
-            pressed_buttons: BTreeSet::new(),
+            ledger: InjectionLedger::default(),
+            release_target_lost: false,
             scroll_remainder: (0, 0),
             cursor: None,
             started: Instant::now(),
@@ -507,21 +601,26 @@ impl WaylandInjector {
     /// One frame per event keeps the events in order and satisfies the protocol's
     /// "at most one absolute motion / one scroll per frame" rules by construction.
     ///
-    /// `applied_count` counts the events written to the EIS socket; `os_error` is set
-    /// when an event could not be encoded or when the write/flush failed, in which case
-    /// the counted events did not reach the compositor.
+    /// `applied_count` counts queued events, not compositor acknowledgements. A failed
+    /// flush may have delivered a prefix; synthetic holds remain conservative until a
+    /// later successful release flush or an observed protocol-neutralizing pause.
     pub fn inject(&mut self, events: &[InputEvent]) -> InjectOutcome {
+        self.inject_with_flush(events, event::Connection::flush)
+    }
+
+    fn inject_with_flush(
+        &mut self,
+        events: &[InputEvent],
+        flush: impl FnOnce(&event::Connection) -> Result<(), rustix::io::Errno>,
+    ) -> InjectOutcome {
         let mut outcome = InjectOutcome::ok();
+        self.ledger.remember_releases(events);
+        if self.release_target_lost || !self.connection.connection().is_alive() {
+            outcome.os_error = Some(WaylandError::EiDisconnected);
+            return outcome;
+        }
         for event in events {
-            let index = self.device_for_event(*event);
-            self.active_device = index;
-            if let Some(index) = index {
-                if !self.ensure_emulating(index) {
-                    outcome.os_error = Some(WaylandError::DevicePaused);
-                    break;
-                }
-            }
-            match self.apply(*event) {
+            match self.queue_event(*event) {
                 Ok(actual) => {
                     outcome.applied_count += 1;
                     self.applied_edges.record(event);
@@ -535,7 +634,9 @@ impl WaylandInjector {
                 }
             }
         }
-        if let Err(error) = self.connection.flush() {
+        let flushed = flush(&self.connection);
+        self.ledger.flushed(flushed.is_ok());
+        if let Err(error) = flushed {
             outcome.os_error = Some(WaylandError::Io(error.into()));
         }
         let now = Instant::now();
@@ -575,49 +676,46 @@ impl WaylandInjector {
 
     /// Releases every key and button this injector still holds down.
     ///
-    /// A paused device is neutral by protocol, so the ledger is simply dropped then.
+    /// Only a successful release flush or an observed pause can retire native holds.
     pub fn release_all(&mut self) -> InjectOutcome {
+        self.release_all_with_flush(event::Connection::flush)
+    }
+
+    fn release_all_with_flush(
+        &mut self,
+        flush: impl FnOnce(&event::Connection) -> Result<(), rustix::io::Errno>,
+    ) -> InjectOutcome {
+        let events = self.ledger.releases();
         let mut outcome = InjectOutcome::ok();
-        for (index, codes, keyboard) in [
-            (self.selection.keyboard, self.pressed_keys.clone(), true),
-            (self.selection.button, self.pressed_buttons.clone(), false),
-        ] {
-            if let Some(index) = index {
-                if self.devices[index].emulating {
-                    self.active_device = Some(index);
-                    for code in codes {
-                        if keyboard {
-                            if let Some(interface) = self.keyboard.as_ref() {
-                                interface.key(u32::from(code), ei::keyboard::KeyState::Released);
-                            }
-                            self.pressed_keys.remove(&code);
-                        } else {
-                            if let Some(interface) = self.button.as_ref() {
-                                interface
-                                    .button(u32::from(code), ei::button::ButtonState::Released);
-                            }
-                            self.pressed_buttons.remove(&code);
-                        }
-                        self.commit_frame();
-                        outcome.applied_count += 1;
-                    }
+        if self.release_target_lost || !self.connection.connection().is_alive() {
+            outcome.os_error = Some(WaylandError::EiDisconnected);
+            return outcome;
+        }
+        for event in events {
+            match self.queue_event(event) {
+                Ok(_) => outcome.applied_count += 1,
+                Err(error) => {
+                    // A missing keyboard must not prevent releasing a live pointer.
+                    outcome.os_error.get_or_insert(error);
                 }
             }
         }
-        self.pressed_keys.clear();
-        self.pressed_buttons.clear();
-        if let Err(error) = self.connection.flush() {
+        let flushed = flush(&self.connection);
+        self.ledger.flushed(flushed.is_ok());
+        if let Err(error) = flushed {
             outcome.os_error = Some(WaylandError::Io(error.into()));
         }
-        self.scroll_remainder = (0, 0);
+        if outcome.os_error.is_none() {
+            self.scroll_remainder = (0, 0);
+        }
         outcome
     }
 
     /// Closes the EIS connection and the portal session.
     ///
-    /// The EIS implementation releases anything still logically pressed when the
-    /// connection goes away; [`WaylandInjector::release_all`] runs first anyway. The
-    /// socket is closed when this value is dropped.
+    /// Explicit release runs first. Stop-emulating and disconnect requests are not
+    /// neutral-state acknowledgements, so their best-effort delivery never erases a
+    /// failed release. The socket is closed when this value is dropped.
     pub async fn disconnect(&mut self) -> Result<(), WaylandError> {
         let release = self.release_all();
         for device in &mut self.devices {
@@ -810,7 +908,12 @@ impl WaylandInjector {
                         resumed: false,
                     });
                 }
+                let previous = self.selection;
                 self.refresh_selection();
+                self.release_target_lost |= (previous.keyboard != self.selection.keyboard
+                    && !self.ledger.held.keys.is_empty())
+                    || (previous.button != self.selection.button
+                        && !self.ledger.held.buttons.is_empty());
                 self.log_selection();
             }
             EiEvent::DeviceResumed(resumed) => {
@@ -822,23 +925,27 @@ impl WaylandInjector {
                 }
             }
             EiEvent::DevicePaused(paused) => {
-                if let Some(state) = self.devices.iter_mut().find(|s| s.device == paused.device) {
+                if let Some(index) = self.devices.iter().position(|s| s.device == paused.device) {
+                    let state = &mut self.devices[index];
                     state.resumed = false;
                     state.emulating = false;
+                    self.ledger.paused(self.selection, index);
+                    if self.selection.scroll == Some(index) {
+                        self.scroll_remainder = (0, 0);
+                    }
                 }
-                self.pressed_keys.clear();
-                self.pressed_buttons.clear();
-                self.scroll_remainder = (0, 0);
             }
             EiEvent::DeviceRemoved(removed) => {
+                if let Some(index) = self.devices.iter().position(|s| s.device == removed.device) {
+                    // Destroyed is not a neutral-state acknowledgement in the EI contract.
+                    self.release_target_lost |= self.ledger.holds_on(self.selection, index);
+                }
                 self.devices.retain(|s| s.device != removed.device);
                 self.refresh_selection();
                 self.log_selection();
-                self.pressed_keys.clear();
-                self.pressed_buttons.clear();
-                self.scroll_remainder = (0, 0);
             }
             EiEvent::Disconnected(_) => {
+                self.release_target_lost |= !self.ledger.held.is_empty();
                 for state in &mut self.devices {
                     state.resumed = false;
                     state.emulating = false;
@@ -916,10 +1023,22 @@ impl WaylandInjector {
         route_event(self.selection, event)
     }
 
+    fn queue_event(&mut self, event: InputEvent) -> Result<Option<Position>, WaylandError> {
+        self.active_device = self.device_for_event(event);
+        if let Some(index) = self.active_device {
+            if !self.ensure_emulating(index) {
+                return Err(WaylandError::DevicePaused);
+            }
+        }
+        let actual = self.apply(event)?;
+        self.ledger.queued(event);
+        Ok(actual)
+    }
+
     fn ensure_emulating(&mut self, index: usize) -> bool {
         let name = self.devices[index].device.name().map(str::to_owned);
         let state = &mut self.devices[index];
-        if !state.resumed {
+        if !state.resumed || !state.device.device().is_alive() {
             return false;
         }
         if !state.emulating {
@@ -973,12 +1092,12 @@ impl WaylandInjector {
                     .ok_or(WaylandError::MissingInterface {
                         interface: "ei_keyboard",
                     })?;
-                keyboard.key(u32::from(code), key_state(state));
-                if state.is_down() {
-                    self.pressed_keys.insert(code);
-                } else {
-                    self.pressed_keys.remove(&code);
+                if !keyboard.is_alive() {
+                    return Err(WaylandError::MissingInterface {
+                        interface: "ei_keyboard",
+                    });
                 }
+                keyboard.key(u32::from(code), key_state(state));
                 self.commit_frame();
                 Ok(None)
             }
@@ -987,12 +1106,12 @@ impl WaylandInjector {
                 let interface = self.button.as_ref().ok_or(WaylandError::MissingInterface {
                     interface: "ei_button",
                 })?;
-                interface.button(u32::from(code), button_state(state));
-                if state.is_down() {
-                    self.pressed_buttons.insert(code);
-                } else {
-                    self.pressed_buttons.remove(&code);
+                if !interface.is_alive() {
+                    return Err(WaylandError::MissingInterface {
+                        interface: "ei_button",
+                    });
                 }
+                interface.button(u32::from(code), button_state(state));
                 self.commit_frame();
                 Ok(None)
             }
@@ -1244,7 +1363,7 @@ mod tests {
             let mut converter: Option<EisRequestConverter> = None;
             let mut buttons = Vec::new();
             let mut frames = 0;
-            while frames < 8 {
+            while frames < 13 {
                 context.read().expect("read client requests");
                 while let Some(request) = context.pending_request() {
                     let reis::PendingRequestResult::Request(request) = request else {
@@ -1388,10 +1507,36 @@ mod tests {
         ]);
         assert!(outcome.os_error.is_none());
         assert_eq!(outcome.applied_count, 3);
+        let failed = injector.release_all_with_flush(|_| Err(rustix::io::Errno::AGAIN));
+        assert!(failed.os_error.is_some());
+        assert_eq!(
+            failed.applied_count, 3,
+            "ups were queued before flush failed"
+        );
+        assert_eq!(injector.ledger.held.buttons.len(), 3);
         let released = injector.release_all();
         assert!(released.os_error.is_none());
         assert_eq!(released.applied_count, 3);
         assert_eq!(injector.release_all().applied_count, 0);
+        assert!(injector
+            .inject(&[edge(MouseButton::Left, KeyState::Down)])
+            .is_ok());
+        let missing_keyboard = injector.inject(&[InputEvent::Key {
+            key: HidKey::keyboard(0x04),
+            state: KeyState::Up,
+        }]);
+        assert!(missing_keyboard.os_error.is_some());
+        let partial = injector.release_all();
+        assert!(partial.os_error.is_some());
+        assert_eq!(partial.applied_count, 1, "available button still releases");
+        assert!(injector.ledger.held.buttons.is_empty());
+        assert_eq!(injector.ledger.held.keys.len(), 1);
+        let retry = injector.release_all();
+        assert!(
+            retry.os_error.is_some(),
+            "unavailable keyboard is never empty success"
+        );
+        assert_eq!(retry.applied_count, 0);
         let buttons = tokio::time::timeout(std::time::Duration::from_secs(3), server)
             .await
             .expect("bounded server observation")
@@ -1407,7 +1552,12 @@ mod tests {
                 (274, Press),
                 (272, Released),
                 (273, Released),
-                (274, Released)
+                (274, Released),
+                (272, Released),
+                (273, Released),
+                (274, Released),
+                (272, Press),
+                (272, Released)
             ]
         );
     }
@@ -1767,5 +1917,128 @@ mod tests {
             assert_eq!(discrete_units(input, &mut remainder), units);
             assert_eq!(remainder, leftover);
         }
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::{DeviceSelection, InjectionLedger};
+    use input_model::{HidKey, InputEvent, KeyState, MouseButton};
+
+    fn key(state: KeyState) -> InputEvent {
+        InputEvent::Key {
+            key: HidKey::keyboard(0x04),
+            state,
+        }
+    }
+
+    fn button(state: KeyState) -> InputEvent {
+        InputEvent::Button {
+            button: MouseButton::Left,
+            state,
+        }
+    }
+
+    #[test]
+    fn queued_release_flush_failure_keeps_native_retry_nonempty() {
+        let mut ledger = InjectionLedger::default();
+        ledger.queued(key(KeyState::Down));
+        ledger.queued(button(KeyState::Down));
+        ledger.flushed(true);
+        let releases = ledger.releases();
+        assert_eq!(releases, [key(KeyState::Up), button(KeyState::Up)]);
+        ledger.remember_releases(&releases);
+        for event in &releases {
+            ledger.queued(*event);
+        }
+        ledger.flushed(false);
+        assert_eq!(
+            ledger.releases(),
+            releases,
+            "no empty-success second release"
+        );
+        let retry = ledger.releases();
+        ledger.remember_releases(&retry);
+        for event in retry {
+            ledger.queued(event);
+        }
+        ledger.flushed(true);
+        assert!(ledger.releases().is_empty());
+    }
+
+    #[test]
+    fn partial_recovery_only_retires_the_successfully_flushed_prefix() {
+        let mut ledger = InjectionLedger::default();
+        let releases = [key(KeyState::Up), button(KeyState::Up)];
+        ledger.remember_releases(&releases);
+        ledger.queued(releases[0]);
+        ledger.flushed(true);
+        assert_eq!(ledger.releases(), [releases[1]]);
+        ledger.queued(releases[1]);
+        ledger.flushed(false);
+        assert_eq!(ledger.releases(), [releases[1]]);
+        ledger.queued(releases[1]);
+        ledger.flushed(true);
+        assert!(ledger.releases().is_empty());
+    }
+
+    #[test]
+    fn unqueued_recovery_and_unmapped_keys_cannot_turn_into_empty_success() {
+        let mut ledger = InjectionLedger::default();
+        let unmapped = InputEvent::Key {
+            key: HidKey {
+                page: 0xffed,
+                usage: 0xabcd,
+            },
+            state: KeyState::Up,
+        };
+        let releases = [unmapped, button(KeyState::Up)];
+        // A paused device or an encoding failure queues nothing.
+        ledger.remember_releases(&releases);
+        ledger.flushed(true);
+        assert_eq!(ledger.releases(), releases);
+        ledger.remember_releases(&releases);
+        ledger.flushed(false);
+        assert_eq!(ledger.releases(), releases);
+    }
+
+    #[test]
+    fn successful_exact_release_preserves_later_downs_and_unrequested_holds() {
+        let mut ledger = InjectionLedger::default();
+        ledger.queued(button(KeyState::Down));
+        ledger.flushed(true);
+        let events = [key(KeyState::Down), key(KeyState::Up), key(KeyState::Down)];
+        ledger.remember_releases(&events);
+        for event in events {
+            ledger.queued(event);
+        }
+        ledger.flushed(true);
+        assert_eq!(ledger.releases(), [key(KeyState::Up), button(KeyState::Up)]);
+        ledger.queued(key(KeyState::Up));
+        ledger.flushed(true);
+        assert_eq!(ledger.releases(), [button(KeyState::Up)]);
+    }
+
+    #[test]
+    fn only_the_observed_paused_device_neutralizes_its_own_holds() {
+        let mut ledger = InjectionLedger::default();
+        let selection = DeviceSelection {
+            keyboard: Some(1),
+            button: Some(0),
+            ..DeviceSelection::default()
+        };
+        ledger.remember_releases(&[key(KeyState::Up), button(KeyState::Up)]);
+        ledger.paused(selection, 2);
+        assert_eq!(ledger.releases().len(), 2, "unrelated pause is no proof");
+        assert!(
+            ledger.holds_on(selection, 0),
+            "removal must preserve uncertainty"
+        );
+        ledger.paused(selection, 0);
+        assert_eq!(ledger.releases(), [key(KeyState::Up)]);
+        assert!(!ledger.holds_on(selection, 0));
+        assert!(ledger.holds_on(selection, 1));
+        ledger.paused(selection, 1);
+        assert!(ledger.releases().is_empty());
     }
 }

@@ -57,10 +57,10 @@ use widgets::{Dot, Icon, Kind, Run};
 /// The top bar's height.
 const TOP_H: f32 = 60.0;
 /// The rail's width.
-const RAIL_W: f32 = 64.0;
+const RAIL_W: f32 = 120.0;
 /// Where the rail's first slot starts, and how far apart the slots are.
 const RAIL_TOP: f32 = 12.0;
-const RAIL_SLOT: f32 = 50.0;
+const RAIL_SLOT: f32 = 62.0;
 /// Below this window width the dock is 2 × 2 and the peer pills are hidden.
 const NARROW: f32 = 1180.0;
 /// How long the field asks to wait between frames. eframe's event loop wakes a little before
@@ -144,6 +144,10 @@ pub struct UiState {
     applied: Option<Theme>,
     theme_wave: Option<theme_wave::Wave>,
     modal_open: Option<(Modal, f32)>,
+    modal_return_focus: Option<egui::Id>,
+    modal_focus_pending: bool,
+    map_shown: Vec<Pos2>,
+    map_cache: crate::view_model::layout::MapCache,
     confirm_clear_history: bool,
     /// History row whose destination menu is expanded.
     pub clipboard_send_menu: Option<u64>,
@@ -168,6 +172,10 @@ impl UiState {
             applied: None,
             theme_wave: None,
             modal_open: None,
+            modal_return_focus: None,
+            modal_focus_pending: false,
+            map_shown: Vec::new(),
+            map_cache: crate::view_model::layout::MapCache::default(),
             confirm_clear_history: false,
             clipboard_send_menu: None,
         }
@@ -211,7 +219,7 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
 
     let narrow = full.width() < NARROW;
     let body_w = full.width() - RAIL_W;
-    let dock_h = dock::height(ui.ctx(), vm, narrow);
+    let dock_h = dock::height(ui.ctx(), vm, narrow).min((full.height() - TOP_H - 340.0).max(32.0));
     let top = Rect::from_min_size(full.min, Vec2::new(full.width(), TOP_H));
     let rail = Rect::from_min_max(Pos2::new(full.max.x - RAIL_W, top.max.y), full.max);
     let dock_rect = Rect::from_min_max(
@@ -255,6 +263,16 @@ pub fn draw(ui: &mut egui::Ui, vm: &ViewModel, st: &mut UiState, env: Env) -> Ou
         wants = Some(wants.map_or(relabel, |w| w.min(relabel)));
     }
     update::notice(ui, &pal, vm, &mut out.actions);
+    if vm.modal.is_none()
+        && !vm.appearance_open
+        && st.selected_display.is_none()
+        && st.selected_bridge.is_none()
+        && vm.pairing.window.is_some()
+        && !egui::Popup::is_any_open(ui.ctx())
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        out.actions.push(Action::ClosePairingWindow);
+    }
     if env.animate && ui.style().animation_time > 0.0 {
         let changed_theme = out.actions.iter().find_map(|action| match action {
             Action::SetLook(look) if look.theme != vm.look.theme => Some(look.theme),
@@ -529,6 +547,10 @@ fn rail_button(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, title)
     });
+    if response.clicked() {
+        // Mouse activation must own focus too, so the modal can restore its real invoker.
+        response.request_focus();
+    }
     let hover = response.hovered() || response.has_focus();
     if on {
         painter.rect(
@@ -565,6 +587,24 @@ fn rail_button(
         galley,
         Color32::from_rgba_unmultiplied(ink.r(), ink.g(), ink.b(), 150),
     ));
+    let label_rect = Rect::from_min_size(
+        Pos2::new(btn.center().x - (RAIL_W - 8.0) / 2.0, btn.bottom() + 1.0),
+        Vec2::new(RAIL_W - 8.0, 17.0),
+    );
+    let label = painter.layout(
+        title.to_owned(),
+        font(10.0, fam::sans_medium()),
+        ink,
+        label_rect.width(),
+    );
+    painter.with_clip_rect(label_rect).galley(
+        Pos2::new(
+            label_rect.center().x - label.size().x / 2.0,
+            label_rect.top(),
+        ),
+        label,
+        ink,
+    );
     if hover {
         *tip = Some((btn, title));
     }

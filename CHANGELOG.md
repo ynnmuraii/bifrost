@@ -2,6 +2,42 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## 0.5.1 — 2026-11-09
+
+### English
+
+- Refuse outgoing capture when physical keys/buttons are held or unknown; recovery requires an exact successful release acknowledgement. Native cleanup failures retain uncertain held state instead of reporting success.
+- Wayland outgoing keyboard/mouse switching intentionally fails closed with unknown physical state; receiving and independent audio remain available.
+- Coalesce volume changes to the latest desire, preserve dirty Advanced drafts across player actions, and actually close/cancel the local pairing window without cancelling unrelated outgoing pairing.
+- Close capacity-refused runtime links; bound/deduplicate clipboard dials and unused parent-scoped grants. Share immutable clipboard-history text storage without changing delivery semantics; full Unicode history replies wait for bounded queue capacity outside the input loop instead of disconnecting at chunk 65.
+- Persist ownership off the input decision loop with a coalescing writer and orderly shutdown drain. Persist only adopted owner pairs: pending claims cannot synthesize a stale owner that takes over after reconnect. Crash persistence remains best-effort.
+- Keep native audio retirement distinct from logical stop, fence replacement starts/cutovers, and report session-local errors honestly. Linux callback storage retires even on native deletion error.
+- Strengthen PipeWire Source-silence server-instance/policy checks and mute-write ownership, confine Linux artwork opens without symlink traversal, and reject stale artwork generations. Windows IPC verifies the pipe server's user; native PTT uses exact physical key identity.
+- Encode the XI2 raw-event subscription as one mask word and check server acceptance, restoring native X11 keyboard/button observation without bypassing XTEST filtering.
+- X11 clipboard teardown no longer clears another application's selection; owned selections retire with their native owner window.
+- Recovery agents perform only the native up-only handshake before normal startup; ancillary frames cannot displace the exact release acknowledgement.
+- Keep initial keyboard focus on the foreground dialog after its sizing pass; mouse launchers own and regain visible focus. Tab traversal skips the backdrop, outlines custom options and reveals scrolled controls.
+- Keep compact pairing controls scroll-reachable, give computer captions bounded readable space, show LAN-settings guidance for bind/loopback destinations and bracket IPv6 endpoints. Rename explains the existing settings-file/restart workflow on click.
+
+**Qualification:** Physical-input, acoustic and live cross-machine behavior is not established by controlled tests. Windows Source-local silence is implemented, with physical-device qualification pending; native mute restoration and crash persistence remain best-effort.
+
+### Русский
+
+- Исходящий захват запрещён при удерживаемых клавишах/кнопках или неизвестном физическом состоянии; восстановление требует точного успешного подтверждения отпускания. Ошибка нативной очистки сохраняет неопределённость, а не выдаётся за успех.
+- Исходящий ввод Wayland намеренно недоступен при неизвестном физическом состоянии; приём и независимое аудио остаются доступны.
+- Громкость сохраняет последнее желаемое значение, действия плеера не теряют черновик «Дополнительно», закрытие местного окна сопряжения реально отменяет его процедуры, сохраняя независимые исходящие.
+- Лишние соединения закрываются при заполнении; подключения и родительские разрешения буфера ограничены и дедуплицируются. История разделяет неизменяемое хранение текста без изменения доставки; полный Unicode-ответ ожидает место в ограниченной очереди вне цикла ввода вместо разрыва на 65-м чанке.
+- Объединяющий записи фоновый поток сохраняет владельца без блокировки решений ввода; штатный выход дожидается записи. Сохраняется только принятая пара владельца: незавершённый claim не создаёт ложного старого владельца, захватывающего управление после переподключения. После сбоя гарантий нет.
+- Завершение нативного аудио отделено от логической остановки; новые запуски/смена бэкенда ждут очистки, ошибки сеанса не скрываются. Linux освобождает callback-хранилище даже при ошибке нативного удаления.
+- Усилены проверки экземпляра сервера/политики PipeWire и владения mute; обложки Linux открываются без перехода по символьным ссылкам, устаревшие поколения отвергаются. IPC Windows проверяет пользователя сервера канала; PTT использует точную физическую клавишу.
+- Исправлена упаковка XI2 raw-подписки в одно слово маски и проверяется ответ сервера: нативное наблюдение клавиатуры/кнопок X11 работает без обхода фильтра XTEST.
+- Завершение адаптера буфера X11 больше не обнуляет чужое владение; собственное владение освобождается вместе с его нативным окном.
+- Восстановительный агент выполняет только подтверждённое нативное отпускание до обычного запуска; посторонние стартовые кадры не подменяют точный ответ.
+- Начальный фокус остаётся в верхнем диалоге после расчётного прохода; вызвавшая его кнопка получает видимый фокус при закрытии. Tab пропускает фон, выделяет нестандартные переключатели и прокручивает скрытый элемент в видимую область.
+- Элементы компактного сопряжения доступны прокруткой; подписям компьютеров выделено читаемое ограниченное место. Bind/loopback-адрес заменён подсказкой о LAN, порт IPv6 отделён скобками; «Переименовать» объясняет существующий путь через файл настроек и перезапуск.
+
+**Проверка:** Управляемые тесты не доказывают физический ввод, акустику или живую работу между ПК. Заглушение источника Windows реализовано; физические устройства ещё не квалифицированы. Нативное восстановление mute и сохранение после сбоя остаются best-effort.
+
 ## 0.5.0 — 2026-11-04
 
 ### English

@@ -11,6 +11,8 @@ workspace = true
 
 [target.'cfg(windows)'.dependencies]
 audio-backend = { path = "../audio-backend" }
+# Reuse the input adapter's pure physical HID/scan table; no native adapter is constructed.
+platform-win = { path = "../platform-win" }
 rtrb = "0.3"
 tracing = "0.1"
 wasapi = "=0.26.0"

@@ -1719,6 +1719,14 @@ bidirectional = true
         .with_persisted_ownership(1, Some((1, node)));
         router.handle(
             0,
+            fr::Input::Agent(fr::AgentEvent::PressedState {
+                keys: vec![],
+                buttons: vec![],
+                known: true,
+            }),
+        );
+        router.handle(
+            0,
             fr::Input::Hello {
                 peer,
                 hello: fr::PeerHello {

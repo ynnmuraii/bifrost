@@ -13,7 +13,7 @@ use std::{
     },
     task::{Context, Poll},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 pub(crate) struct Signals {
@@ -359,20 +359,21 @@ impl Stream for LinuxStream {
             result = deleted;
         }
         self.link.take(); // Shutdown releases callbacks even on command timeout/disconnection.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while !self.signals.released.load(Ordering::Acquire) {
-            if Instant::now() >= deadline {
-                return Err(BackendError::Timeout);
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        result
+        finish_stop(&self.signals, result)
     }
 }
 impl Drop for LinuxStream {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+fn finish_stop(signals: &Signals, result: Result<(), BackendError>) -> Result<(), BackendError> {
+    // Socket shutdown requests teardown; only adapter Drop proves the callback has
+    // finished and its captures are gone. Even an error return must cross this barrier.
+    while !signals.released.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(1));
+    }
+    result
 }
 fn validate_format(format: AudioFormat) -> Result<(), BackendError> {
     if format.sample_rate != 48_000 || !matches!(format.channels, 1 | 2) {
@@ -560,6 +561,60 @@ impl Drop for RenderAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn error_stop_waits_for_delayed_callback_storage_and_drops_captures() {
+        struct Captured(Arc<AtomicBool>);
+        impl Drop for Captured {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        for result in [Ok(()), Err(BackendError::Timeout)] {
+            let signals = Arc::new(Signals::new());
+            let dropped = Arc::new(AtomicBool::new(false));
+            let captured = Captured(dropped.clone());
+            let (entered, entering) = std::sync::mpsc::channel();
+            let (release, permit) = std::sync::mpsc::channel();
+            let mut adapter = CaptureAdapter::new(
+                Box::new(move |_| {
+                    let _ = &captured;
+                    entered.send(()).unwrap();
+                    permit.recv().unwrap();
+                }),
+                signals.clone(),
+                Arc::new(State::new()),
+                AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                },
+            );
+            let reactor = thread::spawn(move || {
+                adapter.write(&[0; 8]);
+                drop(adapter);
+            });
+            entering.recv_timeout(Duration::from_secs(1)).unwrap();
+            signals.running.store(false, Ordering::Release);
+            let waiting = signals.clone();
+            let (done, completed) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                let result = finish_stop(&waiting, result);
+                done.send(result).unwrap();
+            });
+            assert!(matches!(
+                completed.recv_timeout(Duration::from_millis(550)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(!dropped.load(Ordering::Acquire));
+            release.send(()).unwrap();
+            reactor.join().unwrap();
+            assert_eq!(
+                completed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                result
+            );
+            assert!(dropped.load(Ordering::Acquire));
+            worker.join().unwrap();
+        }
+    }
     #[test]
     fn capture_fragments_are_frame_aligned_bounded_and_monotonic() {
         let count = Arc::new(AtomicU64::new(0));

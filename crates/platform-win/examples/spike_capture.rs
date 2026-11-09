@@ -178,7 +178,7 @@ mod win {
                     window.note(&event);
                     if let InputEvent::Key {
                         key,
-                        state: KeyState::Down,
+                        state: KeyState::Up,
                     } = event
                     {
                         if key == TOGGLE_KEY {
@@ -188,8 +188,11 @@ mod win {
                                     CaptureKind::Observe
                                 }
                             };
-                            capture.set_mode(next);
-                            println!("F11: mode -> {next:?}");
+                            if capture.set_mode(next) {
+                                println!("F11 released: mode -> {next:?}");
+                            } else {
+                                println!("F11: mode change refused (physical input held or emergency pending)");
+                            }
                         }
                     }
                 }
@@ -198,7 +201,7 @@ mod win {
                     outcome.emergency = true;
                     break;
                 }
-                Ok(CaptureEvent::HotkeyPressed(action)) => {
+                Ok(CaptureEvent::HotkeyPressed(action, _)) => {
                     println!("hotkey action {action}");
                 }
                 Ok(CaptureEvent::QueueOverflow) => {
@@ -255,7 +258,10 @@ mod win {
             std::thread::sleep(Duration::from_secs(1));
         }
 
-        capture.set_mode(CaptureKind::Remote);
+        if !capture.set_mode(CaptureKind::Remote) {
+            println!("REMOTE refused: release all physical input and acknowledge emergency first");
+            return;
+        }
         match capture.hold_point() {
             Some((x, y)) => println!("REMOTE: cursor held at ({x},{y})"),
             None => println!("REMOTE: no hold point (GetCursorPos failed)"),
@@ -267,7 +273,8 @@ mod win {
             args.remote_secs,
             0,
         );
-        capture.set_mode(CaptureKind::Observe);
+        assert!(capture.set_mode(CaptureKind::Observe));
+        capture.acknowledge_terminal();
         println!(
             "left Remote (emergency={}), local input restored",
             outcome.emergency

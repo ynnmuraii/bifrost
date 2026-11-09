@@ -30,7 +30,7 @@ use transport::{AuxPurpose, DerivedKey, LinkManager};
 use crate::audio::{
     AudioHandle, AudioSupervisor, AudioSupervisorConfig, AudioSupervisorError, AudioSupervisorEvent,
 };
-use crate::gui::{Outgoing, Request};
+use crate::gui::{Outgoing, Replies, Request};
 
 const COMMANDS: usize = 32;
 const TICK: Duration = Duration::from_millis(25);
@@ -48,24 +48,6 @@ fn count_optional_drop(counter: &AtomicU64) {
             Err(current) => count = current,
         }
     }
-}
-
-pub(super) fn is_request(message: &gui::gui_frame::Msg) -> bool {
-    use gui::gui_frame::Msg;
-    matches!(
-        message,
-        Msg::GetAudioStatus(_)
-            | Msg::SetAudio(_)
-            | Msg::SetSystemAudioSharing(_)
-            | Msg::StartAudio(_)
-            | Msg::StopAudio(_)
-            | Msg::SetMicrophoneMute(_)
-            | Msg::SetPtt(_)
-            | Msg::ListAudioDevices(_)
-            | Msg::SetAudioPeerGain(_)
-            | Msg::SendMediaCommand(_)
-            | Msg::GetAudioArtwork(_)
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -239,6 +221,7 @@ impl Coordinator {
             retry: VecDeque::new(),
             worker_epoch: 0,
             worker: None,
+            worker_reconfigure: false,
             worker_events: None,
             ready: None,
             revision: 1,
@@ -500,7 +483,7 @@ impl Coordinator {
             });
         }
     }
-    pub(super) fn submit(&self, request: Request) -> Result<(), (u64, mpsc::Sender<Outgoing>)> {
+    pub(super) fn submit(&self, request: Request) -> Result<(), (u64, Replies)> {
         if matches!(
             &request.message,
             gui::gui_frame::Msg::SetSystemAudioSharing(_)
@@ -572,7 +555,7 @@ struct Record {
     agreement: fsm::Agreement,
     role: model::AudioRole,
     material: Option<Materials>,
-    // Outstanding native start write; only matching native Stopped retires it.
+    // Outstanding native start write; matching Stopped or worker loss retires it.
     start_request_id: Option<u64>,
     health: model::AudioHealth,
     health_state: model::StreamHealth,
@@ -638,6 +621,7 @@ struct Actor {
     scratch_effects: Vec<fsm::Effect>,
     retry: VecDeque<(fsm::Parent, fsm::Control)>,
     worker: Option<Worker>,
+    worker_reconfigure: bool,
     worker_events: Option<mpsc::Receiver<AudioSupervisorEvent>>,
     ready: Option<worker::Ready>,
     revision: u64,
@@ -692,7 +676,7 @@ impl Actor {
         }
         self.session_locked = locked;
     }
-    fn gui_live(&self, connection_id: [u8; 16], out: &mpsc::Sender<Outgoing>) -> bool {
+    fn gui_live(&self, connection_id: [u8; 16], out: &Replies) -> bool {
         let context = self.control_rx.borrow();
         gui_connection_live(
             context.gui_seen.get(&connection_id).copied(),
@@ -1255,6 +1239,22 @@ impl Actor {
                         continue;
                     }
                     let peer = NodeId::new(parent.peer);
+                    if self.worker_reconfigure
+                        || self.native_stops_pending()
+                        || self.records.get(&peer).is_some_and(|record| {
+                            record.start_request_id.is_some()
+                                && record.view.session != agreement.offer.session
+                        })
+                    {
+                        let Some(view) = self.model.session(parent.peer) else {
+                            continue;
+                        };
+                        let _ = self.feed(fsm::Input::ChildFailed {
+                            view,
+                            reason: fsm::Reason::RateLimited,
+                        });
+                        continue;
+                    }
                     let material = self.derive(parent, &agreement).await;
                     let Some(view) = self.model.session(parent.peer) else {
                         continue;
@@ -1264,7 +1264,11 @@ impl Actor {
                             && !self.records.contains_key(&peer)
                         {
                             self.records.retain(|_, r| {
-                                !matches!(r.view.phase, fsm::Phase::Stopped | fsm::Phase::Failed)
+                                r.start_request_id.is_some()
+                                    || !matches!(
+                                        r.view.phase,
+                                        fsm::Phase::Stopped | fsm::Phase::Failed
+                                    )
                             });
                         }
                         if self.records.len() >= model::MAX_AUDIO_SESSIONS
@@ -1551,6 +1555,9 @@ impl Actor {
         // Native SessionEvent::Started, never this write ACK, calls ChildStarted.
     }
     async fn ensure_worker(&mut self) -> Result<(), Code> {
+        if self.worker_reconfigure {
+            return Err(ipc::audio::codes::AUDIO_WORKER_RESTARTING);
+        }
         if !self.worker_needed() {
             return Err(ipc::audio::codes::AUDIO_UNAVAILABLE);
         }
@@ -1664,6 +1671,7 @@ impl Actor {
                 record.capture_active = None;
                 record.sending = None;
             }
+            record.start_request_id = None;
             record.latency_estimate_ms = None;
             record.latency_stages = None;
         }
@@ -1697,10 +1705,24 @@ impl Actor {
                         && record.start_request_id.is_some()
                         && matches!(
                             record.view.phase,
-                            fsm::Phase::Stopping | fsm::Phase::Stopped
+                            fsm::Phase::Stopping
+                                | fsm::Phase::Stopped
+                                | fsm::Phase::Failed
+                                | fsm::Phase::DevicePaused
                         )
                 })
         })
+    }
+    async fn service_worker_reconfigure(&mut self) {
+        if !self.worker_reconfigure || self.native_stops_pending() {
+            return;
+        }
+        let _ = self.stop_worker().await;
+        self.records.clear();
+        self.worker_reconfigure = false;
+        if self.worker_needed() {
+            let _ = self.ensure_worker().await;
+        }
     }
     async fn stop_worker(&mut self) -> Result<(), Code> {
         // Keep the ordinary actor loop responsive until actual native Stopped.
@@ -1907,10 +1929,27 @@ impl Actor {
                         }
                     }
                     Ok(worker::EventKind::Stopped) => {
+                        if self
+                            .worker
+                            .as_ref()
+                            .is_none_or(|worker| !worker.alive || worker.generation != gen)
+                            || self
+                                .records
+                                .get(&peer)
+                                .is_none_or(|record| record.start_request_id.is_none())
+                        {
+                            return;
+                        }
                         if let Some(record) = self.records.get_mut(&peer) {
                             record.path_diagnostic = native_path_diagnostic(event.path_diagnostic);
                         }
-                        if matches!(view.phase, fsm::Phase::Stopping | fsm::Phase::Stopped) {
+                        if matches!(
+                            view.phase,
+                            fsm::Phase::Stopping
+                                | fsm::Phase::Stopped
+                                | fsm::Phase::Failed
+                                | fsm::Phase::DevicePaused
+                        ) {
                             let _ = self.feed(fsm::Input::ChildStopped(view));
                         } else if !matches!(
                             view.phase,
@@ -1922,6 +1961,7 @@ impl Actor {
                                 fsm::Reason::WorkerLost
                             };
                             let _ = self.feed(fsm::Input::ChildFailed { view, reason });
+                            let _ = self.feed(fsm::Input::ChildStopped(view));
                         }
                         if let Some(record) = self.records.get_mut(&peer) {
                             record.start_request_id = None;
@@ -2121,22 +2161,52 @@ impl Actor {
                 error,
                 request_id,
             } => {
+                if self
+                    .worker
+                    .as_ref()
+                    .is_none_or(|worker| !worker.alive || worker.generation != gen)
+                {
+                    return;
+                }
                 if let Ok(id) = <[u8; 16]>::try_from(error.session_id.as_slice()) {
-                    if let Some(view) = self
+                    if let Some((peer, view, start)) = self
                         .records
-                        .values()
-                        .find(|r| {
+                        .iter()
+                        .find(|(_, r)| {
                             r.view.session == id
                                 && r.view.worker_generation == generation(gen, self.worker_epoch)
-                                && r.start_request_id.is_some_and(|start| request_id >= start)
-                                && !matches!(r.view.phase, fsm::Phase::Stopped | fsm::Phase::Failed)
+                                && r.start_request_id
+                                    .is_some_and(|start| request_id == 0 || request_id >= start)
                         })
-                        .map(|r| r.view)
+                        .map(|(peer, r)| (*peer, r.view, r.start_request_id))
                     {
-                        let _ = self.feed(fsm::Input::ChildFailed {
-                            view,
-                            reason: fsm::Reason::DeviceUnavailable,
-                        });
+                        if request_id != 0 && start == Some(request_id) {
+                            let model_owns_start =
+                                self.model.session(*peer.as_bytes()).is_some_and(|current| {
+                                    current.parent == view.parent
+                                        && current.session == view.session
+                                        && current.worker_generation == view.worker_generation
+                                });
+                            if !model_owns_start
+                                || self
+                                    .feed(fsm::Input::ChildStartRejected {
+                                        view,
+                                        reason: fsm::Reason::DeviceUnavailable,
+                                    })
+                                    .is_ok()
+                            {
+                                if let Some(record) = self.records.get_mut(&peer) {
+                                    record.start_request_id = None;
+                                    record.capture_active = Some(false);
+                                    record.sending = Some(false);
+                                }
+                            }
+                        } else if !matches!(view.phase, fsm::Phase::Stopped | fsm::Phase::Failed) {
+                            let _ = self.feed(fsm::Input::ChildFailed {
+                                view,
+                                reason: fsm::Reason::DeviceUnavailable,
+                            });
+                        }
                     }
                 }
             }
@@ -2758,8 +2828,8 @@ impl Actor {
         self.worker_failed = false;
         self.publish_caps();
         if scope_changed {
-            self.records.clear();
-            let _ = self.stop_worker().await;
+            self.worker_reconfigure = true;
+            self.service_worker_reconfigure().await;
         }
         if let Err(error) = self.configure() {
             self.config = previous;
@@ -2780,8 +2850,10 @@ impl Actor {
         if !self.config.enabled {
             self.fail_pending(ipc::audio::codes::AUDIO_UNAVAILABLE);
             self.stop_worker().await?;
-            self.records.clear();
-        } else {
+            if !self.native_stops_pending() {
+                self.records.clear();
+            }
+        } else if !self.worker_reconfigure {
             let _ = self.ensure_worker().await;
         }
         Ok(())
@@ -2879,6 +2951,8 @@ impl Actor {
     }
     fn start_ready(&self, peer: NodeId) -> bool {
         self.system_enabled()
+            && !self.worker_reconfigure
+            && !self.native_stops_pending()
             && self.configuration_error.is_none()
             && self
                 .worker

@@ -693,6 +693,14 @@ impl<S: Stream + 'static> MediaSession<S> {
             }
         }
     }
+    /// Sending admission needs packet freshness, not a second native/statistics snapshot.
+    pub fn is_sending(&self) -> bool {
+        !self.shared.is_stopped()
+            && self.shared.sent_media_packets.load(Ordering::Acquire) > 0
+            && (self.shared.clock.elapsed().as_millis() as u64)
+                .saturating_sub(self.shared.last_send_ms.load(Ordering::Acquire))
+                < 100
+    }
     pub fn snapshot(&mut self) -> HealthSnapshot {
         self.refresh();
         let stats = *lock(&self.shared.stats);
@@ -707,7 +715,6 @@ impl<S: Stream + 'static> MediaSession<S> {
             .discontinuities
             .saturating_add(self.shared.capture_discontinuities.load(Ordering::Acquire));
         let now = self.shared.clock.elapsed().as_millis() as u64;
-        let stopped = self.shared.is_stopped();
         let media = self.shared.sent_media_packets.load(Ordering::Acquire);
         HealthSnapshot {
             health,
@@ -722,9 +729,7 @@ impl<S: Stream + 'static> MediaSession<S> {
                 && self.last_native.status == StreamStatus::Running
                 && self.shared.capture_frames.load(Ordering::Acquire) > 0
                 && now.saturating_sub(self.shared.last_capture_ms.load(Ordering::Acquire)) < 100,
-            sending: !stopped
-                && media > 0
-                && now.saturating_sub(self.shared.last_send_ms.load(Ordering::Acquire)) < 100,
+            sending: self.is_sending(),
             rejected_datagrams: stats
                 .rejected
                 .saturating_add(self.shared.socket_rejected.load(Ordering::Acquire)),
@@ -1419,7 +1424,14 @@ impl SourceWorker {
             .as_ref()
             .map_or(self.frame, NativeRate::max_input_frames);
         let mut input = vec![0.0; input_capacity * 2];
-        let mut pcm = vec![0.0; self.frame * 2];
+        let mut pcm = vec![
+            0.0;
+            if self.converter.is_some() {
+                self.frame * 2
+            } else {
+                0
+            }
+        ];
         let frame_duration = Duration::from_secs_f64(self.frame as f64 / 48_000.0);
         let mut next_frame = Instant::now();
         let mut next_keepalive = Instant::now();
@@ -1617,19 +1629,20 @@ impl SourceWorker {
                     .shared
                     .capture_silence
                     .store(synthesized, Ordering::Release);
-                if let Some(converter) = self.converter.as_mut() {
+                let pcm = if let Some(converter) = self.converter.as_mut() {
                     let n = converter
                         .process(&input[..needed * 2], &mut pcm)
                         .map_err(media_reason)?;
                     if n != self.frame {
                         return Err(StopReason::WorkerFailed);
                     }
+                    &pcm[..]
                 } else {
-                    pcm.copy_from_slice(&input[..needed * 2]);
-                }
+                    &input[..needed * 2]
+                };
                 let n = self
                     .sender
-                    .encode(self.context.now_ms(), &pcm, &mut outgoing)
+                    .encode(self.context.now_ms(), pcm, &mut outgoing)
                     .map_err(media_reason)?;
                 self.context.send(&outgoing[..n])?;
                 next_frame += frame_duration;

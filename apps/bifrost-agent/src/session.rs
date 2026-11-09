@@ -19,6 +19,7 @@
 //! | `Ping` | `Pong` | rule 11 |
 //! | — | `CapturedBatch`, `EmergencyFired`, `LocalInputDetected`, `SessionEvent` | rules 2, 3, 9 |
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +44,104 @@ use crate::{Args, FRAME_MAJOR, FRAME_MINOR};
 /// is 200 ms) and long enough that the clipboard's notification queue, its `stat` and its
 /// framing are not serviced on the 5 ms input tick.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(20);
+// Bound hotkey release admission by the protocol's maximum prepare budget.
+const SWITCH_RELEASE_WINDOW: Duration = Duration::from_millis(400);
+
+/// One local epoch. A terminal watermark rejects even a Prepare queued before release.
+#[derive(Debug, Default)]
+struct HeldLease {
+    current: Option<Vec<u8>>,
+    receiver: bool,
+    source_kind: Option<input_model::CaptureKind>,
+    switch_pending: Option<Instant>,
+    switch_cancelled_at: Option<Instant>,
+    last_seq: u64,
+    terminal_us: u64,
+    // Match the router's bounded recent-ID fence; issuance still rejects older queued epochs.
+    retired_ids: VecDeque<[u8; 16]>,
+    physical: input_model::PressedState,
+}
+
+impl HeldLease {
+    fn is_none(&self) -> bool {
+        self.current.is_none()
+    }
+    #[cfg(test)]
+    fn is_some(&self) -> bool {
+        self.current.is_some()
+    }
+    fn matches(&self, id: &[u8]) -> bool {
+        id.len() == 16 && self.current.as_deref() == Some(id)
+    }
+    fn take(&mut self) -> Option<Vec<u8>> {
+        self.cancel_switch();
+        self.source_kind = None;
+        self.receiver = false;
+        self.last_seq = 0;
+        self.terminal_us = ::ipc::clock::host_monotonic_us().unwrap_or(u64::MAX);
+        if let Some(id) = self
+            .current
+            .as_deref()
+            .and_then(|id| <[u8; 16]>::try_from(id).ok())
+        {
+            if !self.retired_ids.contains(&id) {
+                if self.retired_ids.len() == 1024 {
+                    let _ = self.retired_ids.pop_front();
+                }
+                self.retired_ids.push_back(id);
+            }
+        }
+        self.current.take()
+    }
+    fn capture(&mut self, id: Vec<u8>, kind: input_model::CaptureKind) {
+        self.current = Some(id);
+        self.receiver = false;
+        self.last_seq = 0;
+        self.source_kind = Some(kind);
+        self.cancel_switch();
+    }
+    fn prepare(&mut self, id: &[u8], issued_at_us: u64) -> bool {
+        let Some(now) = ::ipc::clock::host_monotonic_us() else {
+            return false;
+        };
+        if id.len() != 16
+            || self.current.is_some()
+            || self.is_retired(id)
+            || issued_at_us <= self.terminal_us
+            || issued_at_us > now
+        {
+            return false;
+        }
+        self.current = Some(id.to_vec());
+        self.receiver = true;
+        self.last_seq = 0;
+        self.source_kind = None;
+        self.cancel_switch();
+        true
+    }
+
+    fn is_retired(&self, id: &[u8]) -> bool {
+        <[u8; 16]>::try_from(id).is_ok_and(|id| self.retired_ids.contains(&id))
+    }
+
+    fn can_switch(&self) -> bool {
+        !self.receiver
+            && (self.current.is_none()
+                || self.source_kind == Some(input_model::CaptureKind::Remote))
+    }
+
+    fn cancel_switch(&mut self) {
+        self.switch_pending = None;
+        self.switch_cancelled_at = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<Option<Vec<u8>>> for HeldLease {
+    fn eq(&self, other: &Option<Vec<u8>>) -> bool {
+        &self.current == other
+    }
+}
 
 /// How the loop ended.
 enum Stop {
@@ -112,65 +211,98 @@ pub async fn run(args: &Args) -> anyhow::Result<()> {
     let Some((mut backend, mut ready, refusals)) = selected else {
         return Ok(());
     };
-    ready.set_image_clipboard(backend.image_clipboard_available());
-    backend.set_effects(attach.edge_effects, attach.hide_cursor);
-    if args.dry_inject {
-        tracing::warn!("dry mode: no capture hooks, no injection; Inject is only logged");
-    }
-    if !backend.has_capabilities() {
-        tracing::warn!(
-            reason = ready.backend.degraded_reason.as_str(),
-            "no capability advertised: this node stays local"
-        );
-    }
-    link.send(Msg::Ready(ready.to_ipc())).await?;
-    if !attach.hotkeys.is_empty() {
-        if let Some(result) = install_hotkeys(&mut backend, &attach.hotkeys).await {
-            link.send(Msg::HotkeysResult(result)).await?;
+    let result: anyhow::Result<()> = async {
+        ready.set_image_clipboard(backend.image_clipboard_available());
+        backend.set_effects(attach.edge_effects, attach.hide_cursor);
+        if args.dry_inject {
+            tracing::warn!("dry mode: no capture hooks, no injection; Inject is only logged");
         }
-    }
-    // A backend that is usable but incomplete (a missing portal, a dismissed dialog)
-    // says so explicitly: `AgentError` is how `docs/ipc.proto` carries
-    // `PORTAL_DENIED`/`PORTAL_UNAVAILABLE` and the interface they name.
-    for refusal in &refusals {
-        tracing::warn!(
-            code = refusal.code,
-            detail = refusal.detail.as_str(),
-            "backend degraded"
-        );
-        link.send(Msg::Error(AgentError {
-            code: refusal.code.to_owned(),
-            detail: refusal.detail.clone(),
-        }))
+        if !backend.has_capabilities() {
+            tracing::warn!(
+                reason = ready.backend.degraded_reason.as_str(),
+                "no capability advertised: this node stays local"
+            );
+        }
+        link.send(Msg::Ready(ready.to_ipc())).await?;
+        if mode == AgentMode::Recovery as i32 {
+            // Recovery has no hotkey/clipboard/guard traffic before the native release ACK.
+            let mut link = link.into_split();
+            recovery_loop(&mut link, &mut backend).await?;
+            return Ok(());
+        }
+        if !attach.hotkeys.is_empty() {
+            if let Some(result) = install_hotkeys(&mut backend, &attach.hotkeys).await {
+                link.send(Msg::HotkeysResult(result)).await?;
+            }
+        }
+        // A backend that is usable but incomplete (a missing portal, a dismissed dialog)
+        // says so explicitly: `AgentError` is how `docs/ipc.proto` carries
+        // `PORTAL_DENIED`/`PORTAL_UNAVAILABLE` and the interface they name.
+        for refusal in &refusals {
+            tracing::warn!(
+                code = refusal.code,
+                detail = refusal.detail.as_str(),
+                "backend degraded"
+            );
+            link.send(Msg::Error(AgentError {
+                lease_id: Vec::new(),
+                code: refusal.code.to_owned(),
+                detail: refusal.detail.clone(),
+            }))
+            .await?;
+        }
+
+        // Rule 6's clock starts when the agent is ready. Before `AgentReady` the agent has
+        // no capture or injection capability, and `complete_backend_startup` continues to
+        // answer core heartbeats while the user responds to portal prompts.
+        let mut watchdog = watchdog_at_ready(attach.core_silence_ms, now_ms(started));
+
+        let mut link = link.into_split();
+        loop_forever(
+            &mut link,
+            &mut backend,
+            &ready,
+            attach.repeat_mode,
+            &mut watchdog,
+            started,
+            args.dev_capture_injected,
+            ClipboardState::new(),
+        )
         .await?;
+        Ok(())
     }
+    .await;
 
-    // Rule 6's clock starts when the agent is ready. Before `AgentReady` the agent has
-    // no capture or injection capability, and `complete_backend_startup` continues to
-    // answer core heartbeats while the user responds to portal prompts.
-    let mut watchdog = watchdog_at_ready(attach.core_silence_ms, now_ms(started));
-
-    let mut link = link.into_split();
-    let stop = loop_forever(
-        &mut link,
-        &mut backend,
-        &ready,
-        mode,
-        attach.repeat_mode,
-        &mut watchdog,
-        started,
-        args.dev_capture_injected,
-        ClipboardState::new(),
-    )
-    .await?;
-
-    // Both endings leave nothing of this session behind (rules 4, 6, 10; S2).
-    if let Stop::LostCore = stop {
-        // The loop is over, so nothing can inject any more; the state still goes with it.
-        release_everything(&mut backend, &mut None, &mut None, &mut None, &mut None).await;
-    }
+    // Also covers failures while sending startup/ready frames after hooks were created.
+    finish_session(&mut backend, result).await?;
     tracing::info!("agent exiting");
     Ok(())
+}
+
+async fn finish_session(backend: &mut Backend, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    let cleanup = release_everything(
+        backend,
+        &mut None,
+        &mut None,
+        &mut None,
+        &mut HeldLease::default(),
+    )
+    .await;
+    if let Err(error) = &cleanup {
+        tracing::warn!(%error, "final native input cleanup failed");
+    }
+    result.and(cleanup.map(|_| ()))
+}
+
+fn deadline_at(
+    received_at: Instant,
+    host_now_us: Option<u64>,
+    deadline_us: u64,
+) -> Option<Instant> {
+    let remaining_us = deadline_us.checked_sub(host_now_us?)?;
+    (1..=1_000_000)
+        .contains(&remaining_us)
+        .then(|| received_at + Duration::from_micros(remaining_us))
 }
 
 /// Keeps the IPC heartbeat responsive while portal sessions are opening or restoring.
@@ -211,6 +343,7 @@ where
             })) => return Ok(None),
             Startup::Frame(Ok(_)) => {
                 link.send(Msg::Error(AgentError {
+                    lease_id: Vec::new(),
                     code: "STARTUP_ONLY".to_owned(),
                     detail: "agent is initializing its backend".to_owned(),
                 }))
@@ -224,13 +357,79 @@ where
     }
 }
 
-/// The loop in one place so every exit path releases through the same code.
+/// Recovery owns no normal lease: only explicitly named native ups may reach the backend.
+async fn recovery_loop<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    backend: &mut Backend,
+) -> anyhow::Result<Stop> {
+    loop {
+        let frame = match link.recv().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::warn!(%error, "recovery IPC ended");
+                return Ok(Stop::LostCore);
+            }
+        };
+        match frame.msg {
+            Some(Msg::ReleaseKeys(release)) => {
+                let keys: Vec<input_model::HidKey> = release
+                    .keys
+                    .iter()
+                    .map(|key| input_model::HidKey {
+                        page: u16::try_from(key.usage_page).unwrap_or(0),
+                        usage: u16::try_from(key.usage).unwrap_or(0),
+                    })
+                    .collect();
+                let buttons: Vec<input_model::MouseButton> = release
+                    .buttons
+                    .iter()
+                    .filter_map(|button| match button {
+                        1 => Some(input_model::MouseButton::Left),
+                        2 => Some(input_model::MouseButton::Right),
+                        3 => Some(input_model::MouseButton::Middle),
+                        4 => Some(input_model::MouseButton::Back),
+                        5 => Some(input_model::MouseButton::Forward),
+                        _ => None,
+                    })
+                    .collect();
+                let released = match backend.release_keys(&keys, &buttons).await {
+                    Ok(released) => released,
+                    Err(detail) => {
+                        send_error(link, "RECOVERY_FAILED", &detail).await?;
+                        continue;
+                    }
+                };
+                tracing::info!(
+                    keys = released.keys,
+                    buttons = released.buttons,
+                    "recovery release"
+                );
+                link.send(Msg::Released(Released {
+                    lease_id: Vec::new(),
+                    keys_released: released.keys,
+                    buttons_released: released.buttons,
+                }))
+                .await?;
+            }
+            Some(Msg::Shutdown(_)) => return Ok(Stop::Shutdown),
+            _ => {
+                send_error(
+                    link,
+                    "RECOVERY_ONLY_RELEASEKEYS",
+                    "agent is in RECOVERY mode",
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+/// The normal loop in one place so every exit path releases through the same code.
 #[allow(clippy::too_many_arguments)]
 async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     link: &mut AgentSplit<S>,
     backend: &mut Backend,
     ready: &backend::Ready,
-    mode: i32,
     repeat_mode: i32,
     watchdog: &mut Watchdog,
     started: Instant,
@@ -245,7 +444,7 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
     // `BeginCapture(TEMPORARY)` self-timeout (rule 5).
     let mut self_timeout: Option<(Instant, Vec<u8>)> = None;
     // A lease the backend is currently holding state for.
-    let mut held_lease: Option<Vec<u8>> = None;
+    let mut held_lease = HeldLease::default();
     // Captured events waiting for the next tick, so one tick is one batch.
     let mut batch: Vec<LocalEvent> = Vec::new();
     // KVM-036: with `ReceiverSoftware` this agent repeats a held key itself, at the OS rate
@@ -317,14 +516,6 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                     send_error(link, "EMPTY_FRAME", "AgentFrame with no message").await?;
                     continue;
                 };
-                if !::ipc::agent::mode_allows(mode, message) {
-                    tracing::warn!(
-                        mode = AgentMode::try_from(mode).unwrap_or(AgentMode::Unspecified).as_str_name(),
-                        "message refused by the RECOVERY allow-list"
-                    );
-                    send_error(link, "RECOVERY_ONLY_RELEASEKEYS", "agent is in RECOVERY mode").await?;
-                    continue;
-                }
                 if let Some(stop) = handle_message(
                     link, backend, ready, message, &mut deadline, &mut self_timeout,
                     &mut held_lease, &mut batch, &mut displays, &mut repeat,
@@ -362,7 +553,8 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                 let now = now_ms(started);
                 // KVM-036: one repeat per interval, injected like any other key event, so it
                 // travels the same ledger and the same cleanup as the original press.
-                if let Some(engine) = repeat.as_mut() {
+                if let Some(engine) = repeat.as_mut().filter(|_| held_lease.receiver
+                    && deadline.as_ref().is_some_and(|(due, id)| Instant::now() < *due && held_lease.matches(id))) {
                     if let Some(key) = engine.due(now) {
                         let events = [input_model::InputEvent::Key {
                             key,
@@ -374,6 +566,10 @@ async fn loop_forever<S: AsyncRead + AsyncWrite + Unpin>(
                             repeats = engine.repeats(),
                             "software repeat"
                         );
+                        finish_repeat(
+                            link, backend, &mut repeat, &mut deadline, &mut self_timeout,
+                            &mut held_lease, injected,
+                        ).await?;
                     }
                 }
                 if let Some(event) = event {
@@ -454,7 +650,7 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     deadline: &mut Option<(Instant, Vec<u8>)>,
     self_timeout: &mut Option<(Instant, Vec<u8>)>,
-    held_lease: &mut Option<Vec<u8>>,
+    held_lease: &mut HeldLease,
     released_after_silence: &mut bool,
     watchdog: &mut Watchdog,
     now: u64,
@@ -469,7 +665,10 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
             // with it, or the engine keeps injecting a key that was just released (batch-3
             // audit, F12).
             forget_lease_state(repeat, deadline, self_timeout, held_lease);
-            let released = backend.release_session().await;
+            let released = backend
+                .release_session()
+                .await
+                .map_err(anyhow::Error::msg)?;
             link.send(Msg::DeadlineExpired(DeadlineExpired { lease_id }))
                 .await?;
             tracing::info!(keys = released.keys, buttons = released.buttons, "released");
@@ -477,23 +676,7 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
     }
     // Rule 5: a TEMPORARY capture ends by itself and the buffered edge
     // is played locally rather than reaching the wire.
-    if let Some((due, lease_id)) = self_timeout.as_ref() {
-        if Instant::now() >= *due {
-            let lease_id = lease_id.clone();
-            *self_timeout = None;
-            tracing::warn!("self-timeout of a temporary capture");
-            forget_capture_state(repeat, self_timeout);
-            let _ = backend.end_capture(true).await;
-            send_error(
-                link,
-                "CAPTURE_FAILED",
-                "temporary capture self-timeout expired",
-            )
-            .await?;
-            let _ = lease_id;
-            *held_lease = None;
-        }
-    }
+    expire_temporary_capture(link, backend, repeat, self_timeout, held_lease).await?;
     // Rule 6: core went quiet. No frame, not even a Ping.
     if watchdog.silence_exceeded(now) && !*released_after_silence {
         *released_after_silence = true;
@@ -501,9 +684,63 @@ async fn service_timers<S: AsyncRead + AsyncWrite + Unpin>(
             silence_ms = watchdog.silence_ms(now),
             "core silent past the limit; releasing locally"
         );
-        release_everything(backend, repeat, deadline, self_timeout, held_lease).await;
+        release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
     }
+    service_pending_switch(link, backend, held_lease).await?;
     Ok(())
+}
+
+async fn expire_temporary_capture<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    backend: &mut Backend,
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    self_timeout: &mut Option<(Instant, Vec<u8>)>,
+    held_lease: &mut HeldLease,
+) -> anyhow::Result<bool> {
+    let Some((due, lease_id)) = self_timeout.as_ref() else {
+        return Ok(false);
+    };
+    if Instant::now() < *due {
+        return Ok(false);
+    }
+    let lease_id = lease_id.clone();
+    forget_capture_state(repeat, self_timeout);
+    held_lease.take();
+    backend
+        .end_capture(true, true)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    send_lease_error(
+        link,
+        "CAPTURE_FAILED",
+        "temporary capture self-timeout expired",
+        lease_id,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn finish_repeat<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    backend: &mut Backend,
+    repeat: &mut Option<crate::repeat::SoftwareRepeat>,
+    deadline: &mut Option<(Instant, Vec<u8>)>,
+    self_timeout: &mut Option<(Instant, Vec<u8>)>,
+    held_lease: &mut HeldLease,
+    injected: Injected,
+) -> anyhow::Result<()> {
+    if injected.applied == 1 && injected.os_error.is_empty() {
+        return Ok(());
+    }
+    let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
+        .await?
+        .unwrap_or_default();
+    let detail = if injected.os_error.is_empty() {
+        "incomplete software-repeat injection"
+    } else {
+        &injected.os_error
+    };
+    send_lease_error(link, "INJECTION_FAILED", detail, lease_id).await
 }
 
 async fn install_hotkeys(
@@ -529,7 +766,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
     message: &Msg,
     deadline: &mut Option<(Instant, Vec<u8>)>,
     self_timeout: &mut Option<(Instant, Vec<u8>)>,
-    held_lease: &mut Option<Vec<u8>>,
+    held_lease: &mut HeldLease,
     batch: &mut Vec<LocalEvent>,
     displays: &mut crate::displays::DisplaysState,
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
@@ -538,6 +775,20 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
     injection_metrics: &mut InjectionMetrics,
     now: u64,
 ) -> anyhow::Result<Option<Stop>> {
+    // Native admission cannot rearm past an already-due local deadline.
+    if deadline
+        .as_ref()
+        .is_some_and(|(due, _)| Instant::now() >= *due)
+    {
+        let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
+            .await?
+            .unwrap_or_default();
+        link.send(Msg::DeadlineExpired(DeadlineExpired { lease_id }))
+            .await?;
+    }
+    if expire_temporary_capture(link, backend, repeat, self_timeout, held_lease).await? {
+        batch.clear();
+    }
     match message {
         Msg::Attach(_) => {
             send_error(link, "PROTOCOL", "a second AgentAttach is not allowed").await?;
@@ -546,6 +797,7 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             link.send(Msg::Pong(Pong { nonce: ping.nonce })).await?;
         }
         Msg::SetHotkeys(set) => {
+            held_lease.cancel_switch();
             if let Some(result) = install_hotkeys(backend, &set.bindings).await {
                 link.send(Msg::HotkeysResult(result)).await?;
             }
@@ -558,21 +810,107 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                     return Ok(None);
                 }
             };
+            if kind != input_model::CaptureKind::Observe {
+                let fresh = ::ipc::clock::host_monotonic_us().is_some_and(|now| {
+                    begin.issued_at_us > held_lease.terminal_us && begin.issued_at_us <= now
+                });
+                let allowed = match kind {
+                    input_model::CaptureKind::Temporary => {
+                        held_lease.is_none() && !held_lease.is_retired(&begin.lease_id) && fresh
+                    }
+                    input_model::CaptureKind::Remote => {
+                        held_lease.matches(&begin.lease_id) && fresh
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    send_lease_error(
+                        link,
+                        "CAPTURE_FAILED",
+                        "stale capture epoch",
+                        begin.lease_id.clone(),
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+            }
+            if kind != input_model::CaptureKind::Observe
+                && (begin.lease_id.len() != 16 || held_lease.receiver)
+            {
+                return Ok(None);
+            }
+            if kind == input_model::CaptureKind::Remote
+                && backend
+                    .physical_pressed(&held_lease.physical)
+                    .is_none_or(|pressed| !pressed.is_empty())
+            {
+                let lease_id = begin.lease_id.clone();
+                release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
+                batch.clear();
+                send_lease_error(
+                    link,
+                    "CAPTURE_FAILED",
+                    "physical pressed state is held or unavailable",
+                    lease_id,
+                )
+                .await?;
+                return Ok(None);
+            }
+            let promotion_due = if kind == input_model::CaptureKind::Remote {
+                self_timeout.as_ref().map(|(due, _)| *due)
+            } else {
+                None
+            };
+            let self_due = if kind == input_model::CaptureKind::Temporary {
+                match deadline_at(
+                    Instant::now(),
+                    ::ipc::clock::host_monotonic_us(),
+                    begin.self_deadline_us,
+                ) {
+                    Some(due) => Some(due),
+                    None => {
+                        release_everything(backend, repeat, deadline, self_timeout, held_lease)
+                            .await?;
+                        send_lease_error(
+                            link,
+                            "CAPTURE_FAILED",
+                            "temporary capture deadline is expired or invalid",
+                            begin.lease_id.clone(),
+                        )
+                        .await?;
+                        return Ok(None);
+                    }
+                }
+            } else {
+                None
+            };
             match backend
                 .begin_capture(kind, dev_capture_injected && begin.dev_capture_injected)
                 .await
             {
                 Ok(()) => {
-                    *held_lease = Some(begin.lease_id.clone());
-                    if kind == input_model::CaptureKind::Temporary && begin.self_timeout_ms > 0 {
-                        *self_timeout = Some((
-                            Instant::now()
-                                + Duration::from_millis(u64::from(begin.self_timeout_ms).min(1000)),
+                    if self_due
+                        .or(promotion_due)
+                        .is_some_and(|due| Instant::now() >= due)
+                    {
+                        release_everything(backend, repeat, deadline, self_timeout, held_lease)
+                            .await?;
+                        send_lease_error(
+                            link,
+                            "CAPTURE_FAILED",
+                            "temporary capture deadline expired during startup",
                             begin.lease_id.clone(),
-                        ));
-                    } else {
-                        *self_timeout = None;
+                        )
+                        .await?;
+                        return Ok(None);
                     }
+                    if kind != input_model::CaptureKind::Observe {
+                        held_lease.capture(begin.lease_id.clone(), kind);
+                    }
+                    if kind == input_model::CaptureKind::Observe {
+                        report_physical(link, backend, held_lease).await?;
+                    }
+                    *self_timeout = self_due.map(|due| (due, begin.lease_id.clone()));
                     link.send(Msg::CaptureReady(CaptureReady {
                         lease_id: begin.lease_id.clone(),
                         kind: begin.kind,
@@ -581,7 +919,10 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 Err(detail) => {
                     tracing::error!(detail = detail.as_str(), "BeginCapture failed");
-                    send_error(link, "CAPTURE_FAILED", &detail).await?;
+                    release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
+                    batch.clear();
+                    send_lease_error(link, "CAPTURE_FAILED", &detail, begin.lease_id.clone())
+                        .await?;
                 }
             }
         }
@@ -589,13 +930,20 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             // An empty lease rejects only a portal activation on a receiver;
             // its injection lease and repeat engine must continue unchanged.
             let capture_only = end.lease_id.is_empty();
+            if !capture_only && !held_lease.matches(&end.lease_id) {
+                return Ok(None);
+            }
+            held_lease.cancel_switch();
             if !capture_only {
                 forget_capture_state(repeat, self_timeout);
             }
-            match backend.end_capture(end.replay_buffered_locally).await {
+            match backend
+                .end_capture(end.replay_buffered_locally, !capture_only)
+                .await
+            {
                 Ok(released) => {
                     if !capture_only {
-                        *held_lease = None;
+                        held_lease.take();
                     }
                     link.send(Msg::Released(Released {
                         lease_id: end.lease_id.clone(),
@@ -604,34 +952,75 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                     }))
                     .await?;
                 }
-                Err(detail) => send_error(link, "CAPTURE_FAILED", &detail).await?,
+                Err(detail) => {
+                    if !capture_only {
+                        release_everything(backend, repeat, deadline, self_timeout, held_lease)
+                            .await?;
+                    }
+                    send_lease_error(link, "CAPTURE_FAILED", &detail, end.lease_id.clone()).await?;
+                }
             }
         }
         Msg::PrepareInject(prepare) => {
+            if !held_lease.prepare(&prepare.lease_id, prepare.issued_at_us) {
+                send_lease_error(
+                    link,
+                    "CAPTURE_FAILED",
+                    "stale or conflicting injection prepare",
+                    prepare.lease_id.clone(),
+                )
+                .await?;
+                return Ok(None);
+            }
             match backend.prepare_inject().await {
                 // `ipc.proto` has no dedicated "ready to receive" reply, and the FSM's
                 // `AgentEvent::Ready` is documented as «агент ответил `PrepareInject`»,
                 // so the acknowledgement is `AgentReady`.
                 Ok(()) => {
-                    *held_lease = Some(prepare.lease_id.clone());
+                    *deadline = None;
                     link.send(Msg::Ready(ready.to_ipc())).await?;
                 }
-                Err(detail) => send_error(link, "CAPTURE_FAILED", &detail).await?,
+                Err(detail) => {
+                    release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
+                    send_lease_error(link, "CAPTURE_FAILED", &detail, prepare.lease_id.clone())
+                        .await?;
+                }
             }
         }
         Msg::Inject(inject) => {
+            if !held_lease.receiver
+                || !held_lease.matches(&inject.lease_id)
+                || deadline.is_none()
+                || inject.input_batch_seq <= held_lease.last_seq
+                || inject.events.is_empty()
+                || inject.events.len() > 128
+            {
+                link.send(Msg::InjectResult(InjectResult {
+                    lease_id: inject.lease_id.clone(),
+                    input_batch_seq: inject.input_batch_seq,
+                    os_error: "inactive, expired or stale input lease".to_owned(),
+                    ..Default::default()
+                }))
+                .await?;
+                return Ok(None);
+            }
             let events: Vec<input_model::InputEvent> = inject
                 .events
                 .iter()
                 .filter_map(backend::to_input_event)
                 .collect();
             if events.len() != inject.events.len() {
-                tracing::warn!(
-                    offered = inject.events.len(),
-                    accepted = events.len(),
-                    "some injected events had no normalised form"
-                );
+                release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
+                send_lease_error(
+                    link,
+                    "INJECTION_FAILED",
+                    "invalid normalized input",
+                    inject.lease_id.clone(),
+                )
+                .await?;
+                return Ok(None);
             }
+            held_lease.last_seq = inject.input_batch_seq;
             let inject_started = Instant::now();
             let injected: Injected = backend.inject(&events).await;
             // Measure only the adapter call, before bookkeeping or IPC acknowledgement.
@@ -646,8 +1035,12 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             );
             // The engine follows what actually went to the OS: the most recent held key is
             // the one the OS would repeat.
-            if let Some(engine) = repeat.as_mut() {
-                engine.applied(&events, now);
+            if injected.applied == events.len() && injected.os_error.is_empty() {
+                if let Some(engine) = repeat.as_mut() {
+                    engine.applied(&events, now);
+                }
+            } else {
+                release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
             }
             batch.clear();
             injection_metrics.publish(false);
@@ -668,15 +1061,32 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         }
         Msg::ArmDeadline(arm) => {
-            // Rule 4: `remaining_ms` is at most 1000 and the clock is ours.
-            let remaining = u64::from(arm.remaining_ms).clamp(1, 1000);
-            *deadline = Some((
-                Instant::now() + Duration::from_millis(remaining),
-                arm.lease_id.clone(),
-            ));
-            tracing::debug!(remaining, "deadline armed");
+            if !held_lease.receiver || !held_lease.matches(&arm.lease_id) {
+                return Ok(None);
+            }
+            let received_at = Instant::now();
+            let due = deadline_at(
+                received_at,
+                ::ipc::clock::host_monotonic_us(),
+                arm.deadline_us,
+            );
+            match due {
+                Some(due) => {
+                    *deadline = Some((due, arm.lease_id.clone()));
+                }
+                None => {
+                    release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
+                    link.send(Msg::DeadlineExpired(DeadlineExpired {
+                        lease_id: arm.lease_id.clone(),
+                    }))
+                    .await?;
+                }
+            }
         }
         Msg::StopRepeat(stop) => {
+            if !held_lease.receiver || !held_lease.matches(&stop.lease_id) {
+                return Ok(None);
+            }
             // AC-14 (`docs/03-architecture.md`, «Autorepeat при обрыве связи»): no input and
             // no renew for `repeat_guard_ms`. Software repeat stops its engine; native repeat
             // lets the held keys up, because the OS or the application owns that repeat and
@@ -694,7 +1104,10 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
                     );
                 }
                 None => {
-                    let released = backend.release_session().await;
+                    let released = backend
+                        .release_session()
+                        .await
+                        .map_err(anyhow::Error::msg)?;
                     tracing::warn!(
                         keys = released.keys,
                         buttons = released.buttons,
@@ -705,44 +1118,13 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Msg::ReleaseSession(release) => {
+            if !held_lease.matches(&release.lease_id) {
+                return Ok(None);
+            }
             forget_lease_state(repeat, deadline, self_timeout, held_lease);
-            let released = backend.release_session().await;
+            let released = release_native(backend, false).await?;
             link.send(Msg::Released(Released {
                 lease_id: release.lease_id.clone(),
-                keys_released: released.keys,
-                buttons_released: released.buttons,
-            }))
-            .await?;
-        }
-        Msg::ReleaseKeys(release) => {
-            let keys: Vec<input_model::HidKey> = release
-                .keys
-                .iter()
-                .map(|key| input_model::HidKey {
-                    page: u16::try_from(key.usage_page).unwrap_or(0),
-                    usage: u16::try_from(key.usage).unwrap_or(0),
-                })
-                .collect();
-            let buttons: Vec<input_model::MouseButton> = release
-                .buttons
-                .iter()
-                .filter_map(|button| match button {
-                    1 => Some(input_model::MouseButton::Left),
-                    2 => Some(input_model::MouseButton::Right),
-                    3 => Some(input_model::MouseButton::Middle),
-                    4 => Some(input_model::MouseButton::Back),
-                    5 => Some(input_model::MouseButton::Forward),
-                    _ => None,
-                })
-                .collect();
-            let released = backend.release_keys(&keys, &buttons).await;
-            tracing::info!(
-                keys = released.keys,
-                buttons = released.buttons,
-                "recovery release"
-            );
-            link.send(Msg::Released(Released {
-                lease_id: Vec::new(),
                 keys_released: released.keys,
                 buttons_released: released.buttons,
             }))
@@ -780,17 +1162,12 @@ async fn handle_message<S: AsyncRead + AsyncWrite + Unpin>(
         Msg::Shutdown(_) => {
             retire_local_copy(link, clipboard);
             tracing::info!("shutdown requested by core");
-            release_everything(backend, repeat, deadline, self_timeout, held_lease).await;
+            release_everything(backend, repeat, deadline, self_timeout, held_lease).await?;
             return Ok(Some(Stop::Shutdown));
         }
-        // Agent → core messages arriving here are a protocol error.
-        other => {
-            send_error(
-                link,
-                "PROTOCOL",
-                &format!("{other:?} is an agent-to-core message"),
-            )
-            .await?;
+        // Commands unavailable in NORMAL and agent → core messages are protocol errors.
+        _ => {
+            send_error(link, "PROTOCOL", "unexpected message in NORMAL mode").await?;
         }
     }
     Ok(None)
@@ -978,6 +1355,7 @@ impl LocalCopyProducer {
                         Err(_) => {
                             let _ = sender
                                 .send(Msg::Error(AgentError {
+                                    lease_id: Vec::new(),
                                     code: "CLIPBOARD_INVALID".to_owned(),
                                     detail: "local clipboard preparation failed".to_owned(),
                                 }))
@@ -1548,16 +1926,25 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
     deadline: &mut Option<(Instant, Vec<u8>)>,
     self_timeout: &mut Option<(Instant, Vec<u8>)>,
     event: Event,
-    held_lease: &mut Option<Vec<u8>>,
+    held_lease: &mut HeldLease,
     batch: &mut Vec<LocalEvent>,
     at_edge: &mut bool,
     pending_activation: &mut Option<ipc::PortalActivation>,
 ) -> anyhow::Result<()> {
     match event {
-        Event::Input(input) => match crate::events::to_local_event(&input, monotonic_us()) {
-            Some(event) => batch.push(event),
-            None => tracing::trace!("event has no wire form and was dropped"),
-        },
+        Event::Input(input) => {
+            held_lease.physical.apply(&input);
+            if matches!(
+                input,
+                input_model::InputEvent::Key { .. } | input_model::InputEvent::Button { .. }
+            ) {
+                report_physical(link, backend, held_lease).await?;
+            }
+            match crate::events::to_local_event(&input, monotonic_us()) {
+                Some(event) => batch.push(event),
+                None => tracing::trace!("event has no wire form and was dropped"),
+            }
+        }
         Event::AtEdge {
             barrier_id,
             activation,
@@ -1595,9 +1982,27 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
         }
         #[cfg(target_os = "linux")]
         Event::HotkeysResult(result) => {
+            held_lease.cancel_switch();
             link.send(Msg::HotkeysResult(result)).await?;
         }
-        Event::HotkeyPressed(action) => {
+        Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at,
+        } => {
+            let due = issued_at + SWITCH_RELEASE_WINDOW;
+            let now = Instant::now();
+            if held_lease.can_switch()
+                && issued_at <= now
+                && now < due
+                && held_lease
+                    .switch_cancelled_at
+                    .is_none_or(|cancelled| issued_at > cancelled)
+                && held_lease.switch_pending.is_none()
+            {
+                held_lease.switch_pending = Some(due);
+            }
+        }
+        Event::HotkeyPressed { action, .. } => {
             link.send(Msg::HotkeyPressed(ipc::HotkeyPressed {
                 action: backend::wire_hotkey_action(action) as i32,
             }))
@@ -1611,7 +2016,7 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
             // Rule 3: agent restores local control itself, then tells core.
             tracing::warn!("emergency combination: releasing local capture");
             let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
-                .await
+                .await?
                 .unwrap_or_default();
             link.send(Msg::Emergency(EmergencyFired { lease_id }))
                 .await?;
@@ -1630,7 +2035,7 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
                 "physical input on the receiver: releasing the lease locally"
             );
             let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
-                .await
+                .await?
                 .unwrap_or_default();
             link.send(Msg::LocalInput(ipc::LocalInputDetected { lease_id }))
                 .await?;
@@ -1638,9 +2043,13 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
         Event::QueueOverflow => {
             // Rule 2: the agent ends capture itself and reports the overflow.
             tracing::error!("capture queue overflow; ending capture");
-            forget_capture_state(repeat, self_timeout);
-            let _ = backend.end_capture(false).await;
-            send_error(link, "QUEUE_OVERFLOW", "capture queue overflowed").await?;
+            batch.clear();
+            *at_edge = false;
+            *pending_activation = None;
+            let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
+                .await?
+                .unwrap_or_default();
+            send_lease_error(link, "QUEUE_OVERFLOW", "capture queue overflowed", lease_id).await?;
         }
         Event::Failed { code, detail } => {
             tracing::error!(
@@ -1648,9 +2057,13 @@ async fn handle_backend_event<S: AsyncRead + AsyncWrite + Unpin>(
                 detail = detail.as_str(),
                 "capture failed; ending capture"
             );
-            forget_capture_state(repeat, self_timeout);
-            let _ = backend.end_capture(false).await;
-            send_error(link, code, &detail).await?;
+            batch.clear();
+            *at_edge = false;
+            *pending_activation = None;
+            let lease_id = release_everything(backend, repeat, deadline, self_timeout, held_lease)
+                .await?
+                .unwrap_or_default();
+            send_lease_error(link, code, &detail, lease_id).await?;
         }
     }
     Ok(())
@@ -1682,7 +2095,7 @@ fn forget_lease_state(
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     deadline: &mut Option<(Instant, Vec<u8>)>,
     self_timeout: &mut Option<(Instant, Vec<u8>)>,
-    held_lease: &mut Option<Vec<u8>>,
+    held_lease: &mut HeldLease,
 ) -> Option<Vec<u8>> {
     forget_capture_state(repeat, self_timeout);
     *deadline = None;
@@ -1700,19 +2113,32 @@ async fn release_everything(
     repeat: &mut Option<crate::repeat::SoftwareRepeat>,
     deadline: &mut Option<(Instant, Vec<u8>)>,
     self_timeout: &mut Option<(Instant, Vec<u8>)>,
-    held_lease: &mut Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
+    held_lease: &mut HeldLease,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let lease = forget_lease_state(repeat, deadline, self_timeout, held_lease);
-    if let Err(detail) = backend.end_capture(true).await {
-        tracing::warn!(detail = detail.as_str(), "EndCapture failed");
-    }
-    let released = backend.release_session().await;
+    let released = release_native(backend, true).await?;
     tracing::info!(
         keys = released.keys,
         buttons = released.buttons,
         "session-owned state released"
     );
-    lease
+    Ok(lease)
+}
+
+async fn release_native(
+    backend: &mut Backend,
+    replay_buffered_locally: bool,
+) -> anyhow::Result<backend::Released> {
+    let capture = backend.end_capture(replay_buffered_locally, false).await;
+    let released = backend.release_session().await;
+    if let Err(error) = &capture {
+        tracing::warn!(%error, "capture teardown failed");
+    }
+    if let Err(error) = &released {
+        tracing::warn!(%error, "synthetic input release failed");
+    }
+    capture.map_err(anyhow::Error::msg)?;
+    released.map_err(anyhow::Error::msg)
 }
 
 async fn send_error<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1720,11 +2146,85 @@ async fn send_error<S: AsyncRead + AsyncWrite + Unpin>(
     code: &str,
     detail: &str,
 ) -> anyhow::Result<()> {
+    send_lease_error(link, code, detail, Vec::new()).await
+}
+
+async fn send_lease_error<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    code: &str,
+    detail: &str,
+    lease_id: Vec<u8>,
+) -> anyhow::Result<()> {
     link.send(Msg::Error(AgentError {
+        lease_id,
         code: code.to_owned(),
         detail: detail.to_owned(),
     }))
     .await?;
+    Ok(())
+}
+
+async fn report_physical<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    backend: &Backend,
+    held: &HeldLease,
+) -> anyhow::Result<()> {
+    let pressed = backend.physical_pressed(&held.physical);
+    let known = pressed.is_some();
+    let pressed = pressed.unwrap_or_default();
+    link.send(Msg::PhysicalPressed(ipc::PhysicalPressed {
+        keys: pressed
+            .keys
+            .into_iter()
+            .map(|key| ipc::HidKey {
+                usage_page: u32::from(key.page),
+                usage: u32::from(key.usage),
+                down: true,
+            })
+            .collect(),
+        buttons: pressed
+            .buttons
+            .into_iter()
+            .map(|button| button as u32)
+            .collect(),
+        known,
+    }))
+    .await?;
+    Ok(())
+}
+
+async fn service_pending_switch<S: AsyncRead + AsyncWrite + Unpin>(
+    link: &mut AgentSplit<S>,
+    backend: &Backend,
+    held: &mut HeldLease,
+) -> anyhow::Result<()> {
+    let Some(due) = held.switch_pending else {
+        return Ok(());
+    };
+    if Instant::now() >= due || !held.can_switch() {
+        held.cancel_switch();
+        return Ok(());
+    }
+    match backend.physical_pressed(&held.physical) {
+        None => {
+            held.cancel_switch();
+            send_error(
+                link,
+                "PHYSICAL_STATE_UNAVAILABLE",
+                "Outgoing input disabled: complete physical pressed state is unavailable",
+            )
+            .await?;
+        }
+        Some(pressed) if pressed.is_empty() => {
+            held.cancel_switch();
+            report_physical(link, backend, held).await?;
+            link.send(Msg::HotkeyPressed(ipc::HotkeyPressed {
+                action: ipc::HotkeyAction::SwitchNext as i32,
+            }))
+            .await?;
+        }
+        Some(_) => {}
+    }
     Ok(())
 }
 
@@ -2162,7 +2662,7 @@ mod tests {
         ready: backend::Ready,
         deadline: Option<(Instant, Vec<u8>)>,
         self_timeout: Option<(Instant, Vec<u8>)>,
-        held: Option<Vec<u8>>,
+        held: HeldLease,
         batch: Vec<LocalEvent>,
         at_edge: bool,
         activation: Option<ipc::PortalActivation>,
@@ -2177,6 +2677,20 @@ mod tests {
     }
 
     impl Harness {
+        async fn receiver(&mut self, byte: u8) {
+            self.send(Msg::PrepareInject(ipc::PrepareInject {
+                lease_id: lease(byte),
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            }))
+            .await;
+            assert!(matches!(self.recv().await, Msg::Ready(_)));
+            self.send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(byte),
+                deadline_us: host_after_ms(900),
+            }))
+            .await;
+        }
+
         async fn new() -> Self {
             Harness::dry(None).await
         }
@@ -2210,7 +2724,7 @@ mod tests {
                 ready,
                 deadline: None,
                 self_timeout: None,
-                held: None,
+                held: HeldLease::default(),
                 batch: Vec::new(),
                 at_edge: false,
                 activation: None,
@@ -2251,7 +2765,9 @@ mod tests {
             loop {
                 tokio::select! {
                     frame = self.core.recv() => {
-                        return frame.expect("the agent must answer").msg.expect("payload");
+                        let message = frame.expect("the agent must answer").msg.expect("payload");
+                        if matches!(message, Msg::PhysicalPressed(_)) { continue; }
+                        return message;
                     }
                     finished = self.clipboard.finished(), if self.clipboard.active.is_some() => {
                         complete_clipboard_work(
@@ -3615,7 +4131,6 @@ mod tests {
                             &mut agent,
                             &mut backend,
                             &ready,
-                            AgentMode::Normal as i32,
                             ipc::RepeatMode::ReceiverSoftware as i32,
                             &mut watchdog,
                             Instant::now(),
@@ -3629,6 +4144,7 @@ mod tests {
                         match core.recv().await.unwrap().msg.unwrap() {
                             Msg::ClipboardChanged(changed) => break changed,
                             Msg::GameGuardSignals(_) => {}
+                            Msg::PhysicalPressed(_) => {}
                             other => panic!("expected local PNG, got {other:?}"),
                         }
                     };
@@ -3642,13 +4158,20 @@ mod tests {
                     core.send(Msg::Ping(ipc::Ping { nonce: 101 }))
                         .await
                         .unwrap();
-                    core.send(Msg::ReleaseSession(ipc::ReleaseSession {
+                    core.send(Msg::PrepareInject(ipc::PrepareInject {
                         lease_id: lease(3),
+                        issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+                    }))
+                    .await
+                    .unwrap();
+                    core.send(Msg::ArmDeadline(ipc::ArmDeadline {
+                        lease_id: lease(3),
+                        deadline_us: host_after_ms(900),
                     }))
                     .await
                     .unwrap();
                     core.send(Msg::Inject(ipc::Inject {
-                        lease_id: lease(4),
+                        lease_id: lease(3),
                         input_batch_seq: 17,
                         events: vec![ipc::LocalEvent {
                             monotonic_us: 0,
@@ -3661,11 +4184,8 @@ mod tests {
                     }))
                     .await
                     .unwrap();
-                    core.send(Msg::BeginCapture(ipc::BeginCapture {
-                        kind: ipc::CaptureKind::Remote as i32,
-                        lease_id: lease(5),
-                        self_timeout_ms: 0,
-                        dev_capture_injected: false,
+                    core.send(Msg::ReleaseSession(ipc::ReleaseSession {
+                        lease_id: lease(3),
                     }))
                     .await
                     .unwrap();
@@ -3687,6 +4207,24 @@ mod tests {
                             Msg::Released(answer) => {
                                 assert_eq!(answer.lease_id, lease(3));
                                 released = true;
+                                core.send(Msg::BeginCapture(ipc::BeginCapture {
+                                    kind: ipc::CaptureKind::Temporary as i32,
+                                    lease_id: lease(5),
+                                    self_deadline_us: host_after_ms(500),
+                                    dev_capture_injected: false,
+                                    issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+                                }))
+                                .await
+                                .unwrap();
+                                core.send(Msg::BeginCapture(ipc::BeginCapture {
+                                    kind: ipc::CaptureKind::Remote as i32,
+                                    lease_id: lease(5),
+                                    self_deadline_us: host_after_ms(0),
+                                    dev_capture_injected: false,
+                                    issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+                                }))
+                                .await
+                                .unwrap();
                             }
                             Msg::InjectResult(answer) => {
                                 assert_eq!(answer.input_batch_seq, 17);
@@ -3699,6 +4237,7 @@ mod tests {
                                 captured = true;
                             }
                             Msg::GameGuardSignals(_) => {}
+                            Msg::Ready(_) | Msg::PhysicalPressed(_) => {}
                             other => panic!("unexpected control response: {other:?}"),
                         }
                         assert!(
@@ -3723,6 +4262,7 @@ mod tests {
                             Msg::ClipboardChanged(changed) => break changed,
                             Msg::Captured(batch) => assert!(!batch.events.is_empty()),
                             Msg::GameGuardSignals(_) => {}
+                            Msg::PhysicalPressed(_) => {}
                             other => panic!("expected replacement copy: {other:?}"),
                         }
                     };
@@ -3742,6 +4282,7 @@ mod tests {
                             }
                             Msg::Captured(batch) => assert!(!batch.events.is_empty()),
                             Msg::GameGuardSignals(_) => {}
+                            Msg::PhysicalPressed(_) => {}
                             other => panic!("stale payload after replacement: {other:?}"),
                         }
                     }
@@ -3805,7 +4346,6 @@ mod tests {
                         &mut agent,
                         &mut backend,
                         &ready,
-                        AgentMode::Normal as i32,
                         ::protocol::ipc::RepeatMode::ReceiverSoftware as i32,
                         &mut watchdog,
                         started,
@@ -3846,9 +4386,15 @@ mod tests {
                     .expect("native operation starts")
                     .unwrap();
                 core.send(Msg::Ping(ipc::Ping { nonce: 73 })).await.unwrap();
+                core.send(Msg::PrepareInject(ipc::PrepareInject {
+                    lease_id: lease(7),
+                    issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+                }))
+                .await
+                .unwrap();
                 core.send(Msg::ArmDeadline(ipc::ArmDeadline {
                     lease_id: lease(7),
-                    remaining_ms: 30,
+                    deadline_us: host_after_ms(30),
                 }))
                 .await
                 .unwrap();
@@ -3866,6 +4412,7 @@ mod tests {
                                 expired = true;
                             }
                             Msg::GameGuardSignals(_) => {}
+                            Msg::Ready(_) | Msg::PhysicalPressed(_) => {}
                             other => panic!("clipboard must remain pending: {other:?}"),
                         }
                     }
@@ -3930,6 +4477,16 @@ mod tests {
         Instant::now() + Duration::from_millis(ms)
     }
 
+    fn host_after_ms(ms: u64) -> u64 {
+        if ms == 0 {
+            return 0;
+        }
+        ::ipc::clock::host_monotonic_us()
+            .unwrap()
+            .checked_add(ms * 1000)
+            .unwrap()
+    }
+
     /// Batch-3 audit (F12): the lease deadline is a release path, and it has to stop the
     /// software repeat engine like `EndCapture`/`ReleaseSession` do.
     ///
@@ -3940,14 +4497,7 @@ mod tests {
     #[tokio::test]
     async fn the_deadline_release_stops_the_software_repeat() {
         let mut harness = Harness::new().await;
-        // An injection lease with a deadline that is already due, and a key in the engine's
-        // slot: `Inject` is what feeds the engine (`engine.applied`).
-        harness
-            .send(Msg::ArmDeadline(ipc::ArmDeadline {
-                lease_id: lease(1),
-                remaining_ms: 1,
-            }))
-            .await;
+        harness.receiver(1).await;
         harness
             .send(Msg::Inject(ipc::Inject {
                 lease_id: lease(1),
@@ -3973,7 +4523,7 @@ mod tests {
             "the injected down takes the repeat slot"
         );
 
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        harness.deadline = Some((Instant::now(), lease(1)));
         let mut released_after_silence = false;
         // A watchdog that has just seen a frame: the silence path must not be what ends this
         // session, or the test would pass without the deadline path doing anything.
@@ -4020,8 +4570,9 @@ mod tests {
             .send(Msg::BeginCapture(ipc::BeginCapture {
                 kind: ::protocol::ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(7),
-                self_timeout_ms: 500,
+                self_deadline_us: host_after_ms(500),
                 dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         match harness.recv().await {
@@ -4046,29 +4597,14 @@ mod tests {
             "the deadline is ~500 ms away: {due:?}"
         );
 
-        // The bound of rule 4/`ipc.proto`: the agent never arms more than 1000 ms.
-        harness
-            .send(Msg::BeginCapture(ipc::BeginCapture {
-                kind: ::protocol::ipc::CaptureKind::Temporary as i32,
-                lease_id: lease(8),
-                self_timeout_ms: 60_000,
-                dev_capture_injected: false,
-            }))
-            .await;
-        harness.recv().await;
-        let (due, _) = harness.self_timeout.clone().expect("armed");
-        assert!(
-            due <= before(1000),
-            "a self-timeout is clamped to 1000 ms: {due:?}"
-        );
-
         // REMOTE has no self-timeout: it ends only when core says so.
         harness
             .send(Msg::BeginCapture(ipc::BeginCapture {
-                kind: ::protocol::ipc::CaptureKind::Remote as i32,
-                lease_id: lease(9),
-                self_timeout_ms: 9000,
+                kind: ipc::CaptureKind::Remote as i32,
+                lease_id: lease(7),
+                self_deadline_us: host_after_ms(9000),
                 dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         harness.recv().await;
@@ -4076,28 +4612,179 @@ mod tests {
             harness.self_timeout.is_none(),
             "a remote capture is not temporary"
         );
-        assert_eq!(harness.held, Some(lease(9)));
+        assert_eq!(harness.held, Some(lease(7)));
     }
 
     #[tokio::test]
-    async fn end_capture_releases_the_lease_and_clears_the_self_timeout_but_not_the_deadline() {
+    async fn queued_remote_promotion_cannot_revive_an_expired_temporary_capture() {
+        let mut harness = Harness::new().await;
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(7),
+                self_deadline_us: host_after_ms(400),
+                dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            }))
+            .await;
+        assert!(matches!(harness.recv().await, Msg::CaptureReady(_)));
+        harness.self_timeout.as_mut().unwrap().0 = Instant::now() - Duration::from_millis(1);
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ipc::CaptureKind::Remote as i32,
+                lease_id: lease(7),
+                self_deadline_us: 0,
+                dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            }))
+            .await;
+        assert!(matches!(harness.recv().await, Msg::Error(error)
+            if error.code == "CAPTURE_FAILED" && error.lease_id == lease(7)));
+        assert!(harness.held.is_none());
+        assert!(harness.self_timeout.is_none());
+        assert!(!harness.backend.dry_input_state().unwrap().1);
+    }
+
+    #[tokio::test]
+    async fn failed_software_repeat_retires_its_lease_and_releases_native_holds() {
+        let mut harness = Harness::new().await;
+        harness.receiver(8).await;
+        harness.send(safety_key(8, 1, 4, true)).await;
+        assert!(matches!(harness.recv().await, Msg::InjectResult(_)));
+        assert!(!harness.backend.dry_input_state().unwrap().0.is_empty());
+        finish_repeat(
+            &mut harness.agent,
+            &mut harness.backend,
+            &mut harness.repeat,
+            &mut harness.deadline,
+            &mut harness.self_timeout,
+            &mut harness.held,
+            Injected {
+                applied: 0,
+                os_error: "native repeat failed".into(),
+                actual: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(harness.recv().await, Msg::Error(error)
+            if error.code == "INJECTION_FAILED" && error.lease_id == lease(8)));
+        assert!(harness.backend.dry_input_state().unwrap().0.is_empty());
+        assert!(harness.held.is_none());
+        assert!(harness.deadline.is_none());
+        assert!(harness.repeat.as_ref().unwrap().holding().is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_agent_refuses_unscoped_recovery_release_without_retiring_receiver() {
+        let mut harness = Harness::new().await;
+        harness.receiver(9).await;
+        harness.send(safety_key(9, 1, 4, true)).await;
+        assert!(matches!(harness.recv().await, Msg::InjectResult(result)
+            if result.applied_count == 1 && result.os_error.is_empty()));
+        let deadline = harness.deadline.clone();
+
+        harness
+            .send(Msg::ReleaseKeys(ipc::ReleaseKeys {
+                keys: vec![ipc::HidKey {
+                    usage_page: 7,
+                    usage: 4,
+                    down: false,
+                }],
+                buttons: Vec::new(),
+            }))
+            .await;
+        assert!(matches!(harness.recv().await, Msg::Error(error)
+            if error.code == "PROTOCOL"));
+        assert_eq!(harness.held, Some(lease(9)));
+        assert_eq!(harness.deadline, deadline);
+        assert!(harness
+            .backend
+            .dry_input_state()
+            .unwrap()
+            .0
+            .keys
+            .contains(&input_model::HidKey::keyboard(4)));
+
+        harness.send(safety_key(9, 2, 4, false)).await;
+        assert!(matches!(harness.recv().await, Msg::InjectResult(result)
+            if result.applied_count == 1 && result.os_error.is_empty()));
+        assert!(harness.backend.dry_input_state().unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_normal_release_never_acknowledges_cleanup_or_forgets_uncertain_holds() {
+        let mut harness = Harness::new().await;
+        harness.receiver(9).await;
+        harness.send(safety_key(9, 1, 4, true)).await;
+        assert!(matches!(harness.recv().await, Msg::InjectResult(_)));
+        harness.backend.fail_next_dry_release();
+        let primary = handle_message(
+            &mut harness.agent,
+            &mut harness.backend,
+            &harness.ready,
+            &Msg::ReleaseSession(ipc::ReleaseSession { lease_id: lease(9) }),
+            &mut harness.deadline,
+            &mut harness.self_timeout,
+            &mut harness.held,
+            &mut harness.batch,
+            &mut harness.displays,
+            &mut harness.repeat,
+            &mut harness.clipboard,
+            false,
+            &mut harness.injection_metrics,
+            harness.clock,
+        )
+        .await
+        .err()
+        .expect("incomplete release must end the agent epoch");
+        assert!(harness.held.is_none());
+        assert!(harness.deadline.is_none());
+        assert!(!harness.backend.dry_input_state().unwrap().0.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), harness.core.recv())
+                .await
+                .is_err(),
+            "failed cleanup must not publish a positive Released"
+        );
+        let original = primary.to_string();
+        harness.backend.fail_next_dry_release();
+        let failure = finish_session(&mut harness.backend, Err(primary))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.to_string(),
+            original,
+            "cleanup must preserve the primary failure"
+        );
+        assert!(!harness.backend.dry_input_state().unwrap().0.is_empty());
+        release_native(&mut harness.backend, true).await.unwrap();
+        assert!(harness.backend.dry_input_state().unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_end_capture_clears_its_timeout_without_arming_receiver_deadline() {
         let mut harness = Harness::new().await;
         harness
             .send(Msg::BeginCapture(ipc::BeginCapture {
                 kind: ::protocol::ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(1),
-                self_timeout_ms: 500,
+                self_deadline_us: host_after_ms(500),
                 dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         harness.recv().await;
         harness
             .send(Msg::ArmDeadline(ipc::ArmDeadline {
                 lease_id: lease(1),
-                remaining_ms: 900,
+                deadline_us: host_after_ms(900),
             }))
             .await;
-        assert!(harness.deadline.is_some());
+        assert!(
+            harness.deadline.is_none(),
+            "source cannot arm a receiver deadline"
+        );
 
         harness
             .send(Msg::EndCapture(ipc::EndCapture {
@@ -4111,46 +4798,48 @@ mod tests {
         }
         assert!(harness.self_timeout.is_none(), "capture is over");
         assert!(harness.held.is_none(), "the lease is no longer held");
-        assert!(
-            harness.deadline.is_some(),
-            "only ReleaseSession clears the deadline"
-        );
+        assert!(harness.deadline.is_none());
     }
 
     #[tokio::test]
-    async fn arm_deadline_uses_the_agents_own_clock_within_the_protocol_bound() {
+    async fn arm_deadline_preserves_issuance_and_rejects_expired_or_oversized_budget() {
         let mut harness = Harness::new().await;
+        harness.receiver(3).await;
+        let deadline_us = host_after_ms(750);
+        let now_us = ::ipc::clock::host_monotonic_us().unwrap();
+        let queued = ipc::ArmDeadline {
+            lease_id: lease(3),
+            deadline_us: now_us + 500_000,
+        };
+        harness.send(Msg::ArmDeadline(queued)).await;
+        let (due, _) = harness.deadline.clone().unwrap();
+        assert!(due <= before(500));
         harness
             .send(Msg::ArmDeadline(ipc::ArmDeadline {
                 lease_id: lease(3),
-                remaining_ms: 750,
+                deadline_us,
             }))
             .await;
-        let (due, lease_id) = harness.deadline.clone().expect("rule 4 arms the deadline");
-        assert_eq!(lease_id, lease(3), "the deadline belongs to the lease");
-        assert!(due > before(700) && due <= before(750), "{due:?}");
-
-        // `ArmDeadline.remaining_ms` is 1..=1000, so a longer value is clamped, not trusted.
+        let (due, _) = harness.deadline.clone().unwrap();
+        assert!(due <= before(750));
         harness
             .send(Msg::ArmDeadline(ipc::ArmDeadline {
                 lease_id: lease(3),
-                remaining_ms: 60_000,
+                deadline_us: 1,
             }))
             .await;
-        let (due, _) = harness.deadline.clone().expect("re-armed");
-        assert!(due <= before(1000), "clamped to 1000 ms: {due:?}");
-
+        assert!(matches!(harness.recv().await, Msg::DeadlineExpired(_)));
+        assert!(harness.held.is_none());
+        assert!(harness.deadline.is_none());
+        harness.receiver(4).await;
         harness
             .send(Msg::ArmDeadline(ipc::ArmDeadline {
-                lease_id: lease(3),
-                remaining_ms: 0,
+                lease_id: lease(4),
+                deadline_us: host_after_ms(60_000),
             }))
             .await;
-        let (due, _) = harness.deadline.clone().expect("armed at the floor");
-        assert!(
-            due <= before(1) && due >= Instant::now(),
-            "the floor is 1 ms: {due:?}"
-        );
+        assert!(matches!(harness.recv().await, Msg::DeadlineExpired(_)));
+        assert!(harness.held.is_none());
     }
 
     #[tokio::test]
@@ -4160,17 +4849,13 @@ mod tests {
             .send(Msg::BeginCapture(ipc::BeginCapture {
                 kind: ::protocol::ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(4),
-                self_timeout_ms: 400,
+                self_deadline_us: host_after_ms(400),
                 dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         harness.recv().await;
-        harness
-            .send(Msg::ArmDeadline(ipc::ArmDeadline {
-                lease_id: lease(4),
-                remaining_ms: 400,
-            }))
-            .await;
+        assert!(harness.self_timeout.is_some());
 
         harness
             .send(Msg::ReleaseSession(ipc::ReleaseSession {
@@ -4193,20 +4878,16 @@ mod tests {
             .send(Msg::BeginCapture(ipc::BeginCapture {
                 kind: ipc::CaptureKind::Temporary as i32,
                 lease_id: lease(4),
-                self_timeout_ms: 400,
+                self_deadline_us: host_after_ms(400),
                 dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         harness.recv().await;
-        harness
-            .send(Msg::ArmDeadline(ipc::ArmDeadline {
-                lease_id: lease(4),
-                remaining_ms: 400,
-            }))
-            .await;
+        // A source has its own temporary capture clock, not an injection deadline.
         assert!(harness.held.is_some());
         assert!(harness.self_timeout.is_some());
-        assert!(harness.deadline.is_some());
+        assert!(harness.deadline.is_none());
 
         harness.send(Msg::Shutdown(ipc::AgentShutdown {})).await;
 
@@ -4227,12 +4908,25 @@ mod tests {
             ipc::CaptureKind::Remote,
         ] {
             let mut harness = Harness::new().await;
+            if kind == ipc::CaptureKind::Remote {
+                harness
+                    .send(Msg::BeginCapture(ipc::BeginCapture {
+                        kind: ipc::CaptureKind::Temporary as i32,
+                        lease_id: lease(5),
+                        self_deadline_us: host_after_ms(500),
+                        dev_capture_injected: false,
+                        issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+                    }))
+                    .await;
+                harness.recv().await;
+            }
             harness
                 .send(Msg::BeginCapture(ipc::BeginCapture {
                     kind: kind as i32,
                     lease_id: lease(5),
-                    self_timeout_ms: 500,
+                    self_deadline_us: host_after_ms(500),
                     dev_capture_injected: false,
+                    issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
                 }))
                 .await;
             harness.recv().await;
@@ -4247,7 +4941,14 @@ mod tests {
 
             harness.event(Event::Emergency).await;
             match harness.recv().await {
-                Msg::Emergency(fired) => assert_eq!(fired.lease_id, lease(5)),
+                Msg::Emergency(fired) => assert_eq!(
+                    fired.lease_id,
+                    if kind == ipc::CaptureKind::Observe {
+                        Vec::new()
+                    } else {
+                        lease(5)
+                    }
+                ),
                 other => panic!("expected EmergencyFired, got {other:?}"),
             }
             assert!(harness.held.is_none(), "local control is restored first");
@@ -4264,9 +4965,16 @@ mod tests {
         harness
             .send(Msg::PrepareInject(ipc::PrepareInject {
                 lease_id: lease(7),
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         harness.recv().await;
+        harness
+            .send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(7),
+                deadline_us: host_after_ms(900),
+            }))
+            .await;
         harness
             .send(Msg::Inject(ipc::Inject {
                 lease_id: lease(7),
@@ -4316,6 +5024,7 @@ mod tests {
         harness
             .send(Msg::PrepareInject(ipc::PrepareInject {
                 lease_id: lease(7),
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         harness.recv().await;
@@ -4341,6 +5050,7 @@ mod tests {
     #[tokio::test]
     async fn the_repeat_guard_stops_the_software_engine() {
         let mut harness = Harness::new().await;
+        harness.receiver(9).await;
         harness
             .send(Msg::Inject(ipc::Inject {
                 lease_id: lease(9),
@@ -4416,10 +5126,21 @@ mod tests {
         let mut harness = Harness::new().await;
         harness
             .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(6),
+                self_deadline_us: host_after_ms(500),
+                dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            }))
+            .await;
+        harness.recv().await;
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
                 kind: ::protocol::ipc::CaptureKind::Remote as i32,
                 lease_id: lease(6),
-                self_timeout_ms: 0,
+                self_deadline_us: host_after_ms(0),
                 dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         harness.recv().await;
@@ -4428,6 +5149,7 @@ mod tests {
         match harness.recv().await {
             Msg::Error(error) => {
                 assert_eq!(error.code, "QUEUE_OVERFLOW", "rule 2 names the overflow");
+                assert_eq!(error.lease_id, lease(6));
                 assert!(!error.detail.is_empty());
             }
             other => panic!("expected an AgentError, got {other:?}"),
@@ -4489,8 +5211,9 @@ mod tests {
             .send(Msg::BeginCapture(ipc::BeginCapture {
                 kind: 0,
                 lease_id: lease(1),
-                self_timeout_ms: 100,
+                self_deadline_us: host_after_ms(100),
                 dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
             }))
             .await;
         match harness.recv().await {
@@ -4538,6 +5261,449 @@ mod tests {
                 ::ipc::agent::mode_allows(normal, &message),
                 "{message:?} is allowed in NORMAL"
             );
+        }
+    }
+
+    fn safety_key(byte: u8, seq: u64, usage: u32, down: bool) -> Msg {
+        Msg::Inject(ipc::Inject {
+            lease_id: lease(byte),
+            input_batch_seq: seq,
+            events: vec![ipc::LocalEvent {
+                ev: Some(ipc::local_event::Ev::Key(ipc::HidKey {
+                    usage_page: 7,
+                    usage,
+                    down,
+                })),
+                ..Default::default()
+            }],
+        })
+    }
+
+    async fn safety_capture(harness: &mut Harness, byte: u8, kind: ipc::CaptureKind) {
+        harness
+            .send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: kind as i32,
+                lease_id: lease(byte),
+                self_deadline_us: host_after_ms(500),
+                dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn physical_capture_snapshot_precedes_input_and_blocks_suppression() {
+        let mut h = Harness::new().await;
+        h.event(Event::Input(input_model::InputEvent::Key {
+            key: input_model::HidKey::keyboard(4),
+            state: input_model::KeyState::Down,
+        }))
+        .await;
+        let frame = h.core.recv().await.unwrap();
+        let Some(Msg::PhysicalPressed(pressed)) = frame.msg else {
+            panic!("physical snapshot missing")
+        };
+        assert!(pressed.known);
+        assert_eq!(pressed.keys.len(), 1);
+        assert_eq!(pressed.keys[0].usage, 4);
+        safety_capture(&mut h, 1, ipc::CaptureKind::Temporary).await;
+        assert!(matches!(h.recv().await, Msg::CaptureReady(_)));
+        safety_capture(&mut h, 1, ipc::CaptureKind::Remote).await;
+        let Msg::Error(error) = h.recv().await else {
+            panic!("held commit was admitted")
+        };
+        assert_eq!(error.code, "CAPTURE_FAILED");
+        assert_eq!(error.lease_id, lease(1));
+        assert!(h.held.is_none());
+        assert!(!h.backend.dry_input_state().unwrap().1);
+    }
+
+    #[tokio::test]
+    async fn every_terminal_release_fences_queued_input_prepare_and_old_controls() {
+        for terminal in 0..4 {
+            let mut h = Harness::new().await;
+            h.receiver(1).await;
+            let stale_prepare = Msg::PrepareInject(ipc::PrepareInject {
+                lease_id: lease(1),
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            });
+            h.send(safety_key(1, 1, 4, true)).await;
+            assert!(
+                matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 1)
+            );
+            assert_eq!(h.backend.dry_input_state().unwrap().0.keys.len(), 1);
+            match terminal {
+                0 => {
+                    h.event(Event::Emergency).await;
+                    h.recv().await;
+                }
+                1 => {
+                    h.event(Event::LocalTakeover {
+                        reason: "key",
+                        distance_px: None,
+                    })
+                    .await;
+                    h.recv().await;
+                }
+                _ => {
+                    if terminal == 2 {
+                        h.deadline = Some((Instant::now(), lease(1)));
+                    }
+                    let mut watchdog = Watchdog::for_core_silence_ms(300, 0).unwrap();
+                    let mut released = false;
+                    service_timers(
+                        &mut h.agent,
+                        &mut h.backend,
+                        &mut h.repeat,
+                        &mut h.deadline,
+                        &mut h.self_timeout,
+                        &mut h.held,
+                        &mut released,
+                        &mut watchdog,
+                        if terminal == 3 { 301 } else { 0 },
+                    )
+                    .await
+                    .unwrap();
+                    if terminal == 2 {
+                        h.recv().await;
+                    }
+                }
+            }
+            assert!(h.held.is_none());
+            assert!(h.deadline.is_none());
+            assert!(h.backend.dry_input_state().unwrap().0.is_empty());
+            h.send(stale_prepare).await;
+            assert!(matches!(h.recv().await, Msg::Error(_)));
+            h.send(Msg::PrepareInject(ipc::PrepareInject {
+                lease_id: lease(1),
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            }))
+            .await;
+            assert!(
+                matches!(h.recv().await, Msg::Error(_)),
+                "completed lease ID was revived with a fresh timestamp"
+            );
+            h.send(Msg::ArmDeadline(ipc::ArmDeadline {
+                lease_id: lease(1),
+                deadline_us: host_after_ms(900),
+            }))
+            .await;
+            h.send(safety_key(1, 2, 4, true)).await;
+            assert!(
+                matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 0)
+            );
+            assert!(h.deadline.is_none());
+            assert!(h.backend.dry_input_state().unwrap().0.is_empty());
+            h.receiver(2).await;
+            h.send(safety_key(2, 1, 5, true)).await;
+            assert!(
+                matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 1)
+            );
+            let deadline = h.deadline.clone();
+            h.send(safety_key(1, 3, 4, true)).await;
+            assert!(
+                matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 0)
+            );
+            for message in [
+                Msg::ArmDeadline(ipc::ArmDeadline {
+                    lease_id: lease(1),
+                    deadline_us: host_after_ms(800),
+                }),
+                Msg::StopRepeat(ipc::StopRepeat { lease_id: lease(1) }),
+                Msg::ReleaseSession(ipc::ReleaseSession { lease_id: lease(1) }),
+                Msg::EndCapture(ipc::EndCapture {
+                    lease_id: lease(1),
+                    replay_buffered_locally: true,
+                }),
+            ] {
+                h.send(message).await;
+            }
+            assert_eq!(h.deadline, deadline);
+            assert_eq!(h.held, Some(lease(2)));
+            assert_eq!(
+                h.repeat.as_ref().unwrap().holding(),
+                Some(input_model::HidKey::keyboard(5))
+            );
+            assert_eq!(h.backend.dry_input_state().unwrap().0.keys.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_prepared_duplicate_and_nonfinite_input_never_reach_native_work() {
+        let mut h = Harness::new().await;
+        h.send(safety_key(1, 1, 4, true)).await;
+        assert!(matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 0));
+        // Physical source holds do not gate receiver admission.
+        h.event(Event::Input(input_model::InputEvent::Key {
+            key: input_model::HidKey::keyboard(6),
+            state: input_model::KeyState::Down,
+        }))
+        .await;
+        h.send(Msg::PrepareInject(ipc::PrepareInject {
+            lease_id: lease(1),
+            issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+        }))
+        .await;
+        assert!(matches!(h.recv().await, Msg::Ready(_)));
+        h.send(safety_key(1, 1, 4, true)).await;
+        assert!(matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 0));
+        h.send(Msg::ArmDeadline(ipc::ArmDeadline {
+            lease_id: lease(1),
+            deadline_us: host_after_ms(900),
+        }))
+        .await;
+        h.send(safety_key(1, 2, 4, true)).await;
+        assert!(matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 1));
+        h.send(safety_key(1, 2, 5, true)).await;
+        assert!(matches!(h.recv().await, Msg::InjectResult(result) if result.applied_count == 0));
+        h.send(Msg::Inject(ipc::Inject {
+            lease_id: lease(1),
+            input_batch_seq: 3,
+            events: vec![ipc::LocalEvent {
+                ev: Some(ipc::local_event::Ev::Pointer(ipc::PointerAbs {
+                    x: f64::NAN,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+        }))
+        .await;
+        assert!(matches!(h.recv().await, Msg::Error(error) if error.code == "INJECTION_FAILED"));
+        assert!(h.held.is_none());
+        assert!(h.backend.dry_input_state().unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_capture_failure_reports_its_source_lease_and_releases_locally() {
+        for event in [
+            Event::QueueOverflow,
+            Event::Failed {
+                code: "CAPTURE_FAILED",
+                detail: "capture disconnected".to_owned(),
+            },
+            Event::Failed {
+                code: "PORTAL_SESSION_LOST",
+                detail: "portal disconnected".to_owned(),
+            },
+        ] {
+            let mut h = Harness::new().await;
+            safety_capture(&mut h, 1, ipc::CaptureKind::Temporary).await;
+            h.recv().await;
+            safety_capture(&mut h, 1, ipc::CaptureKind::Remote).await;
+            h.recv().await;
+            h.event(event).await;
+            let Msg::Error(error) = h.recv().await else {
+                panic!("capture error missing")
+            };
+            assert_eq!(error.lease_id, lease(1));
+            assert!(h.held.is_none());
+            assert!(h.self_timeout.is_none());
+            assert!(!h.backend.dry_input_state().unwrap().1);
+            assert!(h.batch.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn send_error_cleanup_releases_dry_native_ledger_before_returning_original_error() {
+        let mut h = Harness::new().await;
+        h.receiver(1).await;
+        h.send(safety_key(1, 1, 4, true)).await;
+        h.recv().await;
+        assert!(!h.backend.dry_input_state().unwrap().0.is_empty());
+        drop(h.core);
+        let mut failure = None;
+        // The real writer must encounter BrokenPipe; saturation makes this deterministic
+        // without receiving the independent LostCore notification.
+        for _ in 0..34 {
+            if let Err(error) = send_error(&mut h.agent, "TEST", "writer closed").await {
+                failure = Some(error);
+                break;
+            }
+        }
+        let original = failure.expect("real IPC sender must fail after writer closes");
+        let expected = original.to_string();
+        let error = finish_session(&mut h.backend, Err(original))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        let (pressed, armed, releases) = h.backend.dry_input_state().unwrap();
+        assert!(pressed.is_empty());
+        assert!(!armed);
+        assert!(releases > 0);
+    }
+
+    #[test]
+    fn delayed_deadline_conversion_never_restarts_the_issuance_budget() {
+        let issue = Instant::now();
+        let original = issue + Duration::from_millis(500);
+        assert_eq!(
+            deadline_at(issue, Some(10_000_000), 10_500_000),
+            Some(original)
+        );
+        assert_eq!(
+            deadline_at(
+                issue + Duration::from_millis(250),
+                Some(10_250_000),
+                10_500_000
+            ),
+            Some(original)
+        );
+        assert!(deadline_at(original, Some(10_500_000), 10_500_000).is_none());
+        assert!(deadline_at(issue, None, 10_500_000).is_none());
+        assert!(deadline_at(issue, Some(10_000_000), u64::MAX).is_none());
+    }
+
+    async fn safety_physical_key(h: &mut Harness, usage: u16, state: input_model::KeyState) {
+        h.event(Event::Input(input_model::InputEvent::Key {
+            key: input_model::HidKey::keyboard(usage),
+            state,
+        }))
+        .await;
+        assert!(matches!(
+            h.core.recv().await.unwrap().msg,
+            Some(Msg::PhysicalPressed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_hotkey_waits_for_chord_and_unrelated_key_release_then_emits_once() {
+        let mut h = Harness::new().await;
+        safety_physical_key(&mut h, 0xe0, input_model::KeyState::Down).await;
+        let issued_at = Instant::now();
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at,
+        })
+        .await;
+        let deadline = h.held.switch_pending;
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at: Instant::now(),
+        })
+        .await;
+        assert_eq!(
+            h.held.switch_pending, deadline,
+            "repeated intent reset the admission budget"
+        );
+        safety_physical_key(&mut h, 4, input_model::KeyState::Down).await;
+        safety_physical_key(&mut h, 0xe0, input_model::KeyState::Up).await;
+        service_pending_switch(&mut h.agent, &h.backend, &mut h.held)
+            .await
+            .unwrap();
+        assert!(
+            h.held.switch_pending.is_some(),
+            "unrelated held key did not gate switching"
+        );
+        h.quiet().await;
+        safety_physical_key(&mut h, 4, input_model::KeyState::Up).await;
+        service_pending_switch(&mut h.agent, &h.backend, &mut h.held)
+            .await
+            .unwrap();
+        assert!(
+            matches!(h.recv().await, Msg::HotkeyPressed(hotkey) if hotkey.action == ipc::HotkeyAction::SwitchNext as i32)
+        );
+        assert!(h.held.switch_pending.is_none());
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at,
+        })
+        .await;
+        service_pending_switch(&mut h.agent, &h.backend, &mut h.held)
+            .await
+            .unwrap();
+        h.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn switch_hotkey_expiry_emergency_and_config_loss_discard_pending_intent() {
+        let mut h = Harness::new().await;
+        safety_physical_key(&mut h, 0xe0, input_model::KeyState::Down).await;
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at: Instant::now() - SWITCH_RELEASE_WINDOW - Duration::from_millis(1),
+        })
+        .await;
+        assert!(
+            h.held.switch_pending.is_none(),
+            "queue delivery restarted an expired gesture"
+        );
+        let issued_at = Instant::now();
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at,
+        })
+        .await;
+        assert!(h.held.switch_pending.is_some());
+        h.held.switch_pending = Some(Instant::now());
+        service_pending_switch(&mut h.agent, &h.backend, &mut h.held)
+            .await
+            .unwrap();
+        assert!(h.held.switch_pending.is_none());
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at: Instant::now(),
+        })
+        .await;
+        h.event(Event::Emergency).await;
+        assert!(matches!(h.recv().await, Msg::Emergency(_)));
+        assert!(h.held.switch_pending.is_none());
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at,
+        })
+        .await;
+        assert!(
+            h.held.switch_pending.is_none(),
+            "pre-emergency queued gesture resurrected"
+        );
+        safety_physical_key(&mut h, 0xe0, input_model::KeyState::Up).await;
+        service_pending_switch(&mut h.agent, &h.backend, &mut h.held)
+            .await
+            .unwrap();
+        h.quiet().await;
+        safety_physical_key(&mut h, 0xe0, input_model::KeyState::Down).await;
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at: Instant::now(),
+        })
+        .await;
+        h.send(Msg::SetHotkeys(ipc::SetHotkeys {
+            bindings: Vec::new(),
+        }))
+        .await;
+        assert!(h.held.switch_pending.is_none());
+        assert!(matches!(h.recv().await, Msg::HotkeysResult(_)));
+        h.event(Event::HotkeyPressed {
+            action: config::HotkeyAction::SwitchNext,
+            issued_at: Instant::now(),
+        })
+        .await;
+        h.event(Event::Failed {
+            code: "CAPTURE_FAILED",
+            detail: "backend lost".to_owned(),
+        })
+        .await;
+        assert!(matches!(h.recv().await, Msg::Error(_)));
+        assert!(h.held.switch_pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_temporary_capture_never_restarts_an_expired_or_invalid_budget() {
+        for self_deadline_us in [1, host_after_ms(60_000)] {
+            let mut h = Harness::new().await;
+            h.send(Msg::BeginCapture(ipc::BeginCapture {
+                kind: ipc::CaptureKind::Temporary as i32,
+                lease_id: lease(1),
+                self_deadline_us,
+                dev_capture_injected: false,
+                issued_at_us: ::ipc::clock::host_monotonic_us().unwrap(),
+            }))
+            .await;
+            assert!(matches!(h.recv().await, Msg::Error(error)
+                if error.code == "CAPTURE_FAILED" && error.lease_id == lease(1)));
+            assert!(h.held.is_none());
+            assert!(h.self_timeout.is_none());
+            assert!(!h.backend.dry_input_state().unwrap().1);
         }
     }
 }

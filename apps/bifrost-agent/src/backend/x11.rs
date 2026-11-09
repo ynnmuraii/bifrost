@@ -188,6 +188,7 @@ impl X11 {
     }
 
     pub fn set_hotkeys(&mut self, bindings: &config::HotkeyBindings) -> Result<(), String> {
+        self.pending_hotkeys.clear();
         let capture = self
             .capture
             .as_mut()
@@ -309,6 +310,10 @@ impl X11 {
         self.echo.applied = hash.map(|hash| (hash, std::time::Instant::now()));
     }
 
+    pub fn physical_pressed(&self) -> Option<input_model::PressedState> {
+        self.capture.as_ref()?.physical_pressed().ok()
+    }
+
     pub fn begin_capture(&mut self, kind: CaptureKind) -> Result<(), String> {
         self.source_kind = Some(kind);
         if self.capture.is_none() {
@@ -317,11 +322,10 @@ impl X11 {
         }
         let capture = self.capture.as_mut().expect("just inserted");
         if !kind.is_suppressed() {
-            capture.ungrab();
-            return Ok(());
+            return capture.ungrab().map_err(|error| error.to_string());
         }
-        // Discard observation events already delivered locally before committing
-        // the grab; otherwise a queued local click could be duplicated remotely.
+        // Preserve terminal actions before admission. The native per-device request
+        // fences, not this drain, exclude local input produced during grab round trips.
         if !capture.grab_active() {
             while let Some(event) = capture
                 .next_event(Some(Duration::ZERO))
@@ -330,8 +334,9 @@ impl X11 {
                 if matches!(event, CapturedEvent::Emergency) {
                     return Err("EMERGENCY: capture commit cancelled by local hotkey".to_owned());
                 }
-                if let CapturedEvent::HotkeyPressed(action) = event {
-                    self.pending_hotkeys.push_back(hotkey_event(action));
+                if let CapturedEvent::HotkeyPressed(action, issued_at) = event {
+                    self.pending_hotkeys
+                        .push_back(hotkey_event(action, issued_at));
                 }
             }
             self.repeats.clear();
@@ -339,18 +344,27 @@ impl X11 {
         capture.grab().map_err(|error| error.to_string())
     }
 
-    pub fn end_capture(&mut self) -> Result<Released, String> {
+    pub fn end_capture(&mut self, release_injected: bool) -> Result<Released, String> {
         self.source_kind = None;
-        if let Some(capture) = &mut self.capture {
-            capture.ungrab();
-        }
-        self.repeats.clear();
-        self.disarm_detector();
-        let released = match &mut self.injector {
-            Some(injector) => release_counts(injector),
-            None => Released::default(),
+        self.pending_hotkeys.clear();
+        let capture_result = match &mut self.capture {
+            Some(capture) => capture.ungrab().map_err(|error| error.to_string()),
+            None => Ok(()),
         };
-        Ok(released)
+        self.repeats.clear();
+        // Neither local restoration nor synthetic release may skip the other.
+        let released = if release_injected {
+            self.release_session()
+        } else {
+            Ok(Released::default())
+        };
+        match (capture_result, released) {
+            (Ok(()), released) => released,
+            (Err(error), Ok(_)) => Err(error),
+            (Err(capture_error), Err(release_error)) => {
+                Err(format!("{capture_error}; {release_error}"))
+            }
+        }
     }
 
     /// Prepares injection — and arms the receiver-takeover detector (KVM-035).
@@ -408,16 +422,20 @@ impl X11 {
         }
     }
 
-    pub fn release_session(&mut self) -> Released {
+    pub fn release_session(&mut self) -> Result<Released, String> {
         // `ReleaseSession` ends the receiver side of a lease as surely as `EndCapture`.
         self.disarm_detector();
         match &mut self.injector {
             Some(injector) => release_counts(injector),
-            None => Released::default(),
+            None => Ok(Released::default()),
         }
     }
 
-    pub fn release_keys(&mut self, keys: &[HidKey], buttons: &[MouseButton]) -> Released {
+    pub fn release_keys(
+        &mut self,
+        keys: &[HidKey],
+        buttons: &[MouseButton],
+    ) -> Result<Released, String> {
         let mut events = Vec::with_capacity(keys.len() + buttons.len());
         events.extend(keys.iter().map(|key| InputEvent::Key {
             key: *key,
@@ -427,13 +445,14 @@ impl X11 {
             button: *button,
             state: input_model::KeyState::Up,
         }));
-        if let Ok(injector) = self.injector_mut() {
-            let _ = injector.inject(&events);
+        let result = self.injector_mut()?.inject(&events);
+        if result.applied_count != events.len() || result.os_error.is_some() {
+            return Err("native recovery release was not fully applied".to_owned());
         }
-        Released {
+        Ok(Released {
             keys: keys.len() as u32,
             buttons: buttons.len() as u32,
-        }
+        })
     }
 
     /// X11 monitors through RandR 1.5 (KVM-040).
@@ -524,8 +543,8 @@ impl X11 {
                 }
                 // Rule 4: the emergency combination works on a receiver too.
                 Ok(Some(CapturedEvent::Emergency)) => return Some(Event::Emergency),
-                Ok(Some(CapturedEvent::HotkeyPressed(action))) => {
-                    return Some(hotkey_event(action))
+                Ok(Some(CapturedEvent::HotkeyPressed(action, issued_at))) => {
+                    return Some(hotkey_event(action, issued_at))
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -602,35 +621,79 @@ fn drain_capture(
                 return Ok(Some(Event::Input(event)));
             }
             CapturedEvent::Emergency => return Ok(Some(Event::Emergency)),
-            CapturedEvent::HotkeyPressed(action) => return Ok(Some(hotkey_event(action))),
+            CapturedEvent::HotkeyPressed(action, issued_at) => {
+                return Ok(Some(hotkey_event(action, issued_at)))
+            }
         }
     }
 }
 
-fn hotkey_event(action: u8) -> Event {
-    Event::HotkeyPressed(match action {
-        1 => config::HotkeyAction::SwitchNext,
-        2 => config::HotkeyAction::ReturnLocal,
-        3 => config::HotkeyAction::ClaimOwnership,
-        4 => config::HotkeyAction::GameGuardToggle,
-        _ => config::HotkeyAction::EmergencyRelease,
-    })
+fn hotkey_event(action: u8, issued_at: std::time::Instant) -> Event {
+    Event::HotkeyPressed {
+        issued_at,
+        action: match action {
+            1 => config::HotkeyAction::SwitchNext,
+            2 => config::HotkeyAction::ReturnLocal,
+            3 => config::HotkeyAction::ClaimOwnership,
+            4 => config::HotkeyAction::GameGuardToggle,
+            _ => config::HotkeyAction::EmergencyRelease,
+        },
+    }
 }
 
-/// Releases everything the injector still holds, counting what actually went up.
-fn release_counts(injector: &mut X11Injector) -> Released {
+/// Reports success only after native completion and an empty surviving ledger.
+fn release_counts(injector: &mut X11Injector) -> Result<Released, String> {
     let keys_before = injector.pressed_keys().len();
     let buttons_before = injector.pressed_buttons().len();
-    let _ = injector.release_all();
-    Released {
-        keys: keys_before.saturating_sub(injector.pressed_keys().len()) as u32,
-        buttons: buttons_before.saturating_sub(injector.pressed_buttons().len()) as u32,
+    let result = injector.release_all();
+    complete_release(result, keys_before, buttons_before, injector.is_empty())
+}
+
+fn complete_release(
+    result: platform_x11::inject::InjectResult,
+    keys_before: usize,
+    buttons_before: usize,
+    ledger_empty: bool,
+) -> Result<Released, String> {
+    if let Some(error) = result.os_error {
+        return Err(format!("native X11 session release failed: {error}"));
     }
+    if result.applied_count != keys_before + buttons_before || !ledger_empty {
+        return Err("native X11 session release was not fully applied".to_owned());
+    }
+    Ok(Released {
+        keys: keys_before as u32,
+        buttons: buttons_before as u32,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_release_requires_native_completion_and_empty_ledger() {
+        use platform_x11::inject::InjectResult;
+        let complete = InjectResult {
+            applied_count: 2,
+            ..InjectResult::default()
+        };
+        let released = complete_release(complete.clone(), 1, 1, true).unwrap();
+        assert_eq!((released.keys, released.buttons), (1, 1));
+        assert!(complete_release(complete.clone(), 1, 1, false).is_err());
+        assert!(complete_release(InjectResult::default(), 1, 1, true).is_err());
+        let error = complete_release(
+            InjectResult {
+                os_error: Some("native flush refused".to_owned()),
+                ..complete
+            },
+            1,
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("native flush refused"));
+    }
 
     #[test]
     fn clipboard_read_failures_reach_the_shared_error_boundary() {

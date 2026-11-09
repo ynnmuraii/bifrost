@@ -692,12 +692,14 @@ fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
         let due = start + Duration::from_millis(frame * 10);
         thread::sleep(due.saturating_duration_since(Instant::now()));
         source.stream_mut().unwrap().pump(QUANTUM_FRAMES).unwrap();
+        let output = group.stream_mut().unwrap();
+        // Budget lateness at the same instant used to timestamp rendered PCM.
+        let render_instant = Instant::now();
         if capture_onset.load(Ordering::Acquire) != 0 && output_onset.is_none() {
             callback_lateness =
-                callback_lateness.max(Instant::now().saturating_duration_since(due));
+                callback_lateness.max(render_instant.saturating_duration_since(due));
         }
-        let output = group.stream_mut().unwrap();
-        let render_at = timeline.elapsed().as_secs_f64();
+        let render_at = render_instant.duration_since(timeline).as_secs_f64();
         output.pump(QUANTUM_FRAMES).unwrap();
         let recent: Vec<f32> = output.rendered_samples().collect();
         if output_onset.is_none() {

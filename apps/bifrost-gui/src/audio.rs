@@ -32,6 +32,7 @@ struct ArtRequest {
 pub enum AudioAction {
     EditConfig(Box<ipc::AudioConfig>),
     ApplyConfig,
+    DiscardConfig,
     Refresh,
     Share(bool),
     Receive(bool),
@@ -80,6 +81,11 @@ pub struct AudioView {
     pub error: Option<String>,
     pending_id: Option<u64>,
     pending_revision: Option<u64>,
+    pending_ack: bool,
+    pending_config: bool,
+    pending_gain: Option<(String, u8)>,
+    desired_gain: Vec<(String, u8)>,
+    validated: Option<model::AudioStatus>,
     pending_since: Option<Instant>,
     pending_snapshot_id: Option<u64>,
     pending_target: Option<[u8; 32]>,
@@ -111,6 +117,11 @@ impl Default for AudioView {
             error: None,
             pending_id: None,
             pending_revision: None,
+            pending_ack: false,
+            pending_config: false,
+            pending_gain: None,
+            desired_gain: Vec::new(),
+            validated: None,
             pending_since: None,
             pending_snapshot_id: None,
             pending_target: None,
@@ -171,6 +182,9 @@ impl AudioView {
         self.pending = false;
         self.pending_id = None;
         self.pending_revision = None;
+        self.pending_ack = false;
+        self.pending_config = false;
+        self.pending_gain = None;
         self.pending_since = None;
         self.pending_snapshot_id = None;
         self.pending_target = None;
@@ -181,14 +195,17 @@ impl AudioView {
     fn fail(&mut self, lang: Lang, key: Key) {
         let preserve_draft = self.pending_mode.is_some();
         self.settle();
+        self.desired_gain.clear();
+        if !preserve_draft && !self.dirty {
+            if let Some(config) = self
+                .status
+                .as_ref()
+                .and_then(|status| status.config.as_ref())
+            {
+                self.draft = config.clone();
+            }
+        }
         self.error = Some(text(lang, key).into());
-        if preserve_draft {
-            return;
-        }
-        if let Some(config) = self.status.as_ref().and_then(|s| s.config.as_ref()) {
-            self.draft = config.clone();
-        }
-        self.dirty = false;
     }
     /// The decoded cover for `id`, if this window already holds it.
     pub fn artwork_for(&self, id: [u8; 32]) -> Option<Artwork> {
@@ -198,6 +215,13 @@ impl AudioView {
     /// The decoded pixels are read by the GUI thread; the decode itself never runs there.
     pub fn set_art_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
         *self.art_worker.inner.wake.lock().expect("art wake") = Some(wake);
+    }
+
+    /// Reset connection-scoped state without losing the window's asynchronous repaint hook.
+    pub fn reset(&mut self) {
+        let wake = self.art_worker.inner.wake.lock().expect("art wake").clone();
+        *self = Self::default();
+        *self.art_worker.inner.wake.lock().expect("art wake") = wake;
     }
 
     /// Keeps the cache and the asked-for tuples at exactly the status's current scope, and
@@ -411,6 +435,7 @@ impl AudioView {
 
 pub fn error_key(code: &str) -> Key {
     match code {
+        "GUI_QUEUE_FULL" => Key::GuiQueueFull,
         "AUDIO_CONSENT_REQUIRED" => Key::AudioConsentRequired,
         "AUDIO_ROLE_CONFLICT" => Key::AudioRoleConflict,
         "AUDIO_UNSUPPORTED_BACKEND" => Key::AudioUnsupportedBackend,
@@ -563,6 +588,19 @@ impl ViewModel {
     }
     pub fn apply_audio_status(&mut self, request_id: u64, status: ipc::AudioStatus) {
         let correlated_snapshot = self.audio.pending_snapshot_id == Some(request_id);
+        // A post-ACK read can arrive behind a newer push; reconcile against the newer
+        // authoritative observation without rolling it back or copying its wire payload.
+        let status = if correlated_snapshot
+            && self
+                .audio
+                .status
+                .as_ref()
+                .is_some_and(|old| old.revision > status.revision)
+        {
+            self.audio.status.take().expect("newer status exists")
+        } else {
+            status
+        };
         if self.audio.status.as_ref().is_some_and(|old| {
             old.revision > status.revision
                 || old.revision == status.revision && !correlated_snapshot
@@ -583,7 +621,7 @@ impl ViewModel {
                 .as_ref()
                 .is_some_and(|config| config.listener_node_id.as_slice() == target)
         });
-        if (!self.audio.dirty || self.audio.pending && self.audio.pending_mode.is_none())
+        if (!self.audio.dirty || self.audio.pending_config && correlated_snapshot)
             && (self.audio.system_intent.is_none() || correlated_snapshot && target_observed)
         {
             if let Some(config) = status.config.as_ref() {
@@ -596,22 +634,40 @@ impl ViewModel {
                 && (!enabled || status.role == role as i32)
                 || enabled && !status.system_sharing_error.is_empty()
         });
-        let settles_request = if self.audio.system_intent.is_some() {
-            // A push can predate this request even with a newer status revision.
-            // Only the read requested after this mutation's persistence ACK settles it.
-            correlated_snapshot && target_observed && intent_observed
-        } else {
-            self.audio
-                .pending_revision
-                .is_some_and(|revision| status.revision > revision)
-                && self.audio.pending_mode.is_none_or(|mode| {
-                    status
-                        .config
-                        .as_ref()
-                        .is_some_and(|config| config.mode == mode)
+        let gain_observed = self
+            .audio
+            .pending_gain
+            .as_ref()
+            .is_none_or(|(id, percent)| {
+                model.sessions.iter().any(|session| {
+                    matches_id(id, &session.session_id) && session.gain_percent == *percent
                 })
-        };
+            });
+        // Persistence ACK and an authoritative observation are separate requirements.
+        let settles_request = self.audio.pending_ack
+            && if self.audio.system_intent.is_some() {
+                correlated_snapshot && target_observed && intent_observed
+            } else {
+                (correlated_snapshot
+                    || (self.audio.pending_mode.is_some()
+                        || self.audio.pending_gain.is_some() && gain_observed)
+                        && self
+                            .audio
+                            .pending_revision
+                            .is_some_and(|revision| status.revision > revision))
+                    && self.audio.pending_mode.is_none_or(|mode| {
+                        status
+                            .config
+                            .as_ref()
+                            .is_some_and(|config| config.mode == mode)
+                    })
+            };
         if settles_request {
+            if let Some((id, sent)) = &self.audio.pending_gain {
+                self.audio
+                    .desired_gain
+                    .retain(|(stream, desired)| stream != id || desired != sent);
+            }
             self.audio.settle();
         }
         self.audio.available = true;
@@ -636,6 +692,7 @@ impl ViewModel {
             card.artwork = card.artwork_id.and_then(|id| self.audio.artwork_for(id));
         }
         self.audio_player.replace_cards(cards, observed_active);
+        self.audio.validated = Some(model);
         self.audio.status = Some(status);
         for request in fresh {
             let id = self.begin_request(Request::Audio(AudioRequest::Artwork), Instant::now());
@@ -652,6 +709,7 @@ impl ViewModel {
         if correlated_snapshot && !self.audio.pending {
             self.audio.pending_snapshot_id = None;
         }
+        self.flush_desired_gain();
     }
     pub(crate) fn refresh_audio_peer_names(&mut self) {
         let Some(audio) = &self.audio.status else {
@@ -710,6 +768,9 @@ impl ViewModel {
                 error_key(&result.error_code)
             };
             self.audio.fail(self.look.language, key);
+            for card in &mut self.audio_player.cards {
+                card.desired_gain_percent = None;
+            }
             if key == Key::AudioUnavailable {
                 self.audio.available = false;
                 self.audio_player.replace_cards(Vec::new(), false);
@@ -722,11 +783,8 @@ impl ViewModel {
         // ACK means persisted intent, not active audio. Correlate a fresh read so an
         // earlier queued failure cannot retire a newer switch or hide its OFF action.
         if kind == AudioRequest::Mutation {
-            if self.audio.system_intent.is_some() {
-                self.request_audio_reconciliation();
-            } else {
-                self.request_audio_status(Instant::now());
-            }
+            self.audio.pending_ack = true;
+            self.request_audio_reconciliation();
         }
     }
     pub fn tick_audio(&mut self, now: Instant) {
@@ -743,6 +801,9 @@ impl ViewModel {
                 .retain(|r| !matches!(r.request, Request::Audio(_)) || now < r.deadline);
             self.audio.available = false;
             self.audio.fail(self.look.language, Key::AudioUnavailable);
+            for card in &mut self.audio_player.cards {
+                card.desired_gain_percent = None;
+            }
         }
         self.inflight.retain(|r| {
             !(matches!(r.request, Request::Audio(AudioRequest::Artwork)) && now >= r.deadline)
@@ -756,6 +817,16 @@ impl ViewModel {
     }
     pub fn audio_action(&mut self, action: &AudioAction, now: Instant) {
         match action {
+            AudioAction::DiscardConfig => {
+                if !self.audio.pending {
+                    if let Some(config) = self.audio.status.as_ref().and_then(|s| s.config.as_ref())
+                    {
+                        self.audio.draft = config.clone();
+                    }
+                    self.audio.dirty = false;
+                }
+                return;
+            }
             AudioAction::EditConfig(config) => {
                 self.audio.draft.clone_from(config.as_ref());
                 self.audio.dirty = true;
@@ -812,6 +883,35 @@ impl ViewModel {
         if (!self.audio.available && !urgent) || !self.connection.is_connected() {
             self.audio.error = Some(text(self.look.language, Key::AudioUnavailable).into());
             return;
+        }
+        if let AudioAction::Player(AudioPlayerAction::SetGain { stream_id, percent }) = action {
+            if *percent > 100
+                || !self
+                    .audio_player
+                    .cards
+                    .iter()
+                    .any(|card| card.stream_id == *stream_id)
+            {
+                return;
+            }
+            if let Some((_, desired)) = self
+                .audio
+                .desired_gain
+                .iter_mut()
+                .find(|(id, _)| id == stream_id)
+            {
+                *desired = *percent;
+            } else {
+                self.audio.desired_gain.push((stream_id.clone(), *percent));
+            }
+            if let Some(card) = self
+                .audio_player
+                .cards
+                .iter_mut()
+                .find(|card| card.stream_id == *stream_id)
+            {
+                card.desired_gain_percent = Some(*percent);
+            }
         }
         if self.audio.pending && !urgent {
             return;
@@ -907,7 +1007,12 @@ impl ViewModel {
                 })
             }
             AudioAction::Player(intent) => {
-                let Some(message) = player_request(status, intent) else {
+                let Some(message) = self
+                    .audio
+                    .validated
+                    .as_ref()
+                    .and_then(|model| player_request_validated(model, revision, intent))
+                else {
                     self.audio.error = Some(text(self.look.language, Key::AudioStaleMedia).into());
                     return;
                 };
@@ -929,7 +1034,7 @@ impl ViewModel {
                 self.outgoing.retain(|(id, _)| *id != snapshot);
             }
         }
-        let auxiliary = (self.audio.system_intent.is_some() || self.audio.pending_mode.is_some())
+        let auxiliary = self.audio.pending
             && !matches!(
                 action,
                 AudioAction::Share(_)
@@ -976,6 +1081,14 @@ impl ViewModel {
         }
         self.audio.pending = true;
         self.audio.pending_id = Some(id);
+        self.audio.pending_ack = false;
+        self.audio.pending_config = matches!(action, AudioAction::ApplyConfig);
+        self.audio.pending_gain = match action {
+            AudioAction::Player(AudioPlayerAction::SetGain { stream_id, percent }) => {
+                Some((stream_id.clone(), *percent))
+            }
+            _ => None,
+        };
         self.audio.pending_snapshot_id = None;
         self.audio.pending_mode = match action {
             AudioAction::Player(AudioPlayerAction::SetMode(mode)) => Some(*mode as i32),
@@ -993,6 +1106,34 @@ impl ViewModel {
         self.audio.pending_since = Some(now);
         self.audio.error = None;
         self.outgoing.push((id, message));
+    }
+    fn flush_desired_gain(&mut self) {
+        // Matching telemetry can predate an inflight mutation that will change it again.
+        let pending = self.audio.pending;
+        self.audio.desired_gain.retain(|(id, percent)| {
+            self.audio_player
+                .cards
+                .iter()
+                .any(|card| card.stream_id == *id && (pending || card.gain_percent != *percent))
+        });
+        if !self.audio.pending {
+            if let Some((stream_id, percent)) = self.audio.desired_gain.first().cloned() {
+                self.audio_action(
+                    &AudioAction::Player(AudioPlayerAction::SetGain { stream_id, percent }),
+                    Instant::now(),
+                );
+            }
+        }
+        for (id, percent) in &self.audio.desired_gain {
+            if let Some(card) = self
+                .audio_player
+                .cards
+                .iter_mut()
+                .find(|card| card.stream_id == *id)
+            {
+                card.desired_gain_percent = Some(*percent);
+            }
+        }
     }
 }
 
@@ -1098,6 +1239,7 @@ pub fn map_cards(
                 muted: s.muted,
                 gain_percent: s.gain_percent,
                 path,
+                desired_gain_percent: None,
                 state: match s.state {
                     model::SessionState::Failed => StreamState::Failed,
                     model::SessionState::DevicePaused => StreamState::Degraded,
@@ -1144,6 +1286,15 @@ pub(crate) fn matches_id(hex: &str, id: &[u8]) -> bool {
 }
 
 pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> Option<Msg> {
+    let model = crate::audio_wire::decode_status(status).ok()?;
+    player_request_validated(&model, status.revision, action)
+}
+
+fn player_request_validated(
+    model: &model::AudioStatus,
+    revision: u64,
+    action: &AudioPlayerAction,
+) -> Option<Msg> {
     let id = match action {
         AudioPlayerAction::Previous(id)
         | AudioPlayerAction::Next(id)
@@ -1154,14 +1305,13 @@ pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> 
         | AudioPlayerAction::Seek { stream_id, .. } => stream_id,
         _ => return None,
     };
-    let model = crate::audio_wire::decode_status(status).ok()?;
     if !model.enabled {
         return None;
     }
     let s = model
         .sessions
         .iter()
-        .find(|s| eligible(s) && stream_id(&s.session_id) == *id)?;
+        .find(|s| eligible(s) && matches_id(id, &s.session_id))?;
     match action {
         AudioPlayerAction::Stop(_) => Some(Msg::StopAudio(ipc::StopAudio {
             peer_node_id: s.peer.to_vec(),
@@ -1173,7 +1323,7 @@ pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> 
                 peer_node_id: s.peer.to_vec(),
                 gain_percent: u32::from(s.gain_percent),
                 muted: *muted,
-                expected_revision: status.revision,
+                expected_revision: revision,
             }))
         }
         AudioPlayerAction::SetGain { percent, .. } if *percent <= 100 => {
@@ -1181,7 +1331,7 @@ pub fn player_request(status: &ipc::AudioStatus, action: &AudioPlayerAction) -> 
                 peer_node_id: s.peer.to_vec(),
                 gain_percent: u32::from(*percent),
                 muted: s.muted,
-                expected_revision: status.revision,
+                expected_revision: revision,
             }))
         }
         AudioPlayerAction::Seek {
@@ -1309,6 +1459,7 @@ mod artwork_attach_tests {
             can_next: false,
             muted: false,
             gain_percent: 100,
+            desired_gain_percent: None,
             state: StreamState::Ready,
             path: None,
             background: false,
@@ -1385,6 +1536,7 @@ mod artwork_attach_tests {
             can_next: false,
             muted: false,
             gain_percent: 100,
+            desired_gain_percent: None,
             state: StreamState::Ready,
             path: None,
             background: false,
@@ -1468,5 +1620,51 @@ mod audio_timeout_tests {
         vm.tick_audio(now);
         assert!(!vm.audio.available);
         assert!(vm.audio.error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod reconnect_wake_tests {
+    use super::*;
+
+    #[test]
+    fn artwork_decode_wakes_after_connect_and_reconnect_without_polling() {
+        let mut vm = ViewModel::new(
+            crate::view_model::CoreEndpoint::Ready {
+                description: "fixture".into(),
+            },
+            crate::view_model::LocalConfig::default(),
+        );
+        let (tx, rx) = mpsc::channel();
+        vm.set_audio_art_wake(Arc::new(move || {
+            let _ = tx.send(());
+        }));
+        let image = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image)
+            .unwrap();
+        for cycle in 0..2 {
+            if cycle != 0 {
+                vm.on_disconnected("fixture".into());
+            }
+            vm.on_connected("fixture");
+            vm.audio.art_requested.push(ArtRequest {
+                session_id: [1; 16],
+                token: 9,
+                id: [5; 32],
+            });
+            vm.audio.accept_artwork(ipc::AudioArtwork {
+                session_id: vec![1; 16],
+                session_token: 9,
+                artwork_id: vec![5; 32],
+                mime: "image/jpeg".into(),
+                data: jpeg.clone(),
+                width: 4,
+                height: 4,
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("decoder must wake the connected root window");
+        }
     }
 }

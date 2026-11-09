@@ -418,12 +418,34 @@ pub fn validate_status(status: &wire::AudioStatus) -> Result<()> {
     Ok(())
 }
 
+/// The shared audio-command boundary, including builds without an audio worker.
+pub fn is_request(message: &wire::gui_frame::Msg) -> bool {
+    use wire::gui_frame::Msg;
+    matches!(
+        message,
+        Msg::GetAudioStatus(_)
+            | Msg::SetAudio(_)
+            | Msg::SetSystemAudioSharing(_)
+            | Msg::StartAudio(_)
+            | Msg::StopAudio(_)
+            | Msg::SetMicrophoneMute(_)
+            | Msg::SetPtt(_)
+            | Msg::ListAudioDevices(_)
+            | Msg::SetAudioPeerGain(_)
+            | Msg::SendMediaCommand(_)
+            | Msg::GetAudioArtwork(_)
+    )
+}
+
 pub fn validate_frame(frame: &wire::GuiFrame) -> Result<()> {
     use wire::gui_frame::Msg;
     let Some(message) = &frame.msg else {
         return Ok(());
     };
     match message {
+        Msg::ClosePairingWindow(_) => {
+            return require(frame.request_id != 0, "pairing request requires request id");
+        }
         Msg::AudioStatus(status) => return validate_status(status),
         Msg::GetAudioArtwork(request) => {
             id(&request.session_id, 16, false)?;

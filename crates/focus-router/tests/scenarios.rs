@@ -316,7 +316,7 @@ fn s01_local_switch_starts_temporary_capture() {
     assert_eq!(
         r.handle(10, switch(SwitchTrigger::Edge)),
         vec![
-            begin(CaptureKind::Temporary, id(1), 200),
+            begin(CaptureKind::Temporary, id(1), 210),
             arm(Timer::PrepareTimeout, 210),
             notice(Notice::Focus(FocusState::Preparing))
         ]
@@ -337,7 +337,7 @@ fn preparing_ignores_repeated_edge_samples_without_rearming_capture() {
     }
     assert_eq!(
         effects(&outputs),
-        vec![begin(CaptureKind::Temporary, id(1), 200)]
+        vec![begin(CaptureKind::Temporary, id(1), 210)]
     );
     // An explicit timeout still aborts the one pending transition.
     assert_eq!(
@@ -452,7 +452,7 @@ fn delayed_stale_refusal_restarts_superseding_claim_with_a_fresh_serial() {
         assert!(r.handle(621, switch(SwitchTrigger::Edge)).contains(&begin(
             CaptureKind::Temporary,
             id(1),
-            200
+            821
         )));
         assert!(r
             .handle(
@@ -575,7 +575,7 @@ fn s02_capture_ack_capture_commits_and_renews() {
     );
     assert_eq!(
         r.handle(12, net(ack(id(1), None))),
-        vec![begin(CaptureKind::Remote, id(1), 500)]
+        vec![begin(CaptureKind::Remote, id(1), 0)]
     );
     assert!(r
         .handle(
@@ -656,6 +656,7 @@ fn s06_held_key_refuses_normal_switch() {
         Input::Agent(AgentEvent::PressedState {
             keys: vec![HidKey::keyboard(4)],
             buttons: vec![],
+            known: true,
         }),
     );
     assert_eq!(
@@ -721,7 +722,7 @@ fn s35_return_edge_waits_for_the_leave_ack_not_for_our_own_release() {
     assert!(r.lease().is_idle());
     assert_eq!(
         effects(&r.handle(24, switch(SwitchTrigger::Edge))),
-        vec![begin(CaptureKind::Temporary, id(2), 200)]
+        vec![begin(CaptureKind::Temporary, id(2), 224)]
     );
     assert_eq!(r.focus(), FocusState::Preparing);
 
@@ -765,7 +766,7 @@ fn s36_a_lost_leave_ack_is_bounded_by_the_release_guard() {
     // The walk continues instead of hanging: the next transition opens a fresh lease.
     assert_eq!(
         effects(&r.handle(621, switch(SwitchTrigger::Edge))),
-        vec![begin(CaptureKind::Temporary, id(2), 200)]
+        vec![begin(CaptureKind::Temporary, id(2), 821)]
     );
 }
 
@@ -1161,7 +1162,7 @@ fn s15_commit_arms_deadline_challenge_and_repeat_guard() {
             Output::CancelTimer(Timer::PrepareTimeout),
             Output::Agent(AgentCommand::ArmDeadline {
                 lease_id: L,
-                remaining_ms: 500
+                deadline_ms: 512
             }),
             arm(Timer::ReceiverLeaseDeadline, 512),
             arm(Timer::ReceiverChallenge, 112),
@@ -1546,6 +1547,14 @@ fn reordered_startup_claim_refusal_converges_without_poisoning_input() {
         )
         .with_persisted_ownership(7, Some((7, PEER)))
         .with_claim_on_startup(true);
+        newer.handle(
+            0,
+            Input::Agent(AgentEvent::PressedState {
+                keys: vec![],
+                buttons: vec![],
+                known: true,
+            }),
+        );
 
         // Both claims were formed before the peers learned each other's owner pair.
         assert!(older
@@ -1825,6 +1834,14 @@ fn source_router(lease_ttl_ms: u64) -> FocusRouter {
         capabilities(),
     )
     .with_persisted_ownership(1, Some((1, LOCAL)));
+    r.handle(
+        0,
+        Input::Agent(AgentEvent::PressedState {
+            keys: vec![],
+            buttons: vec![],
+            known: true,
+        }),
+    );
     r.handle(0, hello(PEER, LOCAL, 1));
     r
 }
@@ -1908,4 +1925,48 @@ fn a_lease_challenge_ttl_outside_the_documented_range_is_clamped() {
             "advertised {advertised} ms must clamp to {effective} ms: {committed:?}"
         );
     }
+}
+
+#[test]
+fn restarted_agent_requires_a_fresh_physical_snapshot_before_outgoing_switch() {
+    let mut r = router(LOCAL);
+    r.handle(1, Input::Agent(AgentEvent::AgentLost));
+    r.handle(2, Input::Agent(AgentEvent::AgentReady));
+    let out = r.handle(3, switch(SwitchTrigger::Edge));
+    assert!(out.contains(&notice(Notice::SwitchRefused {
+        trigger: SwitchTrigger::Edge,
+        reason: TransitionRefusal::PhysicalStateUnknown,
+    })));
+    assert!(r.lease().is_idle());
+    r.handle(
+        4,
+        Input::Agent(AgentEvent::PressedState {
+            keys: vec![],
+            buttons: vec![],
+            known: true,
+        }),
+    );
+    r.handle(5, switch(SwitchTrigger::Edge));
+    assert_eq!(r.focus(), FocusState::Preparing);
+}
+
+#[test]
+fn unknown_source_physical_state_does_not_disable_receiving_input() {
+    let mut r = router(PEER);
+    r.handle(
+        1,
+        Input::Agent(AgentEvent::PressedState {
+            keys: vec![],
+            buttons: vec![],
+            known: false,
+        }),
+    );
+    let out = r.handle(2, net(prepare(L, 1)));
+    assert!(out.contains(&Output::Agent(AgentCommand::PrepareInject { lease_id: L })));
+    r.handle(3, Input::Agent(AgentEvent::Ready { lease_id: L }));
+    r.handle(4, net(Message::EnterCommit { lease_id: L }));
+    assert_eq!(r.lease().receiver().unwrap().state, ReceiverState::Active);
+    let out = r.handle(5, net(batch(1, 1)));
+    assert!(out.iter().any(|output| matches!(output,
+        Output::Agent(AgentCommand::Inject { lease_id, .. }) if *lease_id == L)));
 }

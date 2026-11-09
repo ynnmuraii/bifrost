@@ -6,16 +6,18 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clipboard::{ClipboardContent, Marker};
 use platform_x11::clipboard::{Clipboard, DEFAULT_MAX_REQUEST_SIZE};
 use x11rb::connection::Connection as _;
+use x11rb::protocol::xfixes::{ConnectionExt as _, SelectionEventMask};
 use x11rb::protocol::xproto::{
     self, Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux,
     EventMask, PropMode, Property, SelectionNotifyEvent, SelectionRequestEvent, WindowClass,
@@ -205,20 +207,48 @@ fn png_round_trips_through_independent_x11_clients() {
     let png = large_png();
     assert!(png.len() > DEFAULT_MAX_REQUEST_SIZE);
 
-    // A different owner streams PNG through real X properties, not the pure INCR machine.
+    // Independent readers must not replace one another's unfinished raw-owner INCR stream.
+    let second_clipboard = Clipboard::connect().expect("the second clipboard adapter connects");
     let owner = RawOwner::start(None, Some(png.clone()), None);
-    let snapshot = clipboard.read().expect("reading the raw PNG selection");
-    let Some(ClipboardContent::Image { png: received }) = snapshot.content else {
-        panic!("PNG content expected");
-    };
-    assert_eq!(received, png);
-    assert!(snapshot.markers.is_empty());
-    assert_eq!(owner.png_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(owner.incr_transfers.load(Ordering::SeqCst), 1);
+    let start = Barrier::new(2);
+    let (first, (second, second_clipboard)) = thread::scope(|scope| {
+        let start_for_reader = &start;
+        let reader = scope.spawn(move || {
+            start_for_reader.wait();
+            let result = second_clipboard.read();
+            (result, second_clipboard)
+        });
+        start.wait();
+        let first = clipboard.read();
+        (first, reader.join().expect("the second PNG reader thread"))
+    });
+    for (index, result) in [first, second].into_iter().enumerate() {
+        let snapshot = result.unwrap_or_else(|error| {
+            panic!(
+                "reading the raw PNG selection, reader {index}: {error:?}; {}",
+                owner.diagnostics()
+            )
+        });
+        let Some(ClipboardContent::Image { png: received }) = snapshot.content else {
+            panic!("PNG content expected for reader {index}");
+        };
+        assert_eq!(received, png, "reader {index}");
+        assert!(snapshot.markers.is_empty(), "reader {index}");
+    }
+    assert_eq!(owner.png_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(owner.incr_transfers.load(Ordering::SeqCst), 2);
+    drop(second_clipboard);
+    assert_eq!(
+        clipboard_owner(),
+        owner.window,
+        "dropping a reader must preserve the raw owner's CLIPBOARD selection"
+    );
     drop(owner);
 
     let owner = RawOwner::start(Some("text wins over PNG"), Some(png.clone()), None);
-    let snapshot = clipboard.read().expect("reading mixed targets");
+    let snapshot = clipboard.read().unwrap_or_else(|error| {
+        panic!("reading mixed targets: {error:?}; {}", owner.diagnostics())
+    });
     assert_eq!(
         snapshot.content,
         Some(ClipboardContent::Text("text wins over PNG".to_owned()))
@@ -260,8 +290,46 @@ fn png_round_trips_through_independent_x11_clients() {
     assert_eq!(received.format, 8);
     assert_eq!(received.bytes, png);
 
+    // Observe native owner retirement before asserting it, rather than racing server cleanup.
+    let selection = intern(&requestor, "CLIPBOARD");
+    requestor
+        .xfixes_query_version(5, 0)
+        .unwrap()
+        .reply()
+        .unwrap();
+    requestor
+        .xfixes_select_selection_input(
+            window,
+            selection,
+            SelectionEventMask::SELECTION_WINDOW_DESTROY
+                | SelectionEventMask::SELECTION_CLIENT_CLOSE,
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    drop(clipboard);
+    raw_event(
+        &requestor,
+        Instant::now() + Duration::from_secs(10),
+        |event| {
+            matches!(event, Event::XfixesSelectionNotify(event)
+            if event.selection == selection && event.owner == 0)
+        },
+    );
+    assert_eq!(
+        clipboard_owner(),
+        0,
+        "dropping the owner releases CLIPBOARD"
+    );
+    let clipboard = Clipboard::connect().expect("the clipboard adapter reconnects");
+
     let owner = RawOwner::start(None, Some(png), Some("secret"));
-    let snapshot = clipboard.read().expect("reading image secret markers");
+    let snapshot = clipboard.read().unwrap_or_else(|error| {
+        panic!(
+            "reading image secret markers: {error:?}; {}",
+            owner.diagnostics()
+        )
+    });
     assert_eq!(snapshot.markers, [Marker::KdeSecret]);
     assert_eq!(
         snapshot.content,
@@ -455,6 +523,7 @@ fn intern(conn: &RustConnection, name: &str) -> Atom {
 /// A tiny raw-X11 CLIPBOARD owner: a second client that answers exactly the targets this
 /// adapter asks for, including the KDE secret hint `xclip` cannot carry.
 struct RawOwner {
+    window: u32,
     stop: Arc<AtomicBool>,
     png_requests: Arc<AtomicUsize>,
     incr_transfers: Arc<AtomicUsize>,
@@ -492,7 +561,7 @@ impl RawOwner {
         let png = png.map(Arc::new);
         let hint = hint.map(str::to_owned);
         let thread = thread::spawn(move || {
-            let mut active: Option<RawIncr> = None;
+            let mut active = HashMap::new();
             while !stop_for_thread.load(Ordering::Relaxed) {
                 match conn.poll_for_event() {
                     Ok(Some(Event::SelectionRequest(request))) => {
@@ -508,13 +577,12 @@ impl RawOwner {
                             &request,
                         ) {
                             transfers.fetch_add(1, Ordering::SeqCst);
-                            active = Some(transfer);
+                            active.insert((transfer.window, transfer.property), transfer);
                         }
                     }
                     Ok(Some(Event::PropertyNotify(event))) if event.state == Property::DELETE => {
-                        if let Some(transfer) = active.as_mut().filter(|transfer| {
-                            transfer.window == event.window && transfer.property == event.atom
-                        }) {
+                        let key = (event.window, event.atom);
+                        if let Some(transfer) = active.get_mut(&key) {
                             let end = (transfer.sent + DEFAULT_MAX_REQUEST_SIZE / 2)
                                 .min(transfer.png.len());
                             let bytes = &transfer.png[transfer.sent..end];
@@ -528,7 +596,7 @@ impl RawOwner {
                             );
                             transfer.sent = end;
                             if bytes.is_empty() {
-                                active = None;
+                                active.remove(&key);
                             }
                             conn.flush().expect("flushing INCR chunk");
                         }
@@ -537,15 +605,26 @@ impl RawOwner {
                     Err(_) => break,
                 }
             }
-            let _ = conn.set_selection_owner(AtomEnum::NONE, atoms[0], 0u32);
+            let _ = conn.destroy_window(window);
             let _ = conn.flush();
         });
         Self {
+            window,
             stop,
             png_requests,
             incr_transfers,
             thread: Some(thread),
         }
+    }
+
+    fn diagnostics(&self) -> String {
+        format!(
+            "raw_owner={:#x}, selected_owner={:#x}, png_requests={}, incr_transfers={}",
+            self.window,
+            clipboard_owner(),
+            self.png_requests.load(Ordering::SeqCst),
+            self.incr_transfers.load(Ordering::SeqCst),
+        )
     }
 }
 

@@ -27,11 +27,54 @@ const LABEL_W: f32 = 172.0;
 /// The header's height.
 const HEAD_H: f32 = 84.0;
 
+/// Keep the incumbent dialog painting, while egui owns modal input and keyboard scope.
+pub fn draw(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    st: &mut UiState,
+    full: Rect,
+    t: f32,
+    actions: &mut Vec<Action>,
+) -> Option<Duration> {
+    let open = vm.appearance_open || vm.modal.is_some();
+    if !open {
+        st.modal_focus_pending = false;
+        if st.modal_open.is_some() {
+            if let Some(id) = st.modal_return_focus.take() {
+                ui.memory_mut(|memory| memory.request_focus(id));
+                // The root widgets were still blocked by the previous pass's modal layer.
+                ui.ctx().request_repaint();
+            }
+        }
+        return draw_contents(ui, pal, vm, st, full, t, actions);
+    }
+    if st.modal_open.is_none() {
+        st.modal_return_focus = ui.memory(|memory| memory.focused());
+        st.modal_focus_pending = true;
+    }
+    let area = egui::Area::new(egui::Id::new("bifrost-modal"))
+        .order(egui::Order::Foreground)
+        .movable(false)
+        .fixed_pos(full.min);
+    ui.memory_mut(|memory| memory.set_modal_layer(area.layer()));
+    area.show(ui.ctx(), |ui| {
+        ui.set_min_size(full.size());
+        // A new Area first lays out disabled sizing widgets, which surrender requested focus.
+        if st.modal_focus_pending && ui.is_enabled() {
+            ui.memory_mut(|memory| memory.request_focus(egui::Id::new("modal-x")));
+            st.modal_focus_pending = false;
+        }
+        draw_contents(ui, pal, vm, st, full, t, actions)
+    })
+    .inner
+}
+
 /// Draws the open modal, if there is one, over everything.
 ///
 /// Returns when the next frame is due for the relative times the open dialog shows (`None` when
 /// none of them changes on a clock), which the caller folds into its own repaint schedule.
-pub fn draw(
+fn draw_contents(
     ui: &mut egui::Ui,
     pal: &Palette,
     vm: &ViewModel,
@@ -71,13 +114,17 @@ pub fn draw(
     // The scrim: a click outside the dialog closes it, and so does Escape.
     let painter = ui.painter().clone();
     painter.rect_filled(full, 0.0, pal.scrim);
-    let scrim = ui.interact(full, egui::Id::new("scrim"), Sense::click());
+    let scrim = ui.interact(full, egui::Id::new("scrim"), Sense::CLICK);
     let capture_id = egui::Id::new("hotkey-editor");
     let capturing = ui.ctx().data(|d| {
         d.get_temp::<crate::view_model::hotkeys::Editor>(capture_id)
             .is_some_and(|editor| editor.capturing.is_some())
     });
-    if scrim.clicked() || (!capturing && ui.input(|i| i.key_pressed(egui::Key::Escape))) {
+    let popup_open = egui::Popup::is_any_open(ui.ctx());
+    let escape = !capturing
+        && !popup_open
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    if scrim.clicked() || escape {
         ui.ctx()
             .data_mut(|d| d.remove::<crate::view_model::hotkeys::Editor>(capture_id));
         actions.push(Action::CloseModal);
@@ -192,6 +239,19 @@ pub fn draw(
                 Modal::Settings => settings_body(ui, pal, vm, actions),
                 Modal::Appearance => super::appearance::body(ui, pal, vm, actions),
                 Modal::Audio => super::audio_settings::body(ui, pal, vm, actions),
+            }
+            // Native checkboxes and other controls do not request keyboard focus reveal.
+            // Submit the target before this ScrollArea settles, only on a clipped transition.
+            if let Some(response) = ui
+                .memory(|memory| memory.focused())
+                .and_then(|id| ui.ctx().read_response(id))
+            {
+                if response.gained_focus()
+                    && response.layer_id == ui.layer_id()
+                    && !response.interact_rect.contains_rect(response.rect)
+                {
+                    response.scroll_to_me(None);
+                }
             }
         });
     if foot_h > 0.0 {
@@ -338,7 +398,7 @@ fn header(
     let response = ui
         .interact(close, egui::Id::new("modal-x"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let hover = response.hovered();
+    let hover = response.hovered() || response.has_focus();
     painter.circle(
         close.center(),
         22.0,

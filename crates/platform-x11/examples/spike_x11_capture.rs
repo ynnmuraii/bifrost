@@ -128,7 +128,7 @@ fn main() -> std::process::ExitCode {
                 );
                 break;
             }
-            Ok(Some(CapturedEvent::HotkeyPressed(action))) => {
+            Ok(Some(CapturedEvent::HotkeyPressed(action, _))) => {
                 println!("hotkey action {action}");
             }
             Ok(Some(CapturedEvent::Input(event))) => {
@@ -156,7 +156,10 @@ fn main() -> std::process::ExitCode {
         capture.ledger().keys(),
         capture.ledger().buttons()
     );
-    capture.ungrab();
+    if let Err(error) = capture.ungrab() {
+        eprintln!("cannot restore local capture: {error}");
+        return ExitCode::FAILURE;
+    }
     println!("grab active after ungrab: {}", capture.grab_active());
     ExitCode::SUCCESS
 }

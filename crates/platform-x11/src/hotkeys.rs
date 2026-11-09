@@ -58,6 +58,7 @@ impl HotkeyState {
     pub fn seed(&mut self, keys: &[u8; 32]) {
         for (index, pressed) in self.pressed.iter_mut().enumerate() {
             *pressed = keys[index / 8] & (1 << (index % 8)) != 0;
+            self.swallowed[index] &= *pressed;
         }
     }
 
@@ -149,6 +150,32 @@ mod tests {
         assert_eq!(state.edge(114, true), (true, None));
         assert_eq!(state.edge(114, false), (true, None));
         assert_eq!(state.edge(114, true), (false, None));
+    }
+
+    #[test]
+    fn snapshot_retires_only_released_swallowed_triggers() {
+        let mut state = HotkeyState::default();
+        state.bindings[1] = Some(Hotkey {
+            keycode: 38,
+            modifiers: 0,
+        });
+        assert_eq!(state.edge(38, true), (true, Some(1)));
+        let mut keys = [0; 32];
+        keys[38 / 8] |= 1 << (38 % 8);
+        state.seed(&keys);
+        assert_eq!(
+            state.edge(38, true),
+            (true, None),
+            "held trigger stays swallowed"
+        );
+        // Its release was queued before the new configuration's sequence fence.
+        state.seed(&[0; 32]);
+        assert_eq!(
+            state.edge(38, true),
+            (true, Some(1)),
+            "fresh gesture must not be lost"
+        );
+        assert_eq!(state.edge(38, false), (true, None));
     }
     #[test]
     fn two_modifier_sides_and_exact_modifiers() {

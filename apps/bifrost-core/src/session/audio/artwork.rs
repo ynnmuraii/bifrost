@@ -205,7 +205,12 @@ impl Actor {
         }
         match self.artwork.sending.get(&peer) {
             Some(sending)
-                if sending.view == scope.view && sending.token == token && sending.id == id => {}
+                if sending.view == scope.view
+                    && sending.token == token
+                    && sending.id == id
+                    && self.artwork.native.as_ref().is_none_or(|image| {
+                        image.token != token || image.id != id || sending.offset < image.data.len()
+                    }) => {}
             _ => {
                 self.artwork.sending.insert(
                     peer,
@@ -577,5 +582,218 @@ mod tests {
         assert!(!current_identity_matches(Some((7, 2, b)), 7, a));
         assert!(!current_identity_matches(Some((8, 2, a)), 7, a));
         assert!(!current_identity_matches(None, 7, a));
+    }
+
+    #[tokio::test]
+    async fn completed_artwork_request_requeues_without_restarting_partial_transfer() {
+        let (_root, coordinator, mut actor, peer, parent) =
+            sharing::tests::lifecycle::listener_fixture();
+        actor.peers.get_mut(&peer).unwrap().artwork_support = true;
+        coordinator
+            .links
+            .send_modify(|links| links.peers = actor.peers.clone());
+        actor.media_tick().await;
+        let data = jpeg(32, 32);
+        let id: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &data)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let view = actor.records[&peer].view;
+        actor
+            .media_on_network(
+                parent,
+                &net::AudioControl {
+                    control_version: 1,
+                    body: Some(net::audio_control::Body::MediaInfo(net::MediaInfo {
+                        session_id: view.session.to_vec(),
+                        present: true,
+                        token: 11,
+                        revision: 12,
+                        app: "owned-player".into(),
+                        title: "Owned paused track".into(),
+                        playback: net::MediaPlayback::Paused as i32,
+                        commands: 1,
+                        allow_control: true,
+                        artwork_id: id.to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            )
+            .await;
+        actor.artwork_on_network(
+            parent,
+            net::MediaArtworkChunk {
+                session_id: view.session.to_vec(),
+                token: 11,
+                revision: 12,
+                artwork_id: id.to_vec(),
+                total_bytes: data.len() as u32,
+                offset: 0,
+                data: data.clone(),
+                width: 32,
+                height: 32,
+            },
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                actor.artwork_tick().await;
+                if actor.media_info(peer).unwrap().artwork_id == Some(id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("consumer receives the validated JPEG");
+        actor.feed(fsm::Input::Buffering(view)).unwrap();
+        actor.media_tick().await;
+        actor.artwork_tick().await;
+        let buffering = actor.records[&peer].view;
+        actor.feed(fsm::Input::PathReady(buffering)).unwrap();
+        actor.media_tick().await;
+        assert_eq!(actor.media_info(peer).unwrap().artwork_id, None);
+        assert!(actor.media_allowed(peer));
+
+        // Re-establish the Source side through the model's accepted Hello/consent seam.
+        actor.config.role = config::AudioRole::Source;
+        actor.config.listener_node_id = Some(config::audio::HexId(*peer.as_bytes()));
+        actor.config.allow_send_to = vec![config::audio::HexId(*peer.as_bytes())];
+        actor.model = fsm::ControlPlane::new(*actor.local.as_bytes());
+        actor.configure().unwrap();
+        let remote = actor.peers.get_mut(&peer).unwrap();
+        remote.support.system_source = false;
+        remote.support.listener = true;
+        let support = remote.support;
+        let hello = remote.hello.as_mut().unwrap();
+        hello.role = model::AudioRole::Listener;
+        hello.listener = *peer.as_bytes();
+        let hello = *hello;
+        let mut offer = actor.records[&peer].agreement.offer;
+        offer.listener = *peer.as_bytes();
+        offer.source = *actor.local.as_bytes();
+        offer.consent_revision = hello.consent_revision;
+        actor.effects.clear();
+        for input in [
+            fsm::Input::WorkerUp {
+                generation: view.worker_generation,
+                capture: true,
+                render: false,
+            },
+            fsm::Input::PeerUp {
+                parent,
+                support,
+                trusted: true,
+                local_allowed: true,
+                consent_revision: actor.consent_revision,
+            },
+            fsm::Input::Receive {
+                parent,
+                message: fsm::Control::Hello(hello),
+            },
+            fsm::Input::Receive {
+                parent,
+                message: fsm::Control::Offer(offer),
+            },
+            fsm::Input::SourceNonce {
+                parent,
+                session: view.session,
+                nonce: [9; 32],
+            },
+        ] {
+            actor.feed(input).unwrap();
+        }
+        let agreement = actor
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                fsm::Effect::DeriveKeys { agreement, .. } => Some(*agreement),
+                _ => None,
+            })
+            .expect("real source model agreement");
+        let source_view = actor.model.session(*peer.as_bytes()).unwrap();
+        for input in [
+            fsm::Input::KeysReady {
+                view: source_view,
+                transcript_sha256: [10; 32],
+            },
+            fsm::Input::ChildPrepared(source_view),
+            fsm::Input::Receive {
+                parent,
+                message: fsm::Control::Commit {
+                    session: view.session,
+                    transcript_sha256: [10; 32],
+                },
+            },
+            fsm::Input::ChildStartIssued(source_view),
+            fsm::Input::ChildStarted(source_view),
+            fsm::Input::PathReady(source_view),
+        ] {
+            actor.feed(input).unwrap();
+        }
+        let record = actor.records.get_mut(&peer).unwrap();
+        record.role = model::AudioRole::Source;
+        record.agreement = agreement;
+        assert_eq!(record.view, view);
+        actor.effects.clear();
+        coordinator
+            .links
+            .send_modify(|links| links.peers = actor.peers.clone());
+        actor.ready = Some(worker::Ready {
+            backend: worker::BackendKind::Dry as i32,
+            probed: true,
+            capabilities: vec![worker::CapabilityAvailability {
+                capability: worker::Capability::MediaSessions as i32,
+                availability: worker::Availability::Available as i32,
+                reason: 0,
+            }],
+        });
+        actor.artwork_on_worker(
+            1,
+            worker::MediaArtwork {
+                token: 11,
+                revision: 12,
+                artwork_id: id.to_vec(),
+                data: data.clone(),
+                width: 32,
+                height: 32,
+            },
+        );
+        assert!(actor.artwork_available(peer, 11, Some(id)));
+        let request = || net::MediaArtworkRequest {
+            session_id: view.session.to_vec(),
+            token: 11,
+            artwork_id: id.to_vec(),
+        };
+        actor.artwork_on_request(parent, request());
+        assert_eq!(actor.artwork.sending[&peer].offset, 0);
+        actor.artwork.sending.get_mut(&peer).unwrap().offset = 1;
+        actor.artwork_on_request(parent, request());
+        assert_eq!(
+            actor.artwork.sending[&peer].offset, 1,
+            "duplicate cannot restart an in-flight transfer"
+        );
+        actor.artwork.sending.get_mut(&peer).unwrap().offset = data.len();
+        actor.artwork_on_request(parent, request());
+        assert_eq!(
+            actor.artwork.sending[&peer].offset, 0,
+            "a completed image is resendable"
+        );
+        actor.artwork.sending.get_mut(&peer).unwrap().offset = data.len();
+        let mut stale = parent;
+        stale.generation = [99; 16];
+        actor.artwork_on_request(stale, request());
+        assert_eq!(actor.artwork.sending[&peer].offset, data.len());
+        actor.config.system_sharing = Some(false);
+        actor.artwork_on_request(parent, request());
+        assert_eq!(
+            actor.artwork.sending[&peer].offset,
+            data.len(),
+            "withdrawn consent cannot schedule a resend"
+        );
+        actor.media_tick().await;
+        actor.artwork_tick().await;
+        assert!(!actor.artwork.sending.contains_key(&peer));
+        assert!(actor.media_info(peer).is_none());
+        assert!(!actor.media_allowed(peer));
     }
 }

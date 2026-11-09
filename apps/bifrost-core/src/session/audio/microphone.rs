@@ -5,7 +5,7 @@ use net::{AudioControlResult as ResultCode, MicControlOp};
 
 struct Held {
     connection: [u8; 16],
-    out: mpsc::Sender<Outgoing>,
+    out: Replies,
     press: [u8; 16],
     parent: fsm::Parent,
     next: u64,
@@ -2804,7 +2804,7 @@ mod tests {
         ] {
             let mut state = State::default();
             state.set_local_intent(false);
-            let (out, _receive) = mpsc::channel(1);
+            let (out, _receive) = Replies::channel(1);
             state.held = Some(Held {
                 connection: [4; 16],
                 out,
@@ -3329,7 +3329,7 @@ mod tests {
                 connection_id: [2; 16],
                 generation: [3; 16],
             };
-            let (out, _receive) = mpsc::channel(1);
+            let (out, _receive) = Replies::channel(1);
             let mut state = State {
                 held: Some(Held {
                     connection: [4; 16],
@@ -3394,7 +3394,7 @@ mod tests {
             connection_id: [2; 16],
             generation: [3; 16],
         };
-        let (out, _receive) = mpsc::channel(1);
+        let (out, _receive) = Replies::channel(1);
         let mut state = State {
             held: Some(Held {
                 connection: [4; 16],
@@ -3793,7 +3793,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (out, _receive) = mpsc::channel(1);
+        let (out, _receive) = Replies::channel(1);
         source.held = Some(Held {
             connection: [4; 16],
             out,

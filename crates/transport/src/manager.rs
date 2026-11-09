@@ -1021,7 +1021,17 @@ impl LinkManager {
                     self.on_up(key, peer, hello, connection_id, version, remote)
                         .await
                 }
-                LinkReport::Message { peer, message } => {
+                LinkReport::Message { key, peer, message } => {
+                    if !self
+                        .inner
+                        .lock()
+                        .await
+                        .links
+                        .get(&peer)
+                        .is_some_and(|live| live.key == key)
+                    {
+                        return;
+                    }
                     let send_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
                     static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
                     let result = self
@@ -1043,9 +1053,9 @@ impl LinkManager {
                     let _ = result;
                 }
                 LinkReport::Down { key, peer, reason } => {
-                    let removed = {
+                    let (removed, pending) = {
                         let mut inner = self.inner.lock().await;
-                        inner.pending.remove(&key);
+                        let pending = inner.pending.remove(&key).is_some();
                         // Only the link that went down may leave the member list: a `Down` is
                         // matched against the *key* the manager handed that link, so a closed
                         // newcomer in the same direction as a live link cannot evict it.
@@ -1059,13 +1069,14 @@ impl LinkManager {
                         // Whichever link went away, a dialer waiting for this peer may have
                         // its turn now — the check inside only grants when nothing is left.
                         inner.release_dial_waiters(peer);
-                        removed
+                        (removed, pending)
                     };
                     if removed
-                        || matches!(
-                            reason,
-                            LinkDownReason::MembershipFull | LinkDownReason::Incompatible
-                        )
+                        || (pending
+                            && matches!(
+                                reason,
+                                LinkDownReason::MembershipFull | LinkDownReason::Incompatible
+                            ))
                     {
                         let _ = self
                             .events_tx
@@ -1174,26 +1185,10 @@ impl LinkManager {
         if !already_member {
             if let Err(full) = policy::admit_member(member_count, self.max_members) {
                 let _ = full;
-                let _ = pending
-                    .handle
-                    .send(fr::Message::ProtocolError {
-                        code: fr::ErrorCode::MembershipFull,
-                        related_seq: 0,
-                    })
-                    .await;
-                // The refusal is the last thing this link sends, and it must not be thrown
-                // away: closing here used to end the link immediately, and on Windows a close
-                // with anything of the peer's still unread sends a reset — a reset discards
-                // the frames the peer has not read, so the refused member saw
-                // `Io(... 10054)` instead of `MEMBERSHIP_FULL` in ~1 loaded run in 100
-                // (`mesh::the_membership_cap_refuses_the_extra_member`).
-                //
-                // The peer closes as soon as it has read the refusal, which ends this link
-                // through its own reader; a peer that does not is bounded by the liveness
-                // timeout («офлайн через 3 s без `Pong`»). The pending entry is already
-                // removed, so a retry is not blocked by this one.
-                pending.handle.invalidate_auxiliary();
-                drop(pending);
+                // The dedicated refusal slot seals normal traffic immediately. The link's
+                // bounded graceful cleanup flushes it, drains unread input, then aborts both
+                // halves even if a rejected peer keeps answering Pong.
+                pending.handle.refuse_membership(connection_id);
                 let _ = self
                     .events_tx
                     .send(LinkEvent::Down {
@@ -1976,6 +1971,52 @@ mod tests {
         assert_eq!(inner.discovered_routes[&peer], old);
         assert_eq!(inner.links[&peer].key, [5; 16]);
         inner.links.remove(&peer).unwrap().task.abort();
+    }
+
+    #[tokio::test]
+    async fn only_the_current_admitted_generation_publishes_messages() {
+        let (root, local, expected, _) = discovery_fixture("message-generation");
+        let local_id = local.node_id();
+        let peer = expected.node_id();
+        let mut manager = discovery_manager(local, &[peer]);
+        let (events, mut receiver) = mpsc::channel(8);
+        manager.events_tx = events;
+        let mut listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for (key, admitted, visible) in [
+            ([5; 16], false, false),
+            ([7; 16], true, false),
+            ([5; 16], true, true),
+            ([7; 16], true, true),
+            ([5; 16], true, false),
+        ] {
+            if admitted {
+                let mut inner = manager.inner.lock().await;
+                if !inner.links.contains_key(&peer) {
+                    insert_live(&mut inner, peer);
+                }
+                if key == [7; 16] && visible {
+                    inner.links.get_mut(&peer).unwrap().key = key;
+                }
+            }
+            manager
+                .on_message(
+                    ManagerMessage::Report(LinkReport::Message {
+                        key,
+                        peer,
+                        message: crate::convert::Inbound::Focus(fr::Message::OwnerState {
+                            serial: 1,
+                            owner: Some(peer),
+                            granted: true,
+                        }),
+                    }),
+                    local_id,
+                    &mut listener,
+                )
+                .await;
+            assert_eq!(receiver.try_recv().is_ok(), visible);
+        }
+        manager.kill_all().await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

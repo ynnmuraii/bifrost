@@ -271,6 +271,7 @@ pub enum Request {
     Abandon,
     /// `StartPairing`.
     StartPairing,
+    ClosePairingWindow,
     /// `PairWith`: success acknowledges the dial reaching a prompt, not a completed pair.
     PairWith,
     PairingRequest,
@@ -328,6 +329,7 @@ impl Request {
             Request::Claim => text(lang, Key::TakeControl),
             Request::Abandon => text(lang, Key::GiveControlBack),
             Request::StartPairing => text(lang, Key::OpenThePairingWindow),
+            Request::ClosePairingWindow => text(lang, Key::ClosePairingWindow),
             Request::PairWith => text(lang, Key::ConnectByAddress),
             Request::PairingRequest => text(lang, Key::PairingRequestIncoming),
             Request::SetPairingRequests => text(lang, Key::PairingRequests),
@@ -1077,7 +1079,7 @@ impl ViewModel {
         // A sentence from a previous core does not describe this connection.
         self.outcome = None;
         self.push_log(format!("Служба работает ({endpoint})"));
-        self.audio = crate::audio::AudioView::default();
+        self.audio.reset();
     }
 
     /// The service writes first-run config before opening this connection; read it now so
@@ -1110,7 +1112,7 @@ impl ViewModel {
             status.active_layout.clear();
         }
         self.inflight.clear();
-        self.audio = crate::audio::AudioView::default();
+        self.audio.reset();
         self.audio_player.replace_cards(Vec::new(), false);
         // History belongs to the lost core session, not to the last known status.
         self.clipboard_history.clear();
@@ -1841,7 +1843,8 @@ impl ViewModel {
             self.push_log("Окно сопряжения закрыто");
             self.pairing.window = None;
             self.pairing.window_deadline = None;
-            self.pairing.prompt = None;
+            // Window and ceremony identities differ; only a matching terminal result
+            // retires the SAS prompt, which may belong to an unrelated outgoing dial.
         }
     }
 
@@ -2837,6 +2840,7 @@ pub enum Action {
         /// Seconds the core keeps the window open (the protocol caps it at 120).
         window_s: u32,
     },
+    ClosePairingWindow,
     /// Dial the other computer's pairing address.
     PairWith(String),
     RequestPairing(ipc::RequestPairing),
@@ -3073,6 +3077,10 @@ impl Action {
                     window_s: *window_s,
                 }),
             ),
+            Action::ClosePairingWindow => (
+                Request::ClosePairingWindow,
+                Msg::ClosePairingWindow(ipc::ClosePairingWindow {}),
+            ),
             Action::RequestPairing(request) => (
                 Request::PairingRequest,
                 Msg::RequestPairing(request.clone()),
@@ -3266,7 +3274,7 @@ impl Bridge {
     /// Updater shutdown never invokes the service UI's force-stop fallback.
     pub(crate) fn shutdown_for_update(&mut self, now: Instant) {
         let id = self.view.begin_request(Request::Shutdown, now);
-        self.client.send(id, Msg::Shutdown(ipc::Shutdown {}));
+        self.send_request(id, Msg::Shutdown(ipc::Shutdown {}));
     }
 
     /// Sends one action where it belongs.
@@ -3282,7 +3290,19 @@ impl Bridge {
     /// Puts on the wire what the view model asked for itself: the automatic save, a re-read.
     fn send_outgoing(&mut self) {
         for (id, message) in self.view.take_outgoing() {
-            self.client.send(id, message);
+            self.send_request(id, message);
+        }
+    }
+
+    fn send_request(&mut self, id: u64, message: Msg) {
+        if !self.client.send(id, message) {
+            self.view.apply_op_result(
+                id,
+                ipc::OpResult {
+                    ok: false,
+                    error_code: "GUI_QUEUE_FULL".into(),
+                },
+            );
         }
     }
 
@@ -3301,18 +3321,24 @@ impl Bridge {
             } else {
                 self.view.begin_request(request, now)
             };
-            self.client.send(id, message);
+            self.send_request(id, message);
             // «Обновить» on the status screen asks for the document as well as the status.
             if let Some((request, message)) = action.extra_wire() {
                 let id = self.view.begin_request(request, now);
-                self.client.send(id, message);
+                self.send_request(id, message);
             }
             return;
         }
         match action {
             Action::StartCore => {
                 self.view.begin_service_start(now);
-                self.client.start_core();
+                if !self.client.start_core() {
+                    self.view.on_core_started(Err(text(
+                        self.view.look.language,
+                        Key::GuiQueueFull,
+                    )
+                    .into()));
+                }
             }
             Action::RestartCore => self.restart_core(now),
             Action::SetAutostart(enabled) => match crate::autostart::set_enabled(enabled) {
@@ -3396,7 +3422,13 @@ impl Bridge {
             crate::core_exit::Step::Exited => {
                 self.restart_wait = None;
                 self.view.settings.service.restart = Some(Restart::Starting);
-                self.client.start_core_in_unit(self.restart_unit.take());
+                if !self.client.start_core_in_unit(self.restart_unit.take()) {
+                    self.view.on_core_started(Err(text(
+                        self.view.look.language,
+                        Key::GuiQueueFull,
+                    )
+                    .into()));
+                }
             }
             crate::core_exit::Step::TimedOut => {
                 // Only terminate a PID this GUI actually launched, and only once.
@@ -3546,9 +3578,9 @@ enum Command {
 /// the window come alive without the user touching anything.
 pub struct GuiClient {
     /// Requests on their way to the thread; `None` after [`Drop`] closed the channel.
-    commands: Option<tokio::sync::mpsc::UnboundedSender<Command>>,
+    commands: Option<tokio::sync::mpsc::Sender<Command>>,
     /// Frames on their way back.
-    events: tokio::sync::mpsc::UnboundedReceiver<GuiEvent>,
+    events: tokio::sync::mpsc::Receiver<GuiEvent>,
     /// The thread running the runtime; kept so the channel is not the only thing alive.
     thread: Option<std::thread::JoinHandle<()>>,
     /// Called from the client thread after every event, so the window repaints on an IPC
@@ -3560,16 +3592,23 @@ pub struct GuiClient {
 /// does not know the toolkit.
 type Wake = Box<dyn Fn() + Send + Sync>;
 
+const EVENT_CAPACITY: usize = 128;
+const COMMAND_CAPACITY: usize = 64;
+const EVENTS_PER_FRAME: usize = 32;
+
 /// The sending half of the event channel, with the wake-up that goes with every event.
 #[derive(Clone)]
 struct Events {
-    tx: tokio::sync::mpsc::UnboundedSender<GuiEvent>,
+    tx: tokio::sync::mpsc::Sender<GuiEvent>,
     wake: std::sync::Arc<std::sync::OnceLock<Wake>>,
 }
 
 impl Events {
-    fn send(&self, event: GuiEvent) -> Result<(), tokio::sync::mpsc::error::SendError<GuiEvent>> {
-        let sent = self.tx.send(event);
+    async fn send(
+        &self,
+        event: GuiEvent,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<GuiEvent>> {
+        let sent = self.tx.send(event).await;
         if sent.is_ok() {
             if let Some(wake) = self.wake.get() {
                 wake();
@@ -3586,8 +3625,8 @@ impl GuiClient {
     /// answers «не отправлено», which is exactly what the window says on that host.
     pub fn start(endpoint: Option<Endpoint>, launch: Launch) -> Self {
         let lang = Lang::from_system();
-        let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (event_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, command_rx) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        let (event_tx, events) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
         let wake = std::sync::Arc::new(std::sync::OnceLock::new());
         let event_tx = Events {
             tx: event_tx,
@@ -3602,7 +3641,7 @@ impl GuiClient {
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = event_tx.send(GuiEvent::Disconnected {
+                        let _ = event_tx.tx.blocking_send(GuiEvent::Disconnected {
                             why: fill_named(
                                 lang,
                                 Key::CouldNotStartTalkingToTheServiceError,
@@ -3632,7 +3671,7 @@ impl GuiClient {
     pub fn send(&self, id: u64, message: Msg) -> bool {
         self.commands.as_ref().is_some_and(|commands| {
             commands
-                .send(Command::Send {
+                .try_send(Command::Send {
                     id,
                     message: Box::new(message),
                 })
@@ -3648,21 +3687,29 @@ impl GuiClient {
     fn start_core_in_unit(&self, unit: Option<String>) -> bool {
         self.commands
             .as_ref()
-            .is_some_and(|commands| commands.send(Command::StartCore(unit)).is_ok())
+            .is_some_and(|commands| commands.try_send(Command::StartCore(unit)).is_ok())
     }
 
     /// Asks the thread to dial again now.
     pub fn connect_again(&self) -> bool {
         self.commands
             .as_ref()
-            .is_some_and(|commands| commands.send(Command::ConnectAgain).is_ok())
+            .is_some_and(|commands| commands.try_send(Command::ConnectAgain).is_ok())
     }
 
-    /// Takes everything the thread has said since the last frame was drawn.
+    /// Folds a finite batch; bounded backpressure retains every event, including terminal ones.
     pub fn drain(&mut self) -> Vec<GuiEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.events.try_recv() {
+        let mut events = Vec::with_capacity(EVENTS_PER_FRAME);
+        for _ in 0..EVENTS_PER_FRAME {
+            let Ok(event) = self.events.try_recv() else {
+                break;
+            };
             events.push(event);
+        }
+        if !self.events.is_empty() {
+            if let Some(wake) = self.wake.get() {
+                wake();
+            }
         }
         events
     }
@@ -3674,6 +3721,7 @@ impl Drop for GuiClient {
         // returns and the runtime with it. Joining here keeps the window's shutdown ordered,
         // and the thread never blocks on the network — every await in it is cancellable.
         drop(self.commands.take());
+        self.events.close();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -3684,14 +3732,14 @@ impl Drop for GuiClient {
 async fn worker(
     endpoint: Option<Endpoint>,
     launch: Launch,
-    mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    mut commands: tokio::sync::mpsc::Receiver<Command>,
     events: Events,
 ) {
     let Some(endpoint) = endpoint else {
         // Nothing to connect to: the host has no resolvable endpoint at all. The window
         // still has to answer its buttons.
         while let Some(command) = commands.recv().await {
-            answer_offline(command, &launch, &events);
+            answer_offline(command, &launch, &events).await;
         }
         return;
     };
@@ -3699,6 +3747,9 @@ async fn worker(
     // every try, so an idle window with no service is not woken every 2 s.
     let mut last_failure: Option<String> = None;
     loop {
+        if commands.is_closed() {
+            return;
+        }
         match ::ipc::transport::connect(&endpoint).await {
             Ok(stream) => {
                 last_failure = None;
@@ -3709,24 +3760,26 @@ async fn worker(
                 #[cfg(not(unix))]
                 let pid = None;
                 let unit = pid.and_then(crate::core_exit::systemd_unit);
-                let _ = events.send(GuiEvent::Connected {
-                    endpoint: endpoint.describe(),
-                    pid,
-                    unit,
-                });
+                let _ = events
+                    .send(GuiEvent::Connected {
+                        endpoint: endpoint.describe(),
+                        pid,
+                        unit,
+                    })
+                    .await;
                 let mut link = ::ipc::GuiLink::new(stream);
                 // §4 of the build spec: on connect, ask for the status **and** the document.
                 // The app does that when it sees `Connected` (one request counter, one place
                 // that records deadlines), so this loop only carries the link.
                 if let Some(why) = serve(&mut link, &mut commands, &events).await {
-                    let _ = events.send(GuiEvent::Disconnected { why });
+                    let _ = events.send(GuiEvent::Disconnected { why }).await;
                 }
             }
             Err(error) => {
                 let why = error.to_string();
                 if last_failure.as_deref() != Some(why.as_str()) {
                     last_failure = Some(why.clone());
-                    let _ = events.send(GuiEvent::Disconnected { why });
+                    let _ = events.send(GuiEvent::Disconnected { why }).await;
                 }
             }
         }
@@ -3741,13 +3794,13 @@ async fn worker(
                     Some(Command::ConnectAgain) => break,
                     Some(Command::StartCore(unit)) => {
                         let started = launch_core_in_unit(&launch, unit.as_deref());
-                        let _ = events.send(GuiEvent::CoreStarted { started });
+                        let _ = events.send(GuiEvent::CoreStarted { started }).await;
                         // The core needs a moment before its endpoint exists; the retry below
                         // covers the rest, and on Windows `connect` already waits for a pipe.
                         wake.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(500));
                     }
                     Some(Command::Send { id, .. }) => {
-                        let _ = events.send(GuiEvent::NotSent { id });
+                        let _ = events.send(GuiEvent::NotSent { id }).await;
                     }
                 },
             }
@@ -3766,7 +3819,7 @@ async fn worker(
 /// core accepts a `ClientStream`, while the window dials a `NamedPipeClient` / `UnixStream`.
 async fn serve<S>(
     link: &mut ::ipc::GuiLink<S>,
-    commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+    commands: &mut tokio::sync::mpsc::Receiver<Command>,
     events: &Events,
 ) -> Option<String>
 where
@@ -3791,14 +3844,18 @@ where
         };
         match step {
             Step::Frame(frame) => {
-                if events.send(GuiEvent::Frame(frame)).is_err() {
+                if events.send(GuiEvent::Frame(frame)).await.is_err() {
                     return None;
                 }
             }
             Step::Failed(error) => return Some(error),
             Step::Command(None) => return None,
             Step::Command(Some(Command::Send { id, message })) => {
-                if let Err(error) = link.send(id, *message).await {
+                let sent = tokio::select! {
+                    result = link.send(id, *message) => result,
+                    () = events.tx.closed() => return None,
+                };
+                if let Err(error) = sent {
                     return Some(error.to_string());
                 }
             }
@@ -3813,21 +3870,21 @@ where
                 } else {
                     Err(text(lang, Key::TheServiceIsAlreadyRunningAndAnswering).to_owned())
                 };
-                let _ = events.send(GuiEvent::CoreStarted { started });
+                let _ = events.send(GuiEvent::CoreStarted { started }).await;
             }
         }
     }
 }
 
 /// Answers a command while no link exists.
-fn answer_offline(command: Command, launch: &Launch, events: &Events) {
+async fn answer_offline(command: Command, launch: &Launch, events: &Events) {
     match command {
         Command::Send { id, .. } => {
-            let _ = events.send(GuiEvent::NotSent { id });
+            let _ = events.send(GuiEvent::NotSent { id }).await;
         }
         Command::StartCore(unit) => {
             let started = launch_core_in_unit(launch, unit.as_deref());
-            let _ = events.send(GuiEvent::CoreStarted { started });
+            let _ = events.send(GuiEvent::CoreStarted { started }).await;
         }
         Command::ConnectAgain => {}
     }
@@ -4274,6 +4331,7 @@ fn message_name(msg: &Msg) -> &'static str {
         Msg::GetStatus(_) => "GetStatus",
         Msg::GetTopology(_) => "GetTopology",
         Msg::StartPairing(_) => "StartPairing",
+        Msg::ClosePairingWindow(_) => "ClosePairingWindow",
         Msg::PairWith(_) => "PairWith",
         Msg::RequestPairing(_) => "RequestPairing",
         Msg::AnswerPairingRequest(_) => "AnswerPairingRequest",
@@ -4329,6 +4387,7 @@ fn message_name(msg: &Msg) -> &'static str {
 /// What a code means, in a sentence the owner can act on.
 fn code_label(lang: Lang, code: &str) -> String {
     match code {
+        "GUI_QUEUE_FULL" => text(lang, Key::GuiQueueFull).to_owned(),
         "" => text(lang, Key::NoCode).to_owned(),
         "EMERGENCY_HOTKEY" => text(lang, Key::NoEmergencyKey).to_owned(),
         "RECEIVER_TAKEOVER" => text(lang, Key::TheSessionCannotBeEndedWithPhysicalInput).to_owned(),
@@ -4391,6 +4450,7 @@ fn success_text(lang: Lang, request: Request) -> String {
         Request::Shutdown => text(lang, Key::TheServiceIsStopping2).to_owned(),
         Request::ExportDiagnostics => text(lang, Key::TheDiagnosticsAreSaved).to_owned(),
         Request::StartPairing => text(lang, Key::ThePairingWindowIsOpen).to_owned(),
+        Request::ClosePairingWindow => text(lang, Key::ThePairingWindowIsClosed).to_owned(),
         Request::GetStatus | Request::GetTopology => text(lang, Key::TheCoreAnswered).to_owned(),
         Request::Audio(_) => text(lang, Key::AudioSettings).to_owned(),
     }
@@ -4437,8 +4497,8 @@ mod restart_tests {
                 ..Default::default()
             },
         );
-        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
-        let (_events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        let (_events, receiver) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
         let client = GuiClient {
             commands: Some(commands),
             events: receiver,
@@ -4502,12 +4562,12 @@ mod restart_tests {
     async fn systemd_reconnection_before_queued_start_is_success_not_a_second_launch() {
         let (stream, _peer) = tokio::io::duplex(128);
         let mut link = ::ipc::GuiLink::new(stream);
-        let (commands, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
         commands
-            .send(Command::StartCore(Some("fixture.service".into())))
+            .try_send(Command::StartCore(Some("fixture.service".into())))
             .unwrap();
         drop(commands);
-        let (tx, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut receiver) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
         let events = Events {
             tx,
             wake: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -4521,4 +4581,153 @@ mod restart_tests {
         ));
         assert!(receiver.try_recv().is_err());
     }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+
+    fn client() -> (GuiClient, Events) {
+        let (commands, _requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        let (tx, events) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
+        let wake = std::sync::Arc::new(std::sync::OnceLock::new());
+        (
+            GuiClient {
+                commands: Some(commands),
+                events,
+                thread: None,
+                wake: wake.clone(),
+            },
+            Events { tx, wake },
+        )
+    }
+
+    #[tokio::test]
+    async fn bounded_ingress_backpressures_without_dropping_replies_or_disconnects() {
+        let (mut client, events) = client();
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        client.set_wake({
+            let wakes = wakes.clone();
+            move || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        for id in 1..=EVENT_CAPACITY {
+            events
+                .send(GuiEvent::Frame(Box::new(GuiFrame {
+                    request_id: id as u64,
+                    msg: Some(Msg::OpResult(ipc::OpResult {
+                        ok: true,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })))
+                .await
+                .unwrap();
+        }
+        assert_eq!(events.tx.capacity(), 0);
+        let terminal = tokio::spawn(async move {
+            events
+                .send(GuiEvent::Disconnected {
+                    why: "terminal".into(),
+                })
+                .await
+                .unwrap();
+            events
+                .send(GuiEvent::Connected {
+                    endpoint: "new epoch".into(),
+                    pid: None,
+                    unit: None,
+                })
+                .await
+                .unwrap();
+        });
+        let before = wakes.load(std::sync::atomic::Ordering::Relaxed);
+        let first = client.drain();
+        assert_eq!(first.len(), EVENTS_PER_FRAME);
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "backlog explicitly repaints"
+        );
+        let mut seen = first;
+        while !client.events.is_empty() {
+            let batch = client.drain();
+            assert!(batch.len() <= EVENTS_PER_FRAME);
+            seen.extend(batch);
+        }
+        terminal.await.unwrap();
+        seen.extend(client.drain());
+        assert_eq!(seen.len(), EVENT_CAPACITY + 2);
+        for (index, event) in seen[..EVENT_CAPACITY].iter().enumerate() {
+            assert!(
+                matches!(event, GuiEvent::Frame(frame) if frame.request_id == (index + 1) as u64)
+            );
+        }
+        assert!(
+            matches!(&seen[EVENT_CAPACITY], GuiEvent::Disconnected { why } if why == "terminal")
+        );
+        assert!(matches!(
+            &seen[EVENT_CAPACITY + 1],
+            GuiEvent::Connected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_gui_cancels_a_blocked_outgoing_write() {
+        let (stream, _unread_peer) = tokio::io::duplex(1);
+        let mut link = ::ipc::GuiLink::new(stream);
+        let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        commands
+            .try_send(Command::Send {
+                id: 1,
+                message: Box::new(Msg::GetStatus(ipc::GetStatus {})),
+            })
+            .unwrap();
+        let (tx, receiver) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
+        let events = Events {
+            tx,
+            wake: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+        let serving = serve(&mut link, &mut requests, &events);
+        let close = async {
+            tokio::task::yield_now().await;
+            drop(receiver);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(serving, close)
+        })
+        .await
+        .expect("GUI drop must not join a blocked IPC writer forever");
+        assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_full_outgoing_queue_rejects_visibly_without_leaving_an_inflight_request() {
+    let (commands, _receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+    let (_events, events) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
+    let client = GuiClient {
+        commands: Some(commands),
+        events,
+        thread: None,
+        wake: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    for id in 0..COMMAND_CAPACITY {
+        assert!(client.send(id as u64, Msg::GetStatus(ipc::GetStatus {})));
+    }
+    assert!(!client.send(999, Msg::GetStatus(ipc::GetStatus {})));
+    let view = ViewModel::new(
+        CoreEndpoint::Ready {
+            description: "fixture".into(),
+        },
+        LocalConfig::default(),
+    );
+    let mut bridge = Bridge::new(view, client);
+    bridge.dispatch(Action::Claim, Instant::now());
+    assert!(bridge.view.inflight.is_empty());
+    assert_eq!(
+        bridge.view.outcome.as_ref().unwrap().text,
+        text(bridge.view.look.language, Key::GuiQueueFull)
+    );
 }

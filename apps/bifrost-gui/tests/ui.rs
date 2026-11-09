@@ -199,6 +199,7 @@ fn offline_unpair_fallback_removes_the_peer_in_one_click() {
 /// the frame's own coordinates), the rectangles it filled, and what it produced.
 struct Frame {
     texts: Vec<(String, egui::Rect)>,
+    visible_texts: Vec<(String, egui::Rect)>,
     rects: Vec<egui::Rect>,
     output: Output,
 }
@@ -249,11 +250,12 @@ impl Harness {
         });
         let mut frame = Frame {
             texts: Vec::new(),
+            visible_texts: Vec::new(),
             rects: Vec::new(),
             output: produced,
         };
         for clipped in &output.shapes {
-            collect(&clipped.shape, &mut frame);
+            collect(&clipped.shape, clipped.clip_rect, &mut frame);
         }
         assert!(
             output
@@ -278,14 +280,26 @@ impl Harness {
     }
 }
 
-fn collect(shape: &Shape, frame: &mut Frame) {
+fn collect(shape: &Shape, clip_rect: egui::Rect, frame: &mut Frame) {
     match shape {
-        Shape::Text(text) => frame.texts.push((
-            text.galley.text().to_owned(),
-            text.galley.mesh_bounds.translate(text.pos.to_vec2()),
-        )),
+        Shape::Text(text) => {
+            let bounds = text.galley.mesh_bounds.translate(text.pos.to_vec2());
+            frame.texts.push((text.galley.text().to_owned(), bounds));
+            if clip_rect.contains_rect(bounds) {
+                let painted = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.glyphs)
+                    .map(|glyph| glyph.chr)
+                    .collect();
+                frame.visible_texts.push((painted, bounds));
+            }
+        }
         Shape::Rect(rect) => frame.rects.push(rect.rect),
-        Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, frame)),
+        Shape::Vec(shapes) => shapes
+            .iter()
+            .for_each(|shape| collect(shape, clip_rect, frame)),
         _ => {}
     }
 }
@@ -387,7 +401,7 @@ fn empty_and_disabled_discovery_preserve_map_labels_and_manual_pairing() {
 }
 
 #[test]
-fn discovered_rows_keep_identity_window_state_and_manual_pairing_visible() {
+fn discovered_rows_keep_identity_and_manual_pairing_visible() {
     for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
         for theme in [Theme::Light, Theme::Dark] {
             for size in [egui::vec2(1280.0, 720.0), egui::vec2(1745.0, 1091.0)] {
@@ -414,6 +428,8 @@ fn discovered_rows_keep_identity_window_state_and_manual_pairing_visible() {
                         supports_pairing_requests: true,
                     },
                 ];
+                let address = "192.168.1.60:47901";
+                vm.pairing.address = address.to_owned();
                 let mut harness = Harness::new();
                 harness.frame(&vm, false, size, Vec::new());
                 let frame = harness.frame(&vm, false, size, Vec::new());
@@ -427,8 +443,6 @@ fn discovered_rows_keep_identity_window_state_and_manual_pairing_visible() {
                         "192.168.1.42:47901",
                         "Linux",
                         ui_text::text(lang, ui_text::Key::PairingWindowOpen),
-                        ui_text::text(lang, ui_text::Key::PairingWindowClosed),
-                        &ui_text::text(lang, ui_text::Key::ConnectByAddress2).to_uppercase(),
                     ],
                 );
                 for (text, bounds) in &frame.texts {
@@ -436,6 +450,19 @@ fn discovered_rows_keep_identity_window_state_and_manual_pairing_visible() {
                         assert!(bounds.top() >= 0.0 && bounds.bottom() < size.y);
                     }
                 }
+                let manual_address = frame
+                    .texts
+                    .iter()
+                    .find(|(label, _)| label == address)
+                    .expect("manual pairing remains visible beside discovered computers")
+                    .1;
+                assert!(manual_address.top() >= 0.0 && manual_address.bottom() < size.y);
+                harness.frame(&vm, false, size, click_at(manual_address.center()));
+                let frame = harness.frame(&vm, false, size, vec![key(egui::Key::Enter)]);
+                assert_eq!(
+                    frame.output.actions,
+                    vec![Action::PairWith(address.to_owned())]
+                );
             }
         }
     }
@@ -938,7 +965,6 @@ fn the_pairing_dock_shows_the_real_window_countdown_and_the_real_code() {
         &[
             "192.168.1.24:47901",
             "Ждём, пока другой компьютер подключится…",
-            "Закрыть окно · скоро",
         ],
     );
     assert!(
@@ -1078,12 +1104,12 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
     let mut harness = Harness::new();
     harness.settle(&vm, false);
 
-    // The rail: 64 px at the right edge, the first button's centre is 12 + 22 below the bar.
+    // Persistent rail captions leave the icon centred in the 120 px rail.
     let frame = harness.frame(
         &vm,
         false,
         SIZE,
-        click_at(egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + 22.0)),
+        click_at(egui::pos2(SIZE.x - 60.0, 60.0 + 12.0 + 22.0)),
     );
     assert!(
         frame
@@ -1096,8 +1122,8 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
 
     // Appearance follows the service sections, including Audio.
     let at = egui::pos2(
-        SIZE.x - 32.0,
-        60.0 + 12.0 + Modal::ALL.len() as f32 * 50.0 + 22.0,
+        SIZE.x - 60.0,
+        60.0 + 12.0 + Modal::ALL.len() as f32 * 62.0 + 22.0,
     );
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(frame.output.actions.contains(&Action::ToggleAppearance));
@@ -1105,15 +1131,15 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
         .iter()
         .position(|modal| *modal == Modal::Audio)
         .unwrap();
-    let at = egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + audio_slot as f32 * 50.0 + 22.0);
+    let at = egui::pos2(SIZE.x - 60.0, 60.0 + 12.0 + audio_slot as f32 * 62.0 + 22.0);
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(frame
         .output
         .actions
         .contains(&Action::ToggleModal(Modal::Audio)));
     let at = egui::pos2(
-        SIZE.x - 32.0,
-        60.0 + 12.0 + (Modal::ALL.len() + 1) as f32 * 50.0 + 22.0,
+        SIZE.x - 60.0,
+        60.0 + 12.0 + (Modal::ALL.len() + 1) as f32 * 62.0 + 22.0,
     );
     let frame = harness.frame(&vm, false, SIZE, click_at(at));
     assert!(frame.output.actions.contains(&Action::OpenAudioPlayer));
@@ -1122,7 +1148,7 @@ fn clicking_the_rail_opens_a_section_and_the_theme_button_asks_for_the_other_the
         &vm,
         false,
         SIZE,
-        click_at(egui::pos2(SIZE.x - 32.0, SIZE.y - 40.0)),
+        click_at(egui::pos2(SIZE.x - 60.0, SIZE.y - 40.0)),
     );
     assert!(
         frame.output.actions.is_empty(),
@@ -1475,35 +1501,6 @@ fn map_zoom_buttons_and_wheel_only_change_gui_local_look() {
         .actions
         .iter()
         .any(|action| matches!(action, Action::SetLook(_))));
-}
-
-#[test]
-fn removed_layout_controls_stay_absent_and_pairing_close_is_disabled() {
-    let mut vm = connected();
-    let mut harness = Harness::new();
-    let frame = harness.settle(&vm, false);
-    for removed in [
-        "ПРИМЕНЕНО",
-        "Расположить автоматически",
-        "Применить",
-        "СТОРОНА",
-    ] {
-        assert!(!shows(&frame, removed), "{removed} must not be drawn");
-    }
-    vm.modal = None;
-    vm.apply(event(Msg::PairingWindow(protocol::ipc::PairingWindow {
-        open: true,
-        address: "127.0.0.1:47901".to_owned(),
-        seconds_remaining: 60,
-        attempt_id: support::attempt_id(),
-    })));
-    harness.settle(&vm, false);
-    let at = text_position(&mut harness, &vm, "Закрыть окно · скоро");
-    let frame = harness.frame(&vm, false, SIZE, click_at(at));
-    assert!(
-        frame.output.actions.is_empty(),
-        "unimplemented close must not send a command"
-    );
 }
 
 #[test]
@@ -2136,9 +2133,324 @@ fn audio_sidebar_destinations_have_distinct_accessible_names_and_tooltips() {
             .position(|modal| *modal == Modal::Audio)
             .unwrap();
         for (slot, label) in [(settings_slot, settings), (Modal::ALL.len() + 1, player)] {
-            let at = egui::pos2(SIZE.x - 32.0, 60.0 + 12.0 + slot as f32 * 50.0 + 22.0);
+            let at = egui::pos2(SIZE.x - 60.0, 60.0 + 12.0 + slot as f32 * 62.0 + 22.0);
             let frame = harness.frame(&vm, false, SIZE, vec![egui::Event::PointerMoved(at)]);
             expect(&frame, &[label]);
         }
+    }
+}
+
+#[test]
+fn modal_keyboard_focus_stays_on_its_layer_and_returns_to_the_invoker() {
+    let mut vm = connected();
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    let slot = Modal::ALL
+        .iter()
+        .position(|modal| *modal == Modal::Pairs)
+        .unwrap();
+    let launcher = egui::pos2(SIZE.x - 60.0, 60.0 + 12.0 + slot as f32 * 62.0 + 22.0);
+    let frame = harness.frame(&vm, false, SIZE, click_at(launcher));
+    assert!(frame
+        .output
+        .actions
+        .contains(&Action::ToggleModal(Modal::Pairs)));
+    let invoker = harness
+        .ctx
+        .memory(|memory| memory.focused())
+        .expect("the activated navigation control owns focus");
+    vm.local(&Action::ToggleModal(Modal::Pairs));
+    harness.settle(&vm, false);
+    harness.now += Duration::from_secs(1);
+    harness.frame(&vm, false, SIZE, Vec::new());
+    let close = harness
+        .ctx
+        .memory(|memory| memory.focused())
+        .expect("opening a modal focuses its Close control");
+
+    let mut reverse_tab = key(egui::Key::Tab);
+    if let egui::Event::Key { modifiers, .. } = &mut reverse_tab {
+        modifiers.shift = true;
+    }
+    harness.frame(&vm, false, SIZE, vec![reverse_tab]);
+    let frame = harness.frame(&vm, false, SIZE, Vec::new());
+    let focus = harness
+        .ctx
+        .memory(|memory| memory.focused())
+        .expect("reverse traversal wraps to a visible modal action");
+    let response = harness.ctx.read_response(focus).unwrap();
+    assert_ne!(focus, close);
+    assert_eq!(
+        Some(response.layer_id),
+        harness.ctx.memory(|memory| memory.top_modal_layer())
+    );
+    assert!(
+        frame.visible_texts.iter().any(|(text, bounds)| {
+            text == ui_text::text(vm.look.language, ui_text::Key::OpenThePairingWindow2)
+                && response.rect.contains(bounds.center())
+        }),
+        "the focused modal action must have a fully painted label, not the matching underlay label"
+    );
+    let frame = harness.frame(&vm, false, SIZE, vec![key(egui::Key::Enter)]);
+    assert!(frame
+        .output
+        .actions
+        .contains(&Action::StartPairing { window_s: 120 }));
+
+    harness.frame(&vm, false, SIZE, vec![key(egui::Key::Tab)]);
+    harness.frame(&vm, false, SIZE, Vec::new());
+    assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(close));
+    let frame = harness.frame(&vm, false, SIZE, vec![key(egui::Key::Escape)]);
+    assert!(frame.output.actions.contains(&Action::CloseModal));
+    vm.local(&Action::CloseModal);
+    harness.frame(&vm, false, SIZE, Vec::new());
+    assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(invoker));
+    harness.frame(&vm, false, SIZE, Vec::new());
+    assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(invoker));
+}
+
+#[test]
+fn escape_dismisses_display_properties_before_the_open_pairing_window() {
+    let mut vm = connected();
+    vm.apply(event(Msg::PairingWindow(ipc::PairingWindow {
+        open: true,
+        address: "192.168.1.24:47901".into(),
+        seconds_remaining: 120,
+        attempt_id: vec![1; 16],
+    })));
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    let node = &vm.editor.nodes[0];
+    harness.state.selected_display = Some((node.node_id.clone(), node.displays[0].id.clone()));
+    harness.settle(&vm, false);
+    let first = harness.frame(&vm, false, SIZE, vec![key(egui::Key::Escape)]);
+    assert!(harness.state.selected_display.is_none());
+    assert!(!first.output.actions.contains(&Action::ClosePairingWindow));
+    let second = harness.frame(&vm, false, SIZE, vec![key(egui::Key::Escape)]);
+    assert!(second.output.actions.contains(&Action::ClosePairingWindow));
+}
+
+#[test]
+fn popup_escape_does_not_also_dismiss_its_containing_dialog() {
+    let mut vm = connected();
+    vm.modal = Some(Modal::Audio);
+    vm.audio.available = true;
+    vm.audio.status = Some(ipc::AudioStatus {
+        revision: 1,
+        config: Some(vm.audio.draft.clone()),
+        ..Default::default()
+    });
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    harness.now += Duration::from_secs(1);
+    harness.settle(&vm, false);
+    let at = text_position(
+        &mut harness,
+        &vm,
+        ui_text::text(vm.look.language, ui_text::Key::AudioNoTarget),
+    );
+    harness.frame(&vm, false, SIZE, click_at(at));
+    assert!(egui::Popup::is_any_open(&harness.ctx));
+    let frame = harness.frame(&vm, false, SIZE, vec![key(egui::Key::Escape)]);
+    assert!(!frame.output.actions.contains(&Action::CloseModal));
+    assert!(!egui::Popup::is_any_open(&harness.ctx));
+}
+
+#[test]
+fn reverse_tab_reveals_the_scrolled_audio_checkbox() {
+    let mut vm = connected();
+    vm.modal = Some(Modal::Audio);
+    vm.audio.available = true;
+    vm.audio.status = Some(ipc::AudioStatus {
+        revision: 1,
+        config: Some(vm.audio.draft.clone()),
+        ..Default::default()
+    });
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    harness.now += Duration::from_secs(1);
+    harness.settle(&vm, false);
+    let close = harness.ctx.memory(|memory| memory.focused()).unwrap();
+    let advanced = text_position(
+        &mut harness,
+        &vm,
+        ui_text::text(vm.look.language, ui_text::Key::AudioAdvanced),
+    );
+    harness.frame(&vm, false, SIZE, click_at(advanced));
+    for _ in 0..20 {
+        harness.frame(&vm, false, SIZE, Vec::new());
+    }
+    // Start from the actual Close response captured on opening, not a fabricated ID.
+    harness.ctx.memory_mut(|memory| memory.request_focus(close));
+    let frame = harness.frame(&vm, false, SIZE, Vec::new());
+    let label = ui_text::text(vm.look.language, ui_text::Key::AudioAllowDefaultMic);
+    assert!(!frame.visible_texts.iter().any(|(text, _)| text == label));
+
+    let mut reverse_tab = key(egui::Key::Tab);
+    if let egui::Event::Key { modifiers, .. } = &mut reverse_tab {
+        modifiers.shift = true;
+    }
+    harness.frame(&vm, false, SIZE, vec![reverse_tab]);
+    let mut frame = harness.frame(&vm, false, SIZE, Vec::new());
+    for _ in 0..24 {
+        frame = harness.frame(&vm, false, SIZE, Vec::new());
+    }
+    let focused = harness.ctx.memory(|memory| memory.focused()).unwrap();
+    let response = harness.ctx.read_response(focused).unwrap();
+    assert!(
+        frame
+            .visible_texts
+            .iter()
+            .any(|(text, bounds)| { text == label && response.rect.contains(bounds.center()) }),
+        "reverse traversal must reveal the focused checkbox without manual scrolling"
+    );
+}
+
+#[test]
+fn compact_pairing_preserves_readable_map_and_navigation_captions() {
+    for lang in [ui_text::Lang::Ru, ui_text::Lang::En] {
+        let mut vm = connected();
+        vm.look.language = lang;
+        vm.look.dock_open = true;
+        vm.config.display_name = "REVIEW-WORKSTATION".into();
+        let mut doc = two_node_doc(15);
+        doc.members[0]
+            .display_name
+            .clone_from(&vm.config.display_name);
+        vm.apply(event(Msg::TopologyDoc(doc)));
+        let mut status = status_with("LOCAL");
+        status.members[0]
+            .display_name
+            .clone_from(&vm.config.display_name);
+        vm.apply(event(Msg::Status(status)));
+        let mut harness = Harness::new();
+        let size = egui::vec2(960.0, 720.0);
+        harness.frame(&vm, false, size, Vec::new());
+        harness.now += Duration::from_secs(1);
+        let frame = harness.frame(&vm, false, size, Vec::new());
+        let model = vm.map_model();
+        for node in &model.nodes {
+            assert!(
+                frame
+                    .visible_texts
+                    .iter()
+                    .any(|(text, bounds)| text == &node.name && bounds.bottom() < 400.0),
+                "computer-name glyphs remain unelided and unclipped in the compact map"
+            );
+        }
+        assert!(frame
+            .rects
+            .iter()
+            .any(|rect| rect.width() >= 90.0 && rect.height() >= 45.0 && rect.bottom() < 400.0));
+        for modal in Modal::ALL {
+            assert!(frame
+                .texts
+                .iter()
+                .any(|(label, bounds)| label == modal.title(lang)
+                    && bounds.left() >= 840.0
+                    && bounds.right() <= 960.0));
+        }
+    }
+}
+
+#[test]
+fn compact_pairing_close_is_reachable_by_scrolling_without_resizing() {
+    let mut vm = connected();
+    vm.look.dock_open = true;
+    vm.config.listen_address = "0.0.0.0".into();
+    vm.apply(event(Msg::PairingWindow(ipc::PairingWindow {
+        open: true,
+        address: "0.0.0.0:47901".into(),
+        seconds_remaining: 120,
+        attempt_id: vec![1; 16],
+    })));
+    let size = egui::vec2(960.0, 720.0);
+    let mut harness = Harness::new();
+    harness.frame(&vm, false, size, Vec::new());
+    let mut frame = harness.frame(&vm, false, size, Vec::new());
+    let label = ui_text::text(vm.look.language, ui_text::Key::ClosePairingWindow);
+    let mut close_at = None;
+    for _ in 0..12 {
+        if let Some((_, bounds)) = frame.visible_texts.iter().find(|(text, _)| text == label) {
+            close_at = Some(bounds.center());
+            break;
+        }
+        harness.frame(
+            &vm,
+            false,
+            size,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(size.x / 2.0, size.y - 70.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -120.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..8 {
+            frame = harness.frame(&vm, false, size, Vec::new());
+        }
+    }
+    let close_at = close_at.expect("Close becomes fully visible without changing window size");
+    let frame = harness.frame(&vm, false, size, click_at(close_at));
+    assert!(frame.output.actions.contains(&Action::ClosePairingWindow));
+}
+
+#[test]
+fn pairing_close_and_rename_are_real_discoverable_actions() {
+    let mut vm = connected();
+    vm.apply(event(Msg::PairingWindow(ipc::PairingWindow {
+        open: true,
+        address: "192.168.1.24:47901".into(),
+        seconds_remaining: 120,
+        attempt_id: vec![1; 16],
+    })));
+    let mut harness = Harness::new();
+    harness.settle(&vm, false);
+    for (key, action) in [
+        (ui_text::Key::ClosePairingWindow, Action::ClosePairingWindow),
+        (ui_text::Key::RenameComputer, Action::OpenConfigFile),
+    ] {
+        let at = text_position(&mut harness, &vm, ui_text::text(vm.look.language, key));
+        let frame = harness.frame(&vm, false, SIZE, click_at(at));
+        assert!(frame.output.actions.contains(&action));
+    }
+}
+
+#[test]
+fn cached_map_reuses_stable_presentation_without_stale_focus_language_or_drag() {
+    let mut vm = connected();
+    let mut cache = bifrost_gui::view_model::layout::MapCache::default();
+    let nodes = cache.get(&vm).nodes.as_ptr();
+    assert_eq!(
+        nodes,
+        cache.get(&vm).nodes.as_ptr(),
+        "stable paints reuse node labels and links"
+    );
+    for change in [
+        "focus",
+        "language",
+        "drag",
+        "guard",
+        "version",
+        "disconnect",
+    ] {
+        match change {
+            "focus" => vm.status = Some(status_with("REMOTE")),
+            "language" => vm.look.language = ui_text::Lang::En,
+            "drag" => vm.editor.placement[0].x += 30.0,
+            "guard" => vm.status.as_mut().unwrap().game_guard_reason = "fullscreen".into(),
+            "version" => {
+                vm.app_versions.insert(PEER_NODE.into(), "999.0.0".into());
+            }
+            _ => vm.on_disconnected("fixture".into()),
+        }
+        assert_eq!(
+            cache.get(&vm),
+            &vm.map_model(),
+            "{change} must invalidate independently of topology revision"
+        );
     }
 }

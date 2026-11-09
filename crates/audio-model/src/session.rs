@@ -330,6 +330,11 @@ pub enum Input {
     ChildPrepared(SessionView),
     /// The validated StartSession command was written; native startup is still unconfirmed.
     ChildStartIssued(SessionView),
+    /// The exact StartSession request was rejected before native registration.
+    ChildStartRejected {
+        view: SessionView,
+        reason: Reason,
+    },
     ChildStarted(SessionView),
     PathReady(SessionView),
     Buffering(SessionView),
@@ -379,6 +384,9 @@ impl Session {
             self.view.phase,
             Phase::Stopped | Phase::Failed | Phase::DevicePaused
         )
+    }
+    fn occupied(&self) -> bool {
+        self.live() || self.start_issued || self.started
     }
     fn terminate(
         &mut self,
@@ -833,7 +841,7 @@ impl ControlPlane {
                 if kind != keys::StreamKind::System {
                     return Err(Error::Refused(Reason::UnsupportedFormat));
                 }
-                if peer.session.as_ref().is_some_and(Session::live) {
+                if peer.session.as_ref().is_some_and(Session::occupied) {
                     return Err(Error::Refused(Reason::RateLimited));
                 }
                 if !peer.reserve_request(request_id, now) {
@@ -884,7 +892,7 @@ impl ControlPlane {
                                 Err(Reason::ConsentRequired)
                             } else if !self.worker.is_some_and(|worker| worker.render) {
                                 Err(Reason::DeviceUnavailable)
-                            } else if peer.session.as_ref().is_some_and(Session::live)
+                            } else if peer.session.as_ref().is_some_and(Session::occupied)
                                 || listener_full && pending.is_none()
                             {
                                 Err(Reason::RateLimited)
@@ -1069,6 +1077,16 @@ impl ControlPlane {
                 );
                 out.push(Effect::PublishStatus);
             }
+            Input::ChildStartRejected { view, reason } => {
+                let peer = self.peer_mut(view.parent)?;
+                let notify = peer.support.control && peer.trusted;
+                let entry = checked_entry(peer, view)?;
+                if !entry.start_issued || entry.started {
+                    return Err(Error::InvalidState);
+                }
+                entry.start_issued = false;
+                entry.terminate(reason, true, notify, now, out);
+            }
             Input::ChildFailed { view, reason } => {
                 let peer = self.peer_mut(view.parent)?;
                 let notify = peer.support.control && peer.trusted;
@@ -1076,12 +1094,18 @@ impl ControlPlane {
             }
             Input::ChildStopped(view) => {
                 let entry = self.entry_mut(view)?;
-                if !matches!(entry.view.phase, Phase::Stopping | Phase::Stopped) {
+                if !matches!(
+                    entry.view.phase,
+                    Phase::Stopping | Phase::Stopped | Phase::Failed | Phase::DevicePaused
+                ) || matches!(entry.view.phase, Phase::Failed | Phase::DevicePaused)
+                    && !entry.start_issued
+                    && !entry.started
+                {
                     return Err(Error::InvalidState);
                 }
                 entry.start_issued = false;
                 entry.started = false;
-                if entry.view.phase == Phase::Stopped {
+                if entry.view.phase != Phase::Stopping {
                     return Ok(());
                 }
                 entry.view.phase = Phase::Stopped;
@@ -1383,7 +1407,7 @@ impl ControlPlane {
         self.peers
             .iter()
             .filter(|peer| {
-                peer.session.as_ref().is_some_and(Session::live)
+                peer.session.as_ref().is_some_and(Session::occupied)
                     || peer
                         .pending_request
                         .as_ref()
@@ -1427,7 +1451,8 @@ impl ControlPlane {
                             Err(Reason::RoleConflict)
                         } else if request.consent_revision != peer.remote_revision {
                             Err(Reason::ConsentRequired)
-                        } else if listener_full || peer.session.as_ref().is_some_and(Session::live)
+                        } else if listener_full
+                            || peer.session.as_ref().is_some_and(Session::occupied)
                         {
                             Err(Reason::RateLimited)
                         } else if !worker.is_some_and(|worker| worker.render) {
@@ -1528,7 +1553,7 @@ impl ControlPlane {
                         }
                     })
                     .and_then(|()| {
-                        if peer.session.as_ref().is_some_and(Session::live) {
+                        if peer.session.as_ref().is_some_and(Session::occupied) {
                             Err(Reason::RateLimited)
                         } else {
                             Ok(())
@@ -1708,6 +1733,8 @@ impl ControlPlane {
                 peer.finish_request(Err(Reason::WorkerLost), out);
                 if let Some(session) = &mut peer.session {
                     session.terminate(Reason::WorkerLost, true, peer.support.control, now, out);
+                    session.start_issued = false;
+                    session.started = false;
                 }
             }
             out.push(Effect::PublishStatus);

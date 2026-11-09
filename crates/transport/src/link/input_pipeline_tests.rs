@@ -855,6 +855,14 @@ async fn independent_router_deadline_returns_control_within_ttl_plus_100() {
         .with_persisted_ownership(1, Some((1, local)));
         router.handle(
             0,
+            fr::Input::Agent(fr::AgentEvent::PressedState {
+                keys: Vec::new(),
+                buttons: Vec::new(),
+                known: true,
+            }),
+        );
+        router.handle(
+            0,
             fr::Input::Hello {
                 peer,
                 hello: fr::PeerHello {

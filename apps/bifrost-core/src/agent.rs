@@ -818,7 +818,8 @@ impl Supervisor {
         match ready {
             Ok(Ok(frame)) => {
                 if !matches!(frame.msg, Some(Msg::Ready(_))) {
-                    tracing::warn!("recovery agent did not report AgentReady first");
+                    self.stop().await;
+                    return Err("recovery agent did not report AgentReady first".to_owned());
                 }
             }
             Ok(Err(error)) => {
@@ -830,21 +831,27 @@ impl Supervisor {
                 return Err("recovery agent stayed silent".to_owned());
             }
         }
-        self.send(crate::routing::release_keys(keys, buttons))
-            .await?;
+        if let Err(error) = self.send(crate::routing::release_keys(keys, buttons)).await {
+            self.stop().await;
+            return Err(error);
+        }
         let released = tokio::time::timeout(RECOVERY_TIMEOUT, self.recv()).await;
         let counts = match released {
-            Ok(Ok(frame)) => match frame.msg {
-                Some(Msg::Released(released)) => {
-                    (released.keys_released, released.buttons_released)
+            Ok(Ok(frame)) => match recovery_ack(frame.msg.as_ref(), keys.len(), buttons.len()) {
+                Ok(counts) => counts,
+                Err(error) => {
+                    self.stop().await;
+                    return Err(error);
                 }
-                _ => (0, 0),
             },
             Ok(Err(error)) => {
                 self.stop().await;
                 return Err(format!("recovery release failed: {error}"));
             }
-            Err(_) => (0, 0),
+            Err(_) => {
+                self.stop().await;
+                return Err("recovery release acknowledgement timed out".to_owned());
+            }
         };
         tracing::info!(
             keys = counts.0,
@@ -855,6 +862,20 @@ impl Supervisor {
         // `NORMAL` one rather than trying to promote it.
         self.start(AgentMode::Normal).await?;
         Ok(counts)
+    }
+}
+
+/// Receiving a protobuf is not proof that native recovery succeeded.
+fn recovery_ack(message: Option<&Msg>, keys: usize, buttons: usize) -> Result<(u32, u32), String> {
+    match message {
+        Some(Msg::Released(released))
+            if released.lease_id.is_empty()
+                && released.keys_released as usize == keys
+                && released.buttons_released as usize == buttons =>
+        {
+            Ok((released.keys_released, released.buttons_released))
+        }
+        _ => Err("recovery release was not acknowledged completely".to_owned()),
     }
 }
 
@@ -1838,5 +1859,50 @@ mod heartbeat_tests {
         );
         heartbeat.on_frame();
         assert_eq!(heartbeat.silence_ms(), 0);
+    }
+}
+
+#[cfg(test)]
+mod recovery_ack_tests {
+    use super::*;
+
+    #[test]
+    fn normal_restart_requires_an_exact_complete_native_recovery_ack() {
+        let complete = Msg::Released(ipc::Released {
+            lease_id: Vec::new(),
+            keys_released: 2,
+            buttons_released: 1,
+        });
+        assert_eq!(recovery_ack(Some(&complete), 2, 1), Ok((2, 1)));
+        assert!(recovery_ack(None, 2, 1).is_err());
+        assert!(recovery_ack(Some(&Msg::Pong(ipc::Pong { nonce: 1 })), 2, 1).is_err());
+        assert!(recovery_ack(
+            Some(&Msg::Error(ipc::AgentError {
+                code: "RECOVERY_FAILED".to_owned(),
+                detail: "native release rejected".to_owned(),
+                lease_id: Vec::new(),
+            })),
+            2,
+            1
+        )
+        .is_err());
+        for (keys_released, buttons_released, lease_id) in [
+            (0, 0, Vec::new()),
+            (1, 1, Vec::new()),
+            (2, 0, Vec::new()),
+            (3, 1, Vec::new()),
+            (2, 1, vec![1; 16]),
+        ] {
+            assert!(recovery_ack(
+                Some(&Msg::Released(ipc::Released {
+                    lease_id,
+                    keys_released,
+                    buttons_released,
+                })),
+                2,
+                1
+            )
+            .is_err());
+        }
     }
 }

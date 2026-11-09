@@ -16,6 +16,8 @@ use tokio::time::{timeout, Instant};
 const QUEUE: usize = 64;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
+// Native stop owns a two-second budget; IPC/scheduling must not consume that budget.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn backend_matches(selected: w::BackendKind, reported: i32) -> bool {
@@ -530,7 +532,7 @@ impl AudioHandle {
         // and cannot be blocked by the ordinary command queue or generation zero.
         self.shutdown.send_replace(true);
         let mut stopped = self.stopped.clone();
-        timeout(LAUNCH_TIMEOUT + IO_TIMEOUT * 2, async {
+        timeout(LAUNCH_TIMEOUT + SHUTDOWN_TIMEOUT + IO_TIMEOUT * 2, async {
             loop {
                 if *stopped.borrow_and_update() {
                     return Ok(());
@@ -623,6 +625,14 @@ struct Child {
     ready: w::Ready,
 }
 impl Child {
+    async fn wait_for_shutdown(&mut self) {
+        if !matches!(
+            timeout(SHUTDOWN_TIMEOUT, self.process.wait()).await,
+            Ok(Ok(_))
+        ) {
+            self.reap().await;
+        }
+    }
     async fn reap(&mut self) {
         let _ = self.process.start_kill();
         let _ = timeout(IO_TIMEOUT, self.process.wait()).await;
@@ -985,6 +995,13 @@ async fn serve(
                             emit(events, AudioSupervisorEvent::MediaCommandResult {generation,request_id:id,result})?;
                         }
                         Msg::Error(error) => {
+                            if id == 0 {
+                                let session: [u8; 16] = error.session_id.as_slice().try_into().map_err(|_| AudioSupervisorError::InvalidFrame)?;
+                                if !sessions.contains(&session) { return Err(AudioSupervisorError::InvalidFrame); }
+                                let error = worker_rejection(events, generation, id, None, false, error)?;
+                                emit(events, AudioSupervisorEvent::CommandRejected { generation, request_id: id, error })?;
+                                continue;
+                            }
                             if id <= 1 || id > request { return Err(AudioSupervisorError::InvalidFrame); }
                             let error = worker_rejection(events, generation, id, pending_privacy.remove(&id).map(|pending| pending.operation), pending_starts.contains_key(&id), error)?;
                             if let Some(response) = pending.remove(&id) { let _ = response.reply.send(Err(AudioSupervisorError::WorkerRejected(error.code))); }
@@ -1050,7 +1067,7 @@ async fn serve(
                     }
                     if shutdown {
                         available.store(0, Ordering::Release);
-                        if timeout(IO_TIMEOUT, child.process.wait()).await.is_err() { child.reap().await; }
+                        child.wait_for_shutdown().await;
                         let _ = command.reply.send(Ok(Reply::Shutdown)); return Ok(());
                     }
                     if response { pending.insert(request, Pending { reply: command.reply, deadline: Instant::now() + COMMAND_TIMEOUT, inventory }); }
@@ -1267,9 +1284,10 @@ async fn run(
                 child.link.send(u64::MAX, Msg::Shutdown(w::Shutdown {})),
             )
             .await;
-            let _ = timeout(IO_TIMEOUT, child.process.wait()).await;
+            child.wait_for_shutdown().await;
+        } else {
+            child.reap().await;
         }
-        child.reap().await;
         while let Ok(command) = commands.try_recv() {
             let _ = command.reply.send(Err(AudioSupervisorError::Unavailable));
         }
@@ -1385,6 +1403,7 @@ async fn backoff(
 
 #[cfg(test)]
 mod tests {
+    mod lifecycle;
     use super::*;
     use std::future::Future;
 

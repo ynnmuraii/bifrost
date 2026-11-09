@@ -29,10 +29,63 @@ use ipc::peer::SameUser;
 use ipc::transport::{self, ClientStream, Endpoint, GuiListener};
 use ipc::{GuiLink, IpcError};
 use protocol::ipc::{gui_frame, GuiFrame};
-use tokio::sync::{broadcast, mpsc};
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// One frame on its way to a GUI connection, with the request it answers (`0` = event).
 pub type Outgoing = (u64, gui_frame::Msg);
+/// Connection-owned reply delivery. Saturation closes this epoch instead of losing an ACK.
+#[derive(Debug, Clone)]
+pub struct Replies {
+    tx: mpsc::Sender<Outgoing>,
+    disconnect: watch::Sender<bool>,
+}
+
+impl Replies {
+    pub(crate) fn channel(capacity: usize) -> (Self, mpsc::Receiver<Outgoing>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let (disconnect, _) = watch::channel(false);
+        (Self { tx, disconnect }, rx)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.disconnect.borrow() || self.tx.is_closed()
+    }
+
+    pub(crate) fn try_send(&self, message: Outgoing) -> Result<(), mpsc::error::TrySendError<()>> {
+        if self.is_closed() {
+            return Err(mpsc::error::TrySendError::Closed(()));
+        }
+        self.tx.try_send(message).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                self.disconnect.send_replace(true);
+                mpsc::error::TrySendError::Full(())
+            }
+            mpsc::error::TrySendError::Closed(_) => mpsc::error::TrySendError::Closed(()),
+        })
+    }
+
+    pub(crate) async fn send(&self, message: Outgoing) -> Result<(), mpsc::error::SendError<()>> {
+        self.try_send(message)
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    /// Waits for queue capacity only from detached producers, never the session loop.
+    pub(crate) async fn send_wait(
+        &self,
+        message: Outgoing,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        let mut disconnected = self.disconnect.subscribe();
+        if self.is_closed() {
+            return Err(mpsc::error::SendError(()));
+        }
+        tokio::select! {
+            biased;
+            _ = disconnected.changed() => Err(mpsc::error::SendError(())),
+            result = self.tx.send(message) => result.map_err(|_| mpsc::error::SendError(())),
+        }
+    }
+}
 
 /// How many frames a connection may hold before its writer catches up.
 ///
@@ -40,6 +93,7 @@ pub type Outgoing = (u64, gui_frame::Msg);
 /// connection this far behind is dropped by the `send` that fails, exactly as
 /// `docs/03-architecture.md` says a broken local channel is handled.
 const OUTBOUND_QUEUE: usize = 64;
+const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// One request from a GUI connection, with the way to answer it.
 pub struct Request {
@@ -55,7 +109,7 @@ pub struct Request {
     /// frame (`UpdateTopology` is answered with `OpResult`, and the applied document
     /// follows as a pushed `TopologyDoc`), and because a deferred answer outlives the turn
     /// that received the request.
-    pub out: mpsc::Sender<Outgoing>,
+    pub out: Replies,
 }
 
 /// The GUI endpoint of a running core.
@@ -118,16 +172,23 @@ impl Server {
 }
 
 /// The read/write loop of one GUI connection.
-async fn serve(
-    stream: ClientStream,
+async fn serve<S>(
+    stream: S,
     requests: mpsc::Sender<Request>,
     mut events: broadcast::Receiver<Outgoing>,
     connection_id: [u8; 16],
-) {
-    let (out_tx, mut out_rx) = mpsc::channel::<Outgoing>(OUTBOUND_QUEUE);
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (out_tx, mut out_rx) = Replies::channel(OUTBOUND_QUEUE);
+    let mut disconnected = out_tx.disconnect.subscribe();
     let mut link = GuiLink::new(stream);
     loop {
+        if out_tx.is_closed() {
+            return;
+        }
         tokio::select! {
+            _ = disconnected.changed() => return,
             incoming = link.recv() => match incoming {
                 Ok(GuiFrame { request_id, msg, .. }) => {
                     let Some(message) = msg else {
@@ -138,11 +199,10 @@ async fn serve(
                         continue;
                     };
                     if requests
-                        .send(Request { request_id, connection_id, message, out: out_tx.clone() })
-                        .await
+                        .try_send(Request { request_id, connection_id, message, out: out_tx.clone() })
                         .is_err()
                     {
-                        // Core is shutting down.
+                        tracing::warn!("GUI request queue unavailable; closing connection");
                         return;
                     }
                 }
@@ -152,25 +212,126 @@ async fn serve(
                 }
             },
             Some((request_id, message)) = out_rx.recv() => {
-                if let Err(error) = link.send(request_id, message).await {
-                    tracing::debug!(%error, "cannot answer the GUI");
+                let sent = tokio::select! {
+                    biased;
+                    _ = disconnected.changed() => return,
+                    sent = tokio::time::timeout(WRITE_TIMEOUT, link.send(request_id, message)) => sent,
+                };
+                if !matches!(&sent, Ok(Ok(()))) {
+                    tracing::debug!(?sent, "GUI reply write failed or stalled; closing connection");
                     return;
                 }
             }
             event = events.recv() => match event {
                 Ok((request_id, message)) => {
-                    if let Err(error) = link.send(request_id, message).await {
-                        tracing::debug!(%error, "cannot push an event to the GUI");
+                    let sent = tokio::select! {
+                        biased;
+                        _ = disconnected.changed() => return,
+                        sent = tokio::time::timeout(WRITE_TIMEOUT, link.send(request_id, message)) => sent,
+                    };
+                    if !matches!(&sent, Ok(Ok(()))) {
+                        tracing::debug!(?sent, "GUI event write failed or stalled; closing connection");
                         return;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // The GUI is not reading fast enough. Its next `GetStatus`/`GetTopology`
-                    // gives it the state again, so the gap is reported and not invented.
-                    tracing::warn!(skipped, "a GUI connection fell behind the events");
+                    tracing::warn!(skipped, "GUI event stream lagged; closing connection for resynchronization");
+                    return;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::ipc::{self as wire, gui_frame::Msg};
+
+    #[tokio::test]
+    async fn reply_overflow_cancels_the_epoch_even_if_a_slot_is_drained_afterwards() {
+        let (out, mut frames) = Replies::channel(1);
+        let mut disconnected = out.disconnect.subscribe();
+        out.try_send((
+            1,
+            Msg::OpResult(wire::OpResult {
+                ok: true,
+                ..Default::default()
+            }),
+        ))
+        .unwrap();
+        assert!(matches!(
+            out.try_send((2, Msg::OpResult(wire::OpResult::default()))),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        frames.recv().await.unwrap();
+        assert!(
+            out.is_closed(),
+            "freeing capacity cannot resurrect a lost correlated response"
+        );
+        disconnected.changed().await.unwrap();
+        assert!(*disconnected.borrow());
+        assert!(out
+            .send((3, Msg::OpResult(wire::OpResult::default())))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn lagged_terminal_event_stream_disconnects_instead_of_silently_continuing() {
+        let (stream, peer) = tokio::io::duplex(64);
+        let (requests, _receiver) = mpsc::channel(4);
+        let (events, observer) = broadcast::channel(1);
+        for _ in 0..3 {
+            events
+                .send((
+                    0,
+                    Msg::PairingWindow(wire::PairingWindow {
+                        open: false,
+                        ..Default::default()
+                    }),
+                ))
+                .unwrap();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            serve(stream, requests, observer, [1; 16]),
+        )
+        .await
+        .expect("event loss ends the connection");
+        let mut peer = GuiLink::new(peer);
+        assert!(peer.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn slow_gui_write_is_bounded_and_closes_the_actual_reply_sender() {
+        let (stream, peer) = tokio::io::duplex(64);
+        let (requests, mut receiver) = mpsc::channel(4);
+        let (_events, observer) = broadcast::channel(4);
+        let serving = tokio::spawn(serve(stream, requests, observer, [3; 16]));
+        let mut peer = GuiLink::new(peer);
+        peer.send(17, Msg::GetStatus(wire::GetStatus {}))
+            .await
+            .unwrap();
+        let request = receiver.recv().await.unwrap();
+        assert_eq!(request.connection_id, [3; 16]);
+        assert_eq!(request.request_id, 17);
+        request
+            .out
+            .send((
+                17,
+                Msg::OpResult(wire::OpResult {
+                    ok: false,
+                    error_code: "x".repeat(1024),
+                }),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), serving)
+            .await
+            .expect("blocked write disconnects")
+            .unwrap();
+        assert!(request.out.is_closed());
     }
 }

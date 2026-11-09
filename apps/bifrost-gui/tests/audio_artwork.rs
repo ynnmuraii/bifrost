@@ -29,6 +29,7 @@ fn card(id: &str) -> AudioPlayerCard {
         can_next: true,
         muted: false,
         gain_percent: 62,
+        desired_gain_percent: None,
         state: StreamState::Ready,
         path: None,
         background: false,
@@ -688,4 +689,60 @@ fn decoded_landscape_and_portrait_covers_preserve_aspect_inside_the_square() {
         }
         output.drop_without_applying_deltas();
     }
+}
+
+#[test]
+fn hidden_player_prunes_revoked_artwork_on_the_root_frame() {
+    let ctx = egui::Context::default();
+    ui::install_fonts(&ctx);
+    let size = egui::vec2(audio_player::DEFAULT_WIDTH, audio_player::DEFAULT_HEIGHT);
+    let mut active = card("art");
+    active.artwork = Some(artwork(7));
+    active.artwork_id = Some([7; 32]);
+    draw(&ctx, std::slice::from_ref(&active), size, 0.0)
+        .0
+        .drop_without_applying_deltas();
+    let key = egui::Id::new(("audio-art-texture", [7_u8; 32]));
+    assert!(ctx
+        .data(|data| data.get_temp::<egui::TextureHandle>(key))
+        .is_some());
+    let mut model = bifrost_gui::audio_player::AudioPlayer::default();
+    model.open = false;
+    model.cards.push(active);
+    let mut geometry = PlayerGeometry::default();
+    let output = ctx.run_ui(Default::default(), |ui| {
+        assert!(audio_player::viewport(
+            ui.ctx(),
+            &mut model,
+            &mut geometry,
+            Theme::Dark,
+            Lang::En,
+            Default::default()
+        )
+        .is_empty());
+    });
+    assert!(
+        output.textures_delta.free.is_empty(),
+        "hiding an active consented track is not revocation"
+    );
+    output.drop_without_applying_deltas();
+    model.cards.clear();
+    let output = ctx.run_ui(Default::default(), |ui| {
+        audio_player::viewport(
+            ui.ctx(),
+            &mut model,
+            &mut geometry,
+            Theme::Dark,
+            Lang::En,
+            Default::default(),
+        );
+    });
+    assert!(ctx
+        .data(|data| data.get_temp::<egui::TextureHandle>(key))
+        .is_none());
+    assert!(
+        !output.textures_delta.free.is_empty(),
+        "root frame frees the upload without reopening the viewport"
+    );
+    output.drop_without_applying_deltas();
 }

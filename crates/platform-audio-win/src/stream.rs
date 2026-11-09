@@ -451,7 +451,10 @@ fn capture_loop(
         if wait != WAIT_OBJECT_0 {
             return Err(windows::core::Error::from_thread());
         }
-        while unsafe { capture.GetNextPacketSize()? } != 0 {
+        while !state.stop.load(Ordering::Acquire) && unsafe { capture.GetNextPacketSize()? } != 0 {
+            if state.stop.load(Ordering::Acquire) {
+                break;
+            }
             let (mut pointer, mut count, mut flags, mut position, mut qpc) =
                 (std::ptr::null_mut(), 0, 0, 0, 0);
             unsafe {
@@ -479,6 +482,9 @@ fn capture_loop(
                         for offset in
                             (0..count as usize).step_by(audio_backend::MAX_CAPTURE_BLOCK_FRAMES)
                         {
+                            if state.stop.load(Ordering::Acquire) {
+                                break;
+                            }
                             let frames = (count as usize - offset)
                                 .min(audio_backend::MAX_CAPTURE_BLOCK_FRAMES);
                             let samples = if silent {
@@ -497,24 +503,33 @@ fn capture_loop(
                         }
                     }
                     CaptureSink::Ring(sink) => {
-                        for index in 0..count {
-                            let samples = unsafe { read_frame(pointer, silent, index as usize) };
-                            let frame = CapturedFrame {
-                                samples,
-                                device_position: position + u64::from(index),
-                                qpc_100ns: qpc
-                                    + u64::from(index) * 10_000_000 / u64::from(SAMPLE_RATE),
-                                timestamp_valid: flags
-                                    & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32
-                                    == 0,
-                                discontinuity: pending_gap || (index == 0 && discontinuity),
-                            };
-                            if sink.push(frame).is_err() {
-                                pending_gap = true;
-                                dropped += 1;
-                            } else {
-                                pending_gap = false;
-                                delivered += 1;
+                        for start in
+                            (0..count as usize).step_by(audio_backend::MAX_CAPTURE_BLOCK_FRAMES)
+                        {
+                            if state.stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let end = (start + audio_backend::MAX_CAPTURE_BLOCK_FRAMES)
+                                .min(count as usize);
+                            for index in start..end {
+                                let samples = unsafe { read_frame(pointer, silent, index) };
+                                let frame = CapturedFrame {
+                                    samples,
+                                    device_position: position + index as u64,
+                                    qpc_100ns: qpc
+                                        + index as u64 * 10_000_000 / u64::from(SAMPLE_RATE),
+                                    timestamp_valid: flags
+                                        & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32
+                                        == 0,
+                                    discontinuity: pending_gap || (index == 0 && discontinuity),
+                                };
+                                if sink.push(frame).is_err() {
+                                    pending_gap = true;
+                                    dropped += 1;
+                                } else {
+                                    pending_gap = false;
+                                    delivered += 1;
+                                }
                             }
                         }
                     }
@@ -724,6 +739,94 @@ fn render_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct CaptureCalls {
+        acquired: AtomicU64,
+        released: AtomicU64,
+        queried: AtomicU64,
+    }
+
+    #[windows::core::implement(IAudioCaptureClient)]
+    struct ContinuousCapture {
+        calls: Arc<CaptureCalls>,
+        frames: u32,
+        fail_release: bool,
+    }
+
+    #[allow(non_snake_case)]
+    impl IAudioCaptureClient_Impl for ContinuousCapture_Impl {
+        fn GetBuffer(
+            &self,
+            data: *mut *mut u8,
+            frames: *mut u32,
+            flags: *mut u32,
+            position: *mut u64,
+            qpc: *mut u64,
+        ) -> windows::core::Result<()> {
+            self.calls.acquired.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                *data = std::ptr::null_mut();
+                *frames = self.frames;
+                *flags = AUDCLNT_BUFFERFLAGS_SILENT.0 as u32;
+                if !position.is_null() {
+                    *position = 0;
+                }
+                if !qpc.is_null() {
+                    *qpc = 0;
+                }
+            }
+            Ok(())
+        }
+        fn ReleaseBuffer(&self, frames: u32) -> windows::core::Result<()> {
+            assert_eq!(frames, self.frames, "release the entire owned packet");
+            self.calls.released.fetch_add(1, Ordering::Relaxed);
+            if self.fail_release {
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn GetNextPacketSize(&self) -> windows::core::Result<u32> {
+            // Keep the regression bounded even if cancellation is accidentally removed.
+            if self.calls.queried.fetch_add(1, Ordering::Relaxed) >= 4 {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ));
+            }
+            Ok(self.frames)
+        }
+    }
+
+    #[test]
+    fn continuous_capture_stops_between_chunks_and_releases_its_packet_once() {
+        for fail_release in [false, true] {
+            let calls = Arc::new(CaptureCalls::default());
+            let capture: IAudioCaptureClient = ContinuousCapture {
+                calls: calls.clone(),
+                frames: audio_backend::MAX_CAPTURE_BLOCK_FRAMES as u32 * 3,
+                fail_release,
+            }
+            .into();
+            let state = Arc::new(State::default());
+            let stopped = state.clone();
+            let callbacks = Arc::new(AtomicU64::new(0));
+            let observed = callbacks.clone();
+            let mut sink = CaptureSink::Callback(Box::new(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                stopped.stop.store(true, Ordering::Release);
+            }));
+            let event = Event(unsafe { CreateEventW(None, true, true, None) }.unwrap());
+            let result = capture_loop(&state, &capture, &event, &mut sink);
+            assert_eq!(result.is_err(), fail_release);
+            assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+            assert_eq!(calls.acquired.load(Ordering::Relaxed), 1);
+            assert_eq!(calls.released.load(Ordering::Relaxed), 1);
+            assert_eq!(calls.queried.load(Ordering::Relaxed), 1);
+        }
+    }
     #[test]
     fn process_capture_blocks_keep_qpc_without_device_positions() {
         let samples = [0.0; 2];

@@ -83,7 +83,7 @@ fn shared_backend_reads_devices_defaults_mute_and_media() {
     }
 }
 
-/// RegisterHotKey/UnregisterHotKey only: no mute guard, media command or input synthesis.
+/// Chord registration/passive observation only: no mute, media command or input synthesis.
 #[test]
 fn shared_backend_ptt_registration_collision_and_cleanup_without_input() {
     use audio_backend::{Backend, BackendError, Event, PttHotkey};

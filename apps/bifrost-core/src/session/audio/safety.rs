@@ -127,7 +127,7 @@ pub(super) fn submit(
     queue: &mpsc::Sender<Command>,
     safety: &watch::Sender<Latch>,
     request: Request,
-) -> Result<(), (u64, mpsc::Sender<Outgoing>)> {
+) -> Result<(), (u64, Replies)> {
     let mute = matches!(&request.message, gui::gui_frame::Msg::SetMicrophoneMute(v) if v.muted);
     let release = matches!(&request.message, gui::gui_frame::Msg::SetPtt(v) if !v.pressed);
     if mute || release {
@@ -157,7 +157,7 @@ mod tests {
     use super::*;
 
     fn request(id: u64, message: gui::gui_frame::Msg) -> Request {
-        let (out, _) = mpsc::channel(1);
+        let (out, _) = Replies::channel(1);
         Request {
             request_id: id,
             connection_id: [1; 16],

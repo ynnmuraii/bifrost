@@ -17,10 +17,10 @@
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Shared same-host diagnostic epoch in microseconds, never a lease/watchdog clock.
+/// Shared same-host monotonic epoch in microseconds.
 ///
-/// A missing reading is unknown; callers must not substitute wall time or a
-/// process-local origin. Remote hosts' readings are not comparable.
+/// A missing reading is unknown and must fail closed for input admission; never
+/// substitute wall time or a process-local origin. Remote hosts are not comparable.
 pub fn host_monotonic_us() -> Option<u64> {
     #[cfg(windows)]
     {
@@ -96,6 +96,7 @@ pub trait Clock {
 pub struct SystemClock {
     /// The monotonic origin, shared with the caller's own deadlines.
     origin: Instant,
+    host_origin_us: Option<u64>,
 }
 
 impl SystemClock {
@@ -107,12 +108,23 @@ impl SystemClock {
     /// The same, with the monotonic origin given: a loop that already times its
     /// deadlines from one `Instant` keeps them on that scale.
     pub fn from_origin(origin: Instant) -> Self {
-        Self { origin }
+        // Sample the host first: rounding/read latency can only shorten a deadline.
+        let host_origin_us = host_monotonic_us()
+            .and_then(|host| host.checked_sub(origin.elapsed().as_micros().try_into().ok()?));
+        Self {
+            origin,
+            host_origin_us,
+        }
     }
 
     /// The monotonic origin, so deadlines can be built on the same scale.
     pub fn origin(&self) -> Instant {
         self.origin
+    }
+
+    /// The fixed same-host issuance anchor for process-relative FSM deadlines.
+    pub fn host_origin_us(&self) -> Option<u64> {
+        self.host_origin_us
     }
 }
 

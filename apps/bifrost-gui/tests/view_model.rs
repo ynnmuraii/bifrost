@@ -819,7 +819,7 @@ fn a_pairing_window_tells_the_user_what_to_type() {
         "{left:?}"
     );
 
-    // A closed window clears what it opened, too.
+    // A closed window clears its address and countdown, not unrelated ceremony state.
     vm.apply(event(Msg::PairingWindow(protocol::ipc::PairingWindow {
         open: false,
         address: String::new(),
@@ -827,7 +827,7 @@ fn a_pairing_window_tells_the_user_what_to_type() {
         attempt_id: Vec::new(),
     })));
     assert!(vm.pairing.window.is_none());
-    assert!(vm.pairing.prompt.is_none());
+    assert!(vm.pairing.window_deadline.is_none());
 }
 
 #[test]

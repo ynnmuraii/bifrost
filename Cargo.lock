@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "audio-backend"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "image",
  "ring",
@@ -505,7 +505,7 @@ checksum = "1254ebf6529f3763c491acfb5ab6e960809e3c75a38584cc664f8c5667fb7107"
 
 [[package]]
 name = "audio-media"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "audio-backend",
  "audio-model",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "audio-model"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "audioadapter"
@@ -569,7 +569,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bifrost"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bifrost-agent",
  "bifrost-audio",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-agent"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-audio"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "audio-backend",
  "audio-media",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "audio-model",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-desktop"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-gui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "audio-model",
  "bifrost-desktop",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "bifrost-tray"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bifrost-desktop",
  "config",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "clipboard"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ring",
 ]
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "geometry",
  "libc",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "edgefx"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "eframe"
@@ -1594,7 +1594,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "focus-router"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "geometry",
  "input-model",
@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "geometry"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "gethostname"
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "config",
  "geometry",
@@ -2189,11 +2189,11 @@ dependencies = [
 
 [[package]]
 name = "input-model"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "ipc"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "config",
  "libc",
@@ -2467,7 +2467,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "logging"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -3333,7 +3333,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform-audio-linux"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ashpd",
  "audio-backend",
@@ -3354,9 +3354,10 @@ dependencies = [
 
 [[package]]
 name = "platform-audio-win"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "audio-backend",
+ "platform-win",
  "rtrb",
  "tracing",
  "wasapi",
@@ -3366,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "platform-probe"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "x11rb 0.14.0",
  "zbus",
@@ -3374,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "platform-wayland"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ashpd",
  "clipboard",
@@ -3395,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "platform-win"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clipboard",
  "edgefx",
@@ -3406,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "platform-x11"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clipboard",
  "input-model",
@@ -3607,7 +3608,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -4707,7 +4708,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clipboard",
  "focus-router",
@@ -4758,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "ui-text"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "toml 1.1.8+spec-1.1.0",

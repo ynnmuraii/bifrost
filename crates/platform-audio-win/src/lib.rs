@@ -21,11 +21,12 @@
 //!
 //! Supply all reserved KVM chords when configuring PTT. Consumers must check the absolute
 //! 250 ms press lease on every use; renewal events cannot reopen an expired gate.
-//! Registration starts unarmed. Rearming needs a non-injected release of the configured
-//! non-modifier PTT key from the native observer, followed by a fresh press. Modifier release,
-//! zero/unavailable asynchronous key state, reset and lease expiry only revoke; they are
-//! never release proof. Original queued press timestamps are retained rather than rejuvenated
-//! when the message queue is drained. Observer failure/removal stays closed; reconfigure to
+//! Registration starts unarmed. Both edges retain physical HID/scan/E0 identity independently
+//! of the active layout or VK aliases (including main/keypad Enter). Rearming needs a
+//! non-injected release of the configured non-modifier key, followed by a fresh non-injected
+//! press. Modifier release, zero/unavailable asynchronous key state, reset and lease expiry
+//! only revoke; they are never release proof. Original queued press timestamps are retained
+//! rather than rejuvenated when drained. Observer failure/removal stays closed; reconfigure to
 //! reinstall it. Registration-only checks do not qualify physical edges or desktop transitions.
 //!
 //! # Hardware diagnostic

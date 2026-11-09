@@ -379,14 +379,43 @@ fn read_artwork(
     Ok(normalize(&bytes, previous))
 }
 
+#[derive(Default)]
+struct ArtworkCache {
+    generation: Option<u64>,
+    artwork: Option<audio_backend::artwork::Artwork>,
+}
+
+impl ArtworkCache {
+    fn read(
+        &mut self,
+        generation: u64,
+        current: &AtomicU64,
+        load: impl FnOnce(
+            Option<&audio_backend::artwork::Artwork>,
+        ) -> Option<audio_backend::artwork::Artwork>,
+    ) -> Option<audio_backend::artwork::Artwork> {
+        if !revision_matches(current, generation) {
+            return None;
+        }
+        if self.generation != Some(generation) {
+            let artwork = load(self.artwork.as_ref());
+            if !revision_matches(current, generation) {
+                return None;
+            }
+            self.artwork = artwork;
+            self.generation = Some(generation);
+        }
+        self.artwork.clone()
+    }
+}
 struct Entry {
     identity: IUnknown,
     session: Session,
     token: SessionToken,
     revision: Arc<AtomicU64>,
     metadata: Option<i64>,
-    artwork_dirty: Arc<AtomicBool>,
-    artwork: std::cell::RefCell<Option<audio_backend::artwork::Artwork>>,
+    metadata_generation: Arc<AtomicU64>,
+    artwork: std::cell::RefCell<ArtworkCache>,
     playback: Option<i64>,
     timeline: Option<i64>,
 }
@@ -492,18 +521,18 @@ impl State {
                     token,
                     revision: Arc::new(AtomicU64::new(1)),
                     metadata: None,
-                    artwork_dirty: Arc::new(AtomicBool::new(true)),
-                    artwork: std::cell::RefCell::new(None),
+                    metadata_generation: Arc::new(AtomicU64::new(1)),
+                    artwork: std::cell::RefCell::new(ArtworkCache::default()),
                     playback: None,
                     timeline: None,
                 };
                 let sink = self.sink.clone();
                 let revision = entry.revision.clone();
-                let artwork_dirty = entry.artwork_dirty.clone();
+                let metadata_generation = entry.metadata_generation.clone();
                 entry.metadata = Some(entry.session.MediaPropertiesChanged(
                     &TypedEventHandler::new(move |_, _| {
+                        advance_revision(&metadata_generation);
                         advance_revision(&revision);
-                        artwork_dirty.store(true, Ordering::Release);
                         sink.emit(MediaChange::Metadata(token));
                         Ok(())
                     }),
@@ -564,22 +593,22 @@ impl State {
         for entry in current_entry.chain(other_entries) {
             // Capture before reads: a concurrent native change invalidates this snapshot's revision.
             let revision = entry.revision.load(Ordering::Acquire);
+            let generation = entry.metadata_generation.load(Ordering::Acquire);
             let metadata = complete!(entry.session.TryGetMediaPropertiesAsync());
-            if entry.artwork_dirty.swap(false, Ordering::AcqRel) {
-                let artwork = read_artwork(&metadata, entry.artwork.borrow().as_ref())
-                    .ok()
-                    .flatten();
-                *entry.artwork.borrow_mut() = artwork;
-            }
+            let artwork = entry.artwork.borrow_mut().read(
+                generation,
+                &entry.metadata_generation,
+                |previous| read_artwork(&metadata, previous).ok().flatten(),
+            );
             let playback = entry.session.GetPlaybackInfo()?;
             let timeline = entry.session.GetTimelineProperties()?;
-            sessions.push(MediaSession {
+            let session = MediaSession {
                 token: entry.token,
                 revision,
                 app_id: bounded_utf8(&entry.session.SourceAppUserModelId()?, 128),
                 title: bounded_utf8(&metadata.Title()?, 256),
                 artist: bounded_utf8(&metadata.Artist()?, 256),
-                artwork: entry.artwork.borrow().clone(),
+                artwork,
                 playback_status: playback.PlaybackStatus()?.0,
                 controls: controls(&entry.session)?,
                 timeline: Timeline {
@@ -590,7 +619,11 @@ impl State {
                     max_seek: timeline.MaxSeekTime()?.Duration,
                     updated_at: timeline.LastUpdatedTime()?.UniversalTime,
                 },
-            });
+            };
+            // A callback racing metadata or thumbnail reads leaves its generation uncached.
+            if revision_matches(&entry.metadata_generation, generation) {
+                sessions.push(session);
+            }
         }
         let mut snapshot = MediaSnapshot {
             sessions,
@@ -823,6 +856,55 @@ fn revision_matches(revision: &AtomicU64, expected: u64) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn metadata_race_never_reuses_previous_tracks_artwork_without_another_event() {
+        let artwork = audio_backend::artwork::normalize(
+            include_bytes!("../../../apps/bifrost/assets/icon-16.png"),
+            None,
+        )
+        .unwrap();
+        let generation = AtomicU64::new(1);
+        let mut cache = ArtworkCache::default();
+        assert!(cache
+            .read(1, &generation, |_| Some(artwork.clone()))
+            .is_some());
+
+        // Properties A completed; B's callback arrives before the cache is consulted.
+        let captured = generation.load(Ordering::Acquire);
+        advance_revision(&generation);
+        assert!(cache
+            .read(captured, &generation, |_| panic!("stale metadata"))
+            .is_none());
+        let mut refreshed = false;
+        // B has no cover. No additional callback is needed to replace cached A.
+        assert!(cache
+            .read(2, &generation, |_| {
+                refreshed = true;
+                None
+            })
+            .is_none());
+        assert!(refreshed);
+        assert!(cache
+            .read(2, &generation, |_| panic!("already cached B"))
+            .is_none());
+
+        // A second race while a native thumbnail is loading cannot cache it as C.
+        advance_revision(&generation);
+        assert!(cache
+            .read(3, &generation, |_| {
+                advance_revision(&generation);
+                Some(artwork.clone())
+            })
+            .is_none());
+        let mut refreshed = false;
+        assert!(cache
+            .read(4, &generation, |_| {
+                refreshed = true;
+                Some(artwork)
+            })
+            .is_some());
+        assert!(refreshed);
+    }
     fn catalog_session(token: u64, playback_status: i32) -> MediaSession {
         MediaSession {
             token: SessionToken(token),

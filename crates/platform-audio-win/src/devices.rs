@@ -22,7 +22,7 @@ use windows::{
     core::{implement, Interface, GUID, PCWSTR, PWSTR},
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
-        Foundation::PROPERTYKEY,
+        Foundation::{PROPERTYKEY, S_FALSE, S_OK},
         Media::Audio::{
             eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole,
             Endpoints::{
@@ -485,10 +485,40 @@ impl IAudioEndpointVolumeCallback_Impl for MuteCallback_Impl {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MuteWrite {
+    Changed,
+    Unchanged,
+    RevisionLost,
+}
+
+fn write_if_revision(
+    revision: &AtomicU64,
+    expected: u64,
+    write: impl FnOnce() -> windows::core::HRESULT,
+) -> Result<MuteWrite, Error> {
+    if expected == u64::MAX || revision.load(Ordering::Acquire) != expected {
+        return Ok(MuteWrite::RevisionLost);
+    }
+    let result = write();
+    let outcome = if result == S_OK {
+        MuteWrite::Changed
+    } else if result == S_FALSE {
+        MuteWrite::Unchanged
+    } else {
+        return Err(windows::core::Error::from_hresult(result).into());
+    };
+    Ok(if revision.load(Ordering::Acquire) == expected {
+        outcome
+    } else {
+        MuteWrite::RevisionLost
+    })
+}
+
 enum MuteCommand {
     Read(SyncSender<Result<bool, Error>>),
     Set(bool, SyncSender<Result<(), Error>>),
-    SetIfRevision(bool, u64, SyncSender<Result<bool, Error>>),
+    SetIfRevision(bool, u64, SyncSender<Result<MuteWrite, Error>>),
     Stop,
 }
 
@@ -571,15 +601,16 @@ impl CaptureMute {
                             let _ = reply.try_send(result);
                         }
                         MuteCommand::SetIfRevision(muted, expected, reply) => {
-                            let result = if expected == u64::MAX
-                                || callback_revision.load(Ordering::Acquire) != expected
-                            {
-                                Ok(false)
-                            } else {
-                                unsafe { volume.SetMute(muted, &context) }
-                                    .map(|_| callback_revision.load(Ordering::Acquire) == expected)
-                                    .map_err(Error::from)
-                            };
+                            let result = write_if_revision(&callback_revision, expected, || {
+                                // The projection erases S_FALSE, which is not our change.
+                                unsafe {
+                                    (Interface::vtable(&volume).SetMute)(
+                                        Interface::as_raw(&volume),
+                                        muted.into(),
+                                        &context,
+                                    )
+                                }
+                            });
                             let _ = reply.try_send(result);
                         }
                         MuteCommand::Stop => break,
@@ -637,7 +668,11 @@ impl CaptureMute {
     }
 
     /// Refuse a write if any external notification or queue loss revoked the lease.
-    pub(crate) fn set_mute_if_revision(&self, muted: bool, expected: u64) -> Result<bool, Error> {
+    pub(crate) fn set_mute_if_revision(
+        &self,
+        muted: bool,
+        expected: u64,
+    ) -> Result<MuteWrite, Error> {
         let (reply, result) = mpsc::sync_channel(1);
         self.commands
             .as_ref()
@@ -670,6 +705,36 @@ impl Drop for CaptureMute {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_mute_preserves_native_outcome_and_revision_fences() {
+        let revision = AtomicU64::new(0);
+        assert_eq!(
+            write_if_revision(&revision, 0, || S_OK).unwrap(),
+            MuteWrite::Changed
+        );
+        assert_eq!(
+            write_if_revision(&revision, 0, || S_FALSE).unwrap(),
+            MuteWrite::Unchanged
+        );
+        assert_eq!(
+            write_if_revision(&revision, 0, || {
+                revision.store(1, Ordering::Release);
+                S_OK
+            })
+            .unwrap(),
+            MuteWrite::RevisionLost
+        );
+        assert_eq!(
+            write_if_revision(&revision, 0, || panic!("stale write")).unwrap(),
+            MuteWrite::RevisionLost
+        );
+        revision.store(u64::MAX, Ordering::Release);
+        assert_eq!(
+            write_if_revision(&revision, u64::MAX, || panic!("exhausted write")).unwrap(),
+            MuteWrite::RevisionLost
+        );
+    }
 
     #[test]
     fn debounce_waits_for_one_quiet_window() {

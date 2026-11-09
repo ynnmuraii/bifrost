@@ -186,16 +186,15 @@ pub enum AgentEvent {
         /// The expired lease.
         lease_id: LeaseId,
     },
-    /// A conservative snapshot of the agent's pressed ledger.
-    ///
-    /// Core keeps this set to refuse a normal transition while anything is held
-    /// («Нормальный переход только с пустым physical pressed set»); the emergency path
-    /// ignores it. It is also what `ReleaseKeys` is built from after an agent restart.
+    /// Physical source snapshot used only for normal transition admission.
+    /// Synthetic recovery state is maintained separately by core.
     PressedState {
         /// Keys currently held.
         keys: Vec<HidKey>,
         /// Buttons currently held.
         buttons: Vec<MouseButton>,
+        /// False when the native backend cannot establish a complete physical snapshot.
+        known: bool,
     },
     /// The agent is gone and will be restarted in `RECOVERY` mode.
     AgentLost,
@@ -272,6 +271,8 @@ pub enum TransitionRefusal {
     /// Something is physically held: «Нормальный переход только с пустым physical
     /// pressed set»; «Переход при удерживаемой клавише или кнопке откладывается».
     PressedInputHeld,
+    /// The backend cannot prove that all physical keys and buttons are released.
+    PhysicalStateUnknown,
     /// This node cannot offer an emergency hotkey while
     /// `input.require_emergency_hotkey = true` (AC-03).
     SourceCapabilityMissing,
@@ -288,6 +289,9 @@ impl TransitionRefusal {
         match self {
             TransitionRefusal::NotOwner => "not the owner",
             TransitionRefusal::PressedInputHeld => "physical input is held",
+            TransitionRefusal::PhysicalStateUnknown => {
+                "outgoing input disabled: complete physical pressed state is unavailable"
+            }
             TransitionRefusal::SourceCapabilityMissing => "no emergency hotkey capability",
             TransitionRefusal::ReceiverUnsupported => "target cannot receive absolute input",
             TransitionRefusal::AgentBlocked => "input agent is unavailable",
@@ -384,8 +388,8 @@ pub enum AgentCommand {
         kind: CaptureKind,
         /// The lease this capture belongs to.
         lease_id: LeaseId,
-        /// The agent ends the capture itself after this much time (`<= 1000`).
-        self_timeout_ms: u64,
+        /// Absolute temporary-capture deadline on the caller's millisecond clock; 0 otherwise.
+        self_deadline_ms: u64,
     },
     /// `EndCapture`.
     EndCapture {
@@ -409,12 +413,12 @@ pub enum AgentCommand {
         /// The events.
         events: Vec<InputEvent>,
     },
-    /// `ArmDeadline`, with the remaining time computed from the lease deadline.
+    /// `ArmDeadline`, anchored to the receiver's challenge/commit issuance clock.
     ArmDeadline {
         /// The lease whose deadline is being armed.
         lease_id: LeaseId,
-        /// Milliseconds left, `1..=1000`.
-        remaining_ms: u64,
+        /// Absolute deadline on the caller-supplied FSM millisecond clock.
+        deadline_ms: u64,
     },
     /// `ReleaseSession`: release everything this lease injected.
     ReleaseSession {

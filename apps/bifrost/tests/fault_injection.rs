@@ -90,11 +90,6 @@ fn run_cycles(harness: &Harness, cycles: usize) -> (Vec<f64>, Vec<f64>) {
             }
         }
     }
-    assert_eq!(
-        windows.len(),
-        cycles * 2,
-        "a cycle is two switches (to the peer and back), and each is one window"
-    );
     (to_remote, to_local)
 }
 

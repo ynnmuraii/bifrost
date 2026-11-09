@@ -42,11 +42,11 @@ use crate::wire::{
     Nonce, PeerHello,
 };
 
-/// The conservative physical pressed set.
+/// Source admission only: a conservative native snapshot of physical holds.
 ///
-/// «Нормальный переход только с пустым physical pressed set» — the agent's ledger is
-/// the authority; core mirrors it so a transition can be refused without asking the
-/// agent. The emergency path ignores this set entirely.
+/// Native queries can include uncertain synthetic holds; those also block admission.
+/// This is never the synthetic recovery ledger. Emergency release ignores the set,
+/// and the agent independently checks it when suppression is committed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PressedSet {
     keys: BTreeSet<HidKey>,
@@ -161,6 +161,7 @@ pub struct FocusRouter<I: Identifiers = crate::flow::SequentialIds> {
     lease: LeaseSlot,
     diagnostics: Option<crate::diagnostics::Accounting>,
     pressed: PressedSet,
+    pressed_known: bool,
     peers: BTreeMap<NodeId, Peer>,
     /// Bounded replay history for recently expired or released lease IDs.
     burned: BurnedLeases,
@@ -190,6 +191,7 @@ impl<I: Identifiers> FocusRouter<I> {
             lease: LeaseSlot::Idle,
             diagnostics: None,
             pressed: PressedSet::default(),
+            pressed_known: false,
             peers: BTreeMap::new(),
             burned: BurnedLeases::default(),
             topology_revision: 0,
@@ -520,6 +522,9 @@ impl<I: Identifiers> FocusRouter<I> {
                 if !self.ownership.is_owner() {
                     return self.refuse(trigger, TransitionRefusal::NotOwner, out);
                 }
+                if !self.pressed_known {
+                    return self.refuse(trigger, TransitionRefusal::PhysicalStateUnknown, out);
+                }
                 if !self.can_be_source() {
                     return self.refuse(trigger, TransitionRefusal::SourceCapabilityMissing, out);
                 }
@@ -545,7 +550,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::Agent(AgentCommand::BeginCapture {
                     kind: CaptureKind::Temporary,
                     lease_id,
-                    self_timeout_ms: self.timing.prepare_timeout_ms,
+                    self_deadline_ms: now_ms.saturating_add(self.timing.prepare_timeout_ms),
                 }));
                 out.push(Output::ArmTimer {
                     timer: Timer::PrepareTimeout,
@@ -1199,7 +1204,12 @@ impl<I: Identifiers> FocusRouter<I> {
 
     fn on_agent(&mut self, now_ms: u64, event: AgentEvent, out: &mut Vec<Output>) {
         match event {
-            AgentEvent::PressedState { keys, buttons } => {
+            AgentEvent::PressedState {
+                keys,
+                buttons,
+                known,
+            } => {
+                self.pressed_known = known;
                 self.pressed = PressedSet {
                     keys: keys.into_iter().collect(),
                     buttons: buttons.into_iter().collect(),
@@ -1207,10 +1217,12 @@ impl<I: Identifiers> FocusRouter<I> {
             }
             AgentEvent::AgentReady => {
                 self.blocked = false;
+                self.pressed_known = false;
             }
             AgentEvent::AgentLost => {
                 self.on_session_end(now_ms, LeaveReason::AgentLost, out);
                 self.blocked = true;
+                self.pressed_known = false;
             }
             AgentEvent::CaptureReady { lease_id } => self.on_capture_ready(now_ms, lease_id, out),
             AgentEvent::Ready { lease_id } => self.on_agent_ready(now_ms, lease_id, out),
@@ -1244,7 +1256,9 @@ impl<I: Identifiers> FocusRouter<I> {
                 // (`docs/05-protocol.md`): the agent's capture/session failure cancels the
                 // transition, and a buffered press is replayed locally («Нельзя «потерять»
                 // нажатие в Preparing»).
-                ErrorCode::CaptureFailed | ErrorCode::UnsupportedSession => match lease_id {
+                ErrorCode::CaptureFailed
+                | ErrorCode::UnsupportedSession
+                | ErrorCode::InjectionFailed => match lease_id {
                     Some(lease_id) => self.cancel_failed_transition(now_ms, lease_id, code, out),
                     None => out.push(Output::Notice(Notice::Rejected {
                         peer: self.local,
@@ -1281,6 +1295,13 @@ impl<I: Identifiers> FocusRouter<I> {
                 // A temporary capture that failed can be replayed locally; a live capture
                 // cannot, so it is only released.
                 let replay = lease.state != SourceState::Remote;
+                out.push(Output::Send {
+                    peer: lease.peer,
+                    message: Message::Leave {
+                        lease_id,
+                        reason: LeaveReason::AgentLost,
+                    },
+                });
                 out.push(Output::Agent(AgentCommand::EndCapture {
                     lease_id,
                     replay_buffered_locally: replay,
@@ -1292,6 +1313,13 @@ impl<I: Identifiers> FocusRouter<I> {
                 self.burned.insert(lease_id);
             }
             LeaseSlot::Receiver(lease) if lease.lease_id == lease_id => {
+                out.push(Output::Send {
+                    peer: lease.source,
+                    message: Message::Leave {
+                        lease_id,
+                        reason: LeaveReason::AgentLost,
+                    },
+                });
                 out.push(Output::Agent(AgentCommand::ReleaseSession { lease_id }));
                 out.push(Output::CancelTimer(Timer::PrepareTimeout));
                 out.push(Output::CancelTimer(Timer::ReceiverLeaseDeadline));
@@ -1845,7 +1873,7 @@ impl<I: Identifiers> FocusRouter<I> {
                 out.push(Output::CancelTimer(Timer::PrepareTimeout));
                 out.push(Output::Agent(AgentCommand::ArmDeadline {
                     lease_id,
-                    remaining_ms: self.timing.lease_ttl_ms,
+                    deadline_ms: now_ms.saturating_add(self.timing.lease_ttl_ms),
                 }));
                 out.push(Output::ArmTimer {
                     timer: Timer::ReceiverLeaseDeadline,
@@ -2130,7 +2158,7 @@ impl<I: Identifiers> FocusRouter<I> {
         out.push(Output::Agent(AgentCommand::BeginCapture {
             kind: CaptureKind::Remote,
             lease_id,
-            self_timeout_ms: self.timing.lease_ttl_ms.min(1000),
+            self_deadline_ms: 0,
         }));
         let _ = (now_ms, peer);
     }

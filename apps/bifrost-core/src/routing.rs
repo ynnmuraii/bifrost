@@ -79,13 +79,16 @@ fn effect(output: &fr::Output) -> Effect {
 /// The mapping is the table in `docs/03-architecture.md` («Соответствие сетевым
 /// сообщениям»): `PrepareInject` ← `EnterPrepare`, `ArmDeadline` ←
 /// `EnterCommit`/`LeaseRenew`, `Inject` ← `InputBatch`, `ReleaseSession` ← `Leave`.
-pub fn agent_command(command: &fr::AgentCommand) -> ipc::agent_frame::Msg {
+pub fn agent_command(
+    command: &fr::AgentCommand,
+    host_origin_us: Option<u64>,
+) -> ipc::agent_frame::Msg {
     use ipc::agent_frame::Msg;
     match command {
         fr::AgentCommand::BeginCapture {
             kind,
             lease_id,
-            self_timeout_ms,
+            self_deadline_ms,
         } => Msg::BeginCapture(ipc::BeginCapture {
             kind: capture_kind_to_i32(*kind),
             // `ipc.proto`: `lease_id` is «16 bytes for TEMPORARY/REMOTE» — an
@@ -96,11 +99,13 @@ pub fn agent_command(command: &fr::AgentCommand) -> ipc::agent_frame::Msg {
             } else {
                 lease_id.to_vec()
             },
-            // `ipc.proto`: the agent ends capture by itself, max 1000 ms.
-            self_timeout_ms: u32::try_from(*self_timeout_ms)
-                .unwrap_or(u32::MAX)
-                .min(1000),
+            self_deadline_us: if *self_deadline_ms == 0 {
+                0
+            } else {
+                host_deadline_us(*self_deadline_ms, host_origin_us)
+            },
             dev_capture_injected: false,
+            issued_at_us: ::ipc::clock::host_monotonic_us().unwrap_or(0),
         }),
         fr::AgentCommand::EndCapture {
             lease_id,
@@ -111,6 +116,7 @@ pub fn agent_command(command: &fr::AgentCommand) -> ipc::agent_frame::Msg {
         }),
         fr::AgentCommand::PrepareInject { lease_id } => Msg::PrepareInject(ipc::PrepareInject {
             lease_id: lease_id.to_vec(),
+            issued_at_us: ::ipc::clock::host_monotonic_us().unwrap_or(0),
         }),
         fr::AgentCommand::Inject {
             lease_id,
@@ -123,13 +129,10 @@ pub fn agent_command(command: &fr::AgentCommand) -> ipc::agent_frame::Msg {
         }),
         fr::AgentCommand::ArmDeadline {
             lease_id,
-            remaining_ms,
+            deadline_ms,
         } => Msg::ArmDeadline(ipc::ArmDeadline {
             lease_id: lease_id.to_vec(),
-            // Rule 4: `ArmDeadline.remaining_ms` is 1..=1000.
-            remaining_ms: u32::try_from(*remaining_ms)
-                .unwrap_or(u32::MAX)
-                .clamp(1, 1000),
+            deadline_us: host_deadline_us(*deadline_ms, host_origin_us),
         }),
         fr::AgentCommand::ReleaseSession { lease_id } => Msg::ReleaseSession(ipc::ReleaseSession {
             lease_id: lease_id.to_vec(),
@@ -253,24 +256,11 @@ pub fn hello(
     }
 }
 
-/// `ArmDeadline.remaining_ms` for a local timer the *agent* enforces, or `None`.
-///
-/// Rule 4 puts the receiver's lease deadline on the agent's own clock and bounds the frame
-/// at `1..=1000` ms (`docs/ipc.proto`), and the IPC mapping table of
-/// `docs/03-architecture.md` asks for `ArmDeadline(issue_time + lease_ttl_ms − now)` on
-/// every valid renew. The deadline itself stays in the core (the FSM owns it); this only
-/// translates it for the clock that enforces it, so `EnterCommit` and each `LeaseRenew`
-/// re-arm the agent with the remaining time instead of letting its one-shot frame from
-/// `EnterCommit` fire `lease_ttl_ms` later.
-pub fn deadline_rearm_ms(timer: fr::Timer, deadline_ms: u64, now_ms: u64) -> Option<u32> {
-    match timer {
-        fr::Timer::ReceiverLeaseDeadline => Some(
-            u32::try_from(deadline_ms.saturating_sub(now_ms))
-                .unwrap_or(u32::MAX)
-                .clamp(1, 1000),
-        ),
-        _ => None,
-    }
+/// Convert once from the fixed core FSM origin, never from queue/delivery time.
+pub fn host_deadline_us(deadline_ms: u64, host_origin_us: Option<u64>) -> u64 {
+    host_origin_us
+        .and_then(|origin| deadline_ms.checked_mul(1000)?.checked_add(origin))
+        .unwrap_or(0)
 }
 
 /// Replaces capability estimates with the running platform adapter's answer.
@@ -418,6 +408,9 @@ pub enum AgentSignal {
 /// `Ok` from `Partial`.
 pub struct AgentContext {
     prepared: Option<[u8; 16]>,
+    capture: Option<[u8; 16]>,
+    /// Conservative synthetic downs admitted to native work, not physical source state.
+    recovery: input_model::PressedState,
     /// Admitted native work and an ordered, bounded local backpressure queue.
     offered: VecDeque<OfferedInput>,
     pending: VecDeque<fr::AgentCommand>,
@@ -437,13 +430,15 @@ impl std::fmt::Debug for AgentContext {
 struct OfferedInput {
     lease_id: [u8; 16],
     seq: u64,
-    events: usize,
+    events: Vec<InputEvent>,
 }
 
 impl Default for AgentContext {
     fn default() -> Self {
         Self {
             prepared: None,
+            capture: None,
+            recovery: input_model::PressedState::default(),
             offered: VecDeque::with_capacity(crate::QUEUE_CAPACITY),
             pending: VecDeque::with_capacity(crate::QUEUE_CAPACITY),
         }
@@ -491,15 +486,34 @@ impl AgentContext {
     fn track(&mut self, command: &fr::AgentCommand) {
         match command {
             fr::AgentCommand::PrepareInject { lease_id } => self.prepared = Some(*lease_id),
+            fr::AgentCommand::BeginCapture { kind, lease_id, .. }
+                if *kind != input_model::CaptureKind::Observe =>
+            {
+                self.capture = Some(*lease_id)
+            }
             fr::AgentCommand::Inject {
                 lease_id,
                 input_batch_seq,
                 events,
             } => {
+                for event in events {
+                    if matches!(
+                        event,
+                        InputEvent::Key {
+                            state: KeyState::Down,
+                            ..
+                        } | InputEvent::Button {
+                            state: KeyState::Down,
+                            ..
+                        }
+                    ) {
+                        self.recovery.apply(event);
+                    }
+                }
                 self.offered.push_back(OfferedInput {
                     lease_id: *lease_id,
                     seq: *input_batch_seq,
-                    events: events.len(),
+                    events: events.clone(),
                 });
             }
             _ => {}
@@ -509,12 +523,16 @@ impl AgentContext {
     /// The old IPC session is gone; retain allocation, not its outstanding identities.
     pub fn reset(&mut self) {
         self.prepared = None;
+        self.capture = None;
         self.offered.clear();
         self.pending.clear();
     }
 
     fn released(&mut self, lease_id: [u8; 16]) {
         self.offered.retain(|offer| offer.lease_id != lease_id);
+        if self.capture == Some(lease_id) {
+            self.capture = None;
+        }
         self.pending.retain(|pending| {
             !matches!(pending,
             fr::AgentCommand::Inject { lease_id: pending_lease, .. } if *pending_lease == lease_id)
@@ -524,12 +542,62 @@ impl AgentContext {
         }
     }
 
-    fn take_offered(&mut self, lease_id: [u8; 16], seq: u64) -> Option<usize> {
+    /// Retained across agent loss; only a verified complete recovery ACK clears it.
+    pub fn recovery(&self) -> &input_model::PressedState {
+        &self.recovery
+    }
+
+    pub fn recovery_complete(&mut self) {
+        self.recovery = Default::default();
+    }
+
+    fn acknowledge(&mut self, offer: &OfferedInput, applied: u32, os_error: &str) {
+        if applied as usize != offer.events.len() || !os_error.is_empty() {
+            return;
+        }
+        for event in &offer.events {
+            let superseded = self.offered.iter().any(|later| {
+                later.events.iter().any(|next| match (event, next) {
+                    (
+                        InputEvent::Key { key, .. },
+                        InputEvent::Key {
+                            key: other,
+                            state: KeyState::Down,
+                        },
+                    ) => key == other,
+                    (
+                        InputEvent::Button { button, .. },
+                        InputEvent::Button {
+                            button: other,
+                            state: KeyState::Down,
+                        },
+                    ) => button == other,
+                    _ => false,
+                })
+            });
+            if !superseded
+                && matches!(
+                    event,
+                    InputEvent::Key {
+                        state: KeyState::Up,
+                        ..
+                    } | InputEvent::Button {
+                        state: KeyState::Up,
+                        ..
+                    }
+                )
+            {
+                self.recovery.apply(event);
+            }
+        }
+    }
+
+    fn take_offered(&mut self, lease_id: [u8; 16], seq: u64) -> Option<OfferedInput> {
         let index = self
             .offered
             .iter()
             .position(|offer| offer.lease_id == lease_id && offer.seq == seq)?;
-        self.offered.remove(index).map(|offer| offer.events)
+        self.offered.remove(index)
     }
 }
 
@@ -556,6 +624,37 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
             None => AgentSignal::Ignored,
         },
         Msg::Captured(batch) => AgentSignal::Captured(batch.clone()),
+        Msg::PhysicalPressed(pressed) => AgentSignal::Fsm(fr::AgentEvent::PressedState {
+            keys: pressed
+                .keys
+                .iter()
+                .filter_map(|key| {
+                    Some(input_model::HidKey {
+                        page: key.usage_page.try_into().ok()?,
+                        usage: key.usage.try_into().ok()?,
+                    })
+                })
+                .collect(),
+            buttons: pressed
+                .buttons
+                .iter()
+                .filter_map(|button| {
+                    u16::try_from(*button)
+                        .ok()?
+                        .checked_add(0x10f)
+                        .and_then(input_model::MouseButton::from_evdev_code)
+                })
+                .collect(),
+            known: pressed.known
+                && pressed
+                    .keys
+                    .iter()
+                    .all(|key| key.usage_page <= u16::MAX as u32 && key.usage <= u16::MAX as u32)
+                && pressed
+                    .buttons
+                    .iter()
+                    .all(|button| (1..=5).contains(button)),
+        }),
         Msg::Released(released) => match lease_id(&released.lease_id) {
             // `ReleaseKeys` answers with an empty lease id: it is a RECOVERY ack and
             // never drives the FSM (the counts are logged by the caller).
@@ -575,6 +674,9 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
         Msg::InjectResult(result) => match lease_id(&result.lease_id) {
             Some(lease_id) => {
                 let offered = context.take_offered(lease_id, result.input_batch_seq);
+                if let Some(offer) = &offered {
+                    context.acknowledge(offer, result.applied_count, &result.os_error);
+                }
                 AgentSignal::Fsm(fr::AgentEvent::InjectResult {
                     lease_id,
                     input_batch_seq: result.input_batch_seq,
@@ -582,7 +684,11 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
                     actual_position: result.actual.as_ref().map(|pointer| {
                         geometry::Position::new("".to_owned(), pointer.x, pointer.y)
                     }),
-                    status: inject_status(result.applied_count, offered, &result.os_error),
+                    status: inject_status(
+                        result.applied_count,
+                        offered.map(|offer| offer.events.len()),
+                        &result.os_error,
+                    ),
                 })
             }
             None => AgentSignal::Ignored,
@@ -612,10 +718,29 @@ pub fn agent_signal(frame: &ipc::agent_frame::Msg, context: &mut AgentContext) -
         // A refused clipboard copy (too large, secret, disabled) is the clipboard's business:
         // fed to the FSM it would cancel a prepared lease as an `InvalidFrame`.
         Msg::Error(error) if error.code.starts_with("CLIPBOARD_") => AgentSignal::Ignored,
-        Msg::Error(error) => AgentSignal::Fsm(fr::AgentEvent::Error {
-            lease_id: context.prepared.take(),
-            code: error_code(&error.code),
-        }),
+        Msg::Error(error) => {
+            let attributed = lease_id(&error.lease_id)
+                .or(context.capture)
+                .or(context.prepared);
+            let code = error_code(&error.code);
+            if matches!(
+                code,
+                fr::ErrorCode::CaptureFailed
+                    | fr::ErrorCode::UnsupportedSession
+                    | fr::ErrorCode::InjectionFailed
+                    | fr::ErrorCode::AgentLost
+            ) && context.capture == attributed
+            {
+                context.capture = None;
+            }
+            if context.prepared == attributed {
+                context.prepared = None;
+            }
+            AgentSignal::Fsm(fr::AgentEvent::Error {
+                lease_id: attributed,
+                code,
+            })
+        }
         Msg::Pong(_) => AgentSignal::Ignored,
         // The clipboard IPC never drives the focus FSM: `ClipboardChanged` is offered to the
         // peers on the clipboard channel and `SetClipboardText` is addressed to the agent, so
@@ -693,7 +818,7 @@ pub fn inject_status(applied: u32, offered: Option<usize>, os_error: &str) -> fr
         };
     }
     match offered {
-        Some(offered) if applied as usize >= offered => fr::InjectStatus::Ok,
+        Some(offered) if applied as usize == offered => fr::InjectStatus::Ok,
         Some(0) if applied == 0 => fr::InjectStatus::Ok,
         Some(_) if applied == 0 => fr::InjectStatus::Failed,
         Some(_) => fr::InjectStatus::Partial,
@@ -707,7 +832,10 @@ pub fn inject_status(applied: u32, offered: Option<usize>, os_error: &str) -> fr
 /// `AgentError.code` → the FSM's code.
 pub fn error_code(code: &str) -> fr::ErrorCode {
     match code {
-        "CAPTURE_FAILED" | "QUEUE_OVERFLOW" | "STARTUP_ONLY" => fr::ErrorCode::CaptureFailed,
+        "CAPTURE_FAILED" | "QUEUE_OVERFLOW" | "STARTUP_ONLY" | "HOTKEY_UNAVAILABLE" => {
+            fr::ErrorCode::CaptureFailed
+        }
+        code if code.starts_with("PORTAL_") => fr::ErrorCode::CaptureFailed,
         "UNSUPPORTED_SESSION" => fr::ErrorCode::UnsupportedSession,
         "INJECTION_FAILED" => fr::ErrorCode::InjectionFailed,
         "AGENT_LOST" => fr::ErrorCode::AgentLost,
@@ -824,6 +952,7 @@ pub fn agent_frame_name(frame: &ipc::agent_frame::Msg) -> &'static str {
         Msg::HotkeysResult(_) => "HotkeysResult",
         Msg::HotkeyPressed(_) => "HotkeyPressed",
         Msg::GameGuardSignals(_) => "GameGuardSignals",
+        Msg::PhysicalPressed(_) => "PhysicalPressed",
     }
 }
 
@@ -863,7 +992,7 @@ mod tests {
             fr::AgentCommand::BeginCapture {
                 kind: input_model::CaptureKind::Temporary,
                 lease_id: id,
-                self_timeout_ms: 200,
+                self_deadline_ms: 200,
             },
             fr::AgentCommand::EndCapture {
                 lease_id: id,
@@ -872,58 +1001,44 @@ mod tests {
             fr::AgentCommand::PrepareInject { lease_id: id },
             fr::AgentCommand::ArmDeadline {
                 lease_id: id,
-                remaining_ms: 500,
+                deadline_ms: 500,
             },
             fr::AgentCommand::ReleaseSession { lease_id: id },
         ];
         for command in cases {
-            let frame = agent_command(&command);
+            let frame = agent_command(&command, Some(0));
             assert!(!matches!(
                 frame,
                 ipc::agent_frame::Msg::Ready(_) | ipc::agent_frame::Msg::Pong(_)
             ));
         }
 
-        match agent_command(&fr::AgentCommand::ArmDeadline {
-            lease_id: id,
-            remaining_ms: 5_000,
-        }) {
-            ipc::agent_frame::Msg::ArmDeadline(arm) => assert_eq!(arm.remaining_ms, 1000),
+        match agent_command(
+            &fr::AgentCommand::ArmDeadline {
+                lease_id: id,
+                deadline_ms: 5_000,
+            },
+            Some(123),
+        ) {
+            ipc::agent_frame::Msg::ArmDeadline(arm) => assert_eq!(arm.deadline_us, 5_000_123),
             other => panic!("expected ArmDeadline, got {other:?}"),
         }
-        // The receiver's lease deadline is enforced by the agent (rule 4), so the core has
-        // to translate every re-arm of it into a fresh `ArmDeadline`: the frame sent at
-        // `EnterCommit` is a one-shot on the agent's clock, and a `LeaseRenew` that only
-        // moved the core's timer would still let the agent's deadline fire.
-        assert_eq!(
-            deadline_rearm_ms(fr::Timer::ReceiverLeaseDeadline, 1_500, 1_000),
-            Some(500),
-            "a renew moves the deadline, so the agent gets the remaining time"
-        );
-        assert_eq!(
-            deadline_rearm_ms(fr::Timer::ReceiverLeaseDeadline, 1_000, 1_000),
-            Some(1),
-            "rule 4: the frame is never 0"
-        );
-        assert_eq!(
-            deadline_rearm_ms(fr::Timer::ReceiverLeaseDeadline, 9_000, 1_000),
-            Some(1_000),
-            "rule 4: the frame is never above 1000 ms"
-        );
-        assert_eq!(
-            deadline_rearm_ms(fr::Timer::PrepareTimeout, 1_500, 1_000),
-            None,
-            "only the timer the agent enforces travels to it"
-        );
+        assert_eq!(host_deadline_us(1_500, Some(1_000_000)), 2_500_000);
+        assert_eq!(host_deadline_us(0, Some(1_000_000)), 1_000_000);
+        assert_eq!(host_deadline_us(u64::MAX, Some(1)), 0);
+        assert_eq!(host_deadline_us(500, None), 0);
 
-        match agent_command(&fr::AgentCommand::BeginCapture {
-            kind: input_model::CaptureKind::Remote,
-            lease_id: id,
-            self_timeout_ms: 9_000,
-        }) {
+        match agent_command(
+            &fr::AgentCommand::BeginCapture {
+                kind: input_model::CaptureKind::Remote,
+                lease_id: id,
+                self_deadline_ms: 9_000,
+            },
+            Some(0),
+        ) {
             ipc::agent_frame::Msg::BeginCapture(begin) => {
                 assert_eq!(begin.kind, 3, "REMOTE is 3 in ipc.proto");
-                assert_eq!(begin.self_timeout_ms, 1000);
+                assert_eq!(begin.self_deadline_us, 9_000_000);
                 assert_eq!(begin.lease_id, id.to_vec());
             }
             other => panic!("expected BeginCapture, got {other:?}"),
@@ -1474,6 +1589,7 @@ mod contract_tests {
             fr::AgentCommand::PrepareInject { lease_id: lease(4) }
         ));
         let refusal = ipc::agent_frame::Msg::Error(ipc::AgentError {
+            lease_id: Vec::new(),
             code: "CLIPBOARD_TOO_LARGE".to_owned(),
             detail: "2 MiB".to_owned(),
         });
@@ -1497,6 +1613,7 @@ mod contract_tests {
         ));
 
         let error = ipc::agent_frame::Msg::Error(ipc::AgentError {
+            lease_id: Vec::new(),
             code: "CAPTURE_FAILED".to_owned(),
             detail: "no capture".to_owned(),
         });
@@ -2019,7 +2136,7 @@ mod bounded_native_tests {
                 context
                     .on_command(fr::AgentCommand::ArmDeadline {
                         lease_id: [4; 16],
-                        remaining_ms: 900,
+                        deadline_ms: 900,
                     })
                     .unwrap(),
                 Some(fr::AgentCommand::ArmDeadline { .. })
@@ -2088,5 +2205,293 @@ mod bounded_native_tests {
             context.take_ready().is_none(),
             "cancelled pending input crossed the lease boundary"
         );
+    }
+}
+
+#[cfg(test)]
+mod input_safety_tests {
+    use super::*;
+
+    fn nodes() -> [NodeId; 2] {
+        [NodeId::new([1; 32]), NodeId::new([2; 32])]
+    }
+
+    fn routers() -> [fr::FocusRouter; 2] {
+        let nodes = nodes();
+        let caps = fr::Capabilities {
+            capture: true,
+            inject: true,
+            absolute_pointer: true,
+            emergency_hotkey: true,
+        };
+        std::array::from_fn(|side| {
+            let mut router = fr::FocusRouter::new(
+                nodes[side],
+                fr::Timing::default(),
+                fr::SequentialIds::default(),
+                caps,
+            )
+            .with_persisted_ownership(1, Some((1, nodes[0])));
+            router.handle(
+                0,
+                fr::Input::Agent(fr::AgentEvent::PressedState {
+                    keys: vec![],
+                    buttons: vec![],
+                    known: true,
+                }),
+            );
+            router.handle(
+                0,
+                fr::Input::Hello {
+                    peer: nodes[1 - side],
+                    hello: fr::PeerHello {
+                        can_own: true,
+                        capabilities: caps,
+                        owner_serial: 1,
+                        owner: Some(nodes[0]),
+                    },
+                },
+            );
+            router
+        })
+    }
+
+    fn switch() -> fr::Input {
+        fr::Input::Local(fr::LocalInput::SwitchRequest {
+            trigger: fr::SwitchTrigger::Edge,
+            target: nodes()[1],
+            entry_position: geometry::Position::new("display", 2.0, 3.0),
+            topology_revision: 0,
+        })
+    }
+
+    // Dispatch only real routing/decoder paths. Native application is covered by agent Dry tests.
+    fn pump(
+        routers: &mut [fr::FocusRouter; 2],
+        contexts: &mut [AgentContext; 2],
+        side: usize,
+        outputs: Vec<fr::Output>,
+        now: u64,
+    ) -> Vec<(usize, fr::Output)> {
+        use protocol::ipc::agent_frame::Msg;
+        let mut pending: VecDeque<_> = outputs.into_iter().map(|output| (side, output)).collect();
+        let mut seen = Vec::new();
+        while let Some((side, output)) = pending.pop_front() {
+            assert!(seen.len() < 200, "handshake did not settle");
+            seen.push((side, output.clone()));
+            let next = match output {
+                fr::Output::Send { peer, message } => {
+                    assert_eq!(peer, nodes()[1 - side]);
+                    Some((
+                        1 - side,
+                        routers[1 - side].handle(
+                            now,
+                            fr::Input::Net {
+                                from: nodes()[side],
+                                message,
+                            },
+                        ),
+                    ))
+                }
+                fr::Output::Agent(command) => {
+                    let command = contexts[side].on_command(command).unwrap().unwrap();
+                    let answer = match agent_command(&command, Some(0)) {
+                        Msg::BeginCapture(begin) => Some(Msg::CaptureReady(ipc::CaptureReady {
+                            lease_id: begin.lease_id,
+                            kind: begin.kind,
+                        })),
+                        Msg::PrepareInject(_) => Some(Msg::Ready(ipc::AgentReady::default())),
+                        Msg::EndCapture(end) => Some(Msg::Released(ipc::Released {
+                            lease_id: end.lease_id,
+                            ..Default::default()
+                        })),
+                        Msg::ReleaseSession(release) => Some(Msg::Released(ipc::Released {
+                            lease_id: release.lease_id,
+                            ..Default::default()
+                        })),
+                        Msg::ArmDeadline(_) => None,
+                        other => panic!("unexpected native work in handshake: {other:?}"),
+                    };
+                    answer.and_then(|answer| match agent_signal(&answer, &mut contexts[side]) {
+                        AgentSignal::Fsm(event) => {
+                            Some((side, routers[side].handle(now, fr::Input::Agent(event))))
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            };
+            if let Some((side, outputs)) = next {
+                pending.extend(outputs.into_iter().map(|output| (side, output)));
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn runtime_physical_snapshot_decoder_gates_held_and_unknown_source_state() {
+        let [mut router, _] = routers();
+        let mut context = AgentContext::default();
+        for (keys, known, expected) in [
+            (
+                vec![ipc::HidKey {
+                    usage_page: 7,
+                    usage: 4,
+                    down: true,
+                }],
+                true,
+                fr::TransitionRefusal::PressedInputHeld,
+            ),
+            (
+                Vec::new(),
+                false,
+                fr::TransitionRefusal::PhysicalStateUnknown,
+            ),
+        ] {
+            let signal = agent_signal(
+                &ipc::agent_frame::Msg::PhysicalPressed(ipc::PhysicalPressed {
+                    keys,
+                    buttons: Vec::new(),
+                    known,
+                }),
+                &mut context,
+            );
+            let AgentSignal::Fsm(event) = signal else {
+                panic!("snapshot was not decoded")
+            };
+            router.handle(1, fr::Input::Agent(event));
+            let outputs = router.handle(2, switch());
+            assert!(outputs.iter().any(|out| matches!(out, fr::Output::Notice(fr::Notice::SwitchRefused { reason, .. }) if *reason == expected)));
+            assert!(router.lease().is_idle());
+            assert!(
+                context.recovery().is_empty(),
+                "physical holds leaked into synthetic recovery"
+            );
+        }
+        let AgentSignal::Fsm(event) = agent_signal(
+            &ipc::agent_frame::Msg::PhysicalPressed(ipc::PhysicalPressed {
+                known: true,
+                ..Default::default()
+            }),
+            &mut context,
+        ) else {
+            panic!("snapshot missing")
+        };
+        router.handle(3, fr::Input::Agent(event));
+        assert!(router.handle(4, switch()).iter().any(|out| matches!(
+            out,
+            fr::Output::Agent(fr::AgentCommand::BeginCapture { .. })
+        )));
+    }
+
+    #[test]
+    fn source_capture_errors_decode_to_terminal_peer_release_and_stop_renewals() {
+        for code in ["QUEUE_OVERFLOW", "CAPTURE_FAILED", "PORTAL_SESSION_LOST"] {
+            let mut routers = routers();
+            let mut contexts = [AgentContext::default(), AgentContext::default()];
+            let start = routers[0].handle(1, switch());
+            pump(&mut routers, &mut contexts, 0, start, 2);
+            assert_eq!(routers[0].focus(), fr::FocusState::Remote);
+            assert_eq!(
+                routers[1].lease().receiver().unwrap().state,
+                fr::ReceiverState::Active
+            );
+            let lease_id = routers[0].lease().source().unwrap().lease_id;
+            let AgentSignal::Fsm(event) = agent_signal(
+                &ipc::agent_frame::Msg::Error(ipc::AgentError {
+                    code: code.to_owned(),
+                    detail: "capture disconnected".to_owned(),
+                    lease_id: lease_id.to_vec(),
+                }),
+                &mut contexts[0],
+            ) else {
+                panic!("error was not decoded")
+            };
+            assert_eq!(
+                event,
+                fr::AgentEvent::Error {
+                    lease_id: Some(lease_id),
+                    code: fr::ErrorCode::CaptureFailed
+                }
+            );
+            let outputs = routers[0].handle(3, fr::Input::Agent(event));
+            let seen = pump(&mut routers, &mut contexts, 0, outputs, 4);
+            assert!(seen.iter().any(|(side, out)| *side == 1 && matches!(out,
+                fr::Output::Agent(fr::AgentCommand::ReleaseSession { lease_id: released }) if *released == lease_id)));
+            assert!(routers[0].lease().is_idle());
+            assert!(routers[1].lease().is_idle());
+            for now in (100..=2000).step_by(100) {
+                let outputs =
+                    routers[1].handle(now, fr::Input::TimerExpired(fr::Timer::ReceiverChallenge));
+                let seen = pump(&mut routers, &mut contexts, 1, outputs, now);
+                assert!(!seen.iter().any(|(_, out)| matches!(
+                    out,
+                    fr::Output::Send {
+                        message: fr::Message::LeaseRenew { .. },
+                        ..
+                    }
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_tracks_admitted_synthetic_downs_and_only_confirmed_ups() {
+        let mut context = AgentContext::default();
+        let key = input_model::HidKey::keyboard(4);
+        let command = |seq, state| fr::AgentCommand::Inject {
+            lease_id: [1; 16],
+            input_batch_seq: seq,
+            events: vec![InputEvent::Key { key, state }],
+        };
+        assert!(context
+            .on_command(command(1, KeyState::Down))
+            .unwrap()
+            .is_some());
+        assert!(
+            context.recovery().keys.contains(&key),
+            "down must be recorded before native admission can fail"
+        );
+        assert!(context
+            .on_command(command(2, KeyState::Up))
+            .unwrap()
+            .is_some());
+        agent_signal(
+            &ipc::agent_frame::Msg::InjectResult(ipc::InjectResult {
+                lease_id: vec![1; 16],
+                input_batch_seq: 2,
+                applied_count: 0,
+                os_error: "native failure".to_owned(),
+                ..Default::default()
+            }),
+            &mut context,
+        );
+        assert!(context.recovery().keys.contains(&key));
+        context.reset();
+        assert!(
+            context.recovery().keys.contains(&key),
+            "agent loss discarded the recovery ledger"
+        );
+        assert!(context
+            .on_command(command(3, KeyState::Up))
+            .unwrap()
+            .is_some());
+        agent_signal(
+            &ipc::agent_frame::Msg::InjectResult(ipc::InjectResult {
+                lease_id: vec![1; 16],
+                input_batch_seq: 3,
+                applied_count: 1,
+                ..Default::default()
+            }),
+            &mut context,
+        );
+        assert!(context.recovery().is_empty());
+        assert!(context
+            .on_command(command(4, KeyState::Down))
+            .unwrap()
+            .is_some());
+        context.reset();
+        context.recovery_complete();
+        assert!(context.recovery().is_empty());
     }
 }

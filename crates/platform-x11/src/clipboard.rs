@@ -743,9 +743,8 @@ mod x11_impl {
             }
         }
 
-        // Release the selection and destroy the window that owned it; the server then frees
-        // both and XFixes tells every other client the selection is unowned.
-        let _ = conn.set_selection_owner(AtomEnum::NONE, atoms.clipboard, CURRENT_TIME);
+        // Destroying our window releases only selections it still owns. Clearing CLIPBOARD
+        // explicitly would erase a foreign owner's selection; even querying first would race.
         let _ = conn.destroy_window(window);
         let _ = conn.flush();
     }

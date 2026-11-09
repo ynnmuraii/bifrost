@@ -61,6 +61,19 @@ fn frame(message: wire::gui_frame::Msg) -> wire::GuiFrame {
 }
 
 #[test]
+fn pairing_window_close_requires_a_correlated_request() {
+    let mut request = frame(wire::gui_frame::Msg::ClosePairingWindow(
+        wire::ClosePairingWindow {},
+    ));
+    validate_frame(&request).expect("correlated cancellation");
+    request.request_id = 0;
+    assert!(
+        validate_frame(&request).is_err(),
+        "unsolicited cancellation"
+    );
+}
+
+#[test]
 fn modern_listener_retains_dormant_media_preferences_without_relaxing_other_roles() {
     let mut value = config();
     value.peers.push(wire::AudioPeerConfig {

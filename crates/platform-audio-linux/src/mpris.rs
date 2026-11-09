@@ -53,6 +53,9 @@ struct Data {
 struct Shared {
     data: Mutex<Data>,
     stop: AtomicBool,
+    // A command future may send only while being polled under this gate.
+    // Cancellation takes the same gate before removing its admission ticket.
+    send_gate: Mutex<()>,
 }
 impl Data {
     fn new() -> Self {
@@ -184,6 +187,7 @@ impl Mpris {
         let shared = Arc::new(Shared {
             data: Mutex::new(Data::new()),
             stop: AtomicBool::new(false),
+            send_gate: Mutex::new(()),
         });
         let worker = shared.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -281,6 +285,7 @@ impl Mpris {
         Ok(())
     }
     pub fn cancel(&self) {
+        let _send = lock(&self.shared.send_gate);
         lock(&self.shared.data).cancel(BackendError::Cancelled);
     }
     pub fn shutdown(&mut self) {
@@ -425,6 +430,8 @@ async fn discover(
     player.next_poll = now + Duration::from_secs(1);
     data.players.insert(name.clone(), player);
     data.publish(&name, true, false, now);
+    drop(data);
+    refresh_artwork(shared, &name, model::ArtworkRequest::load);
 }
 async fn changed(connection: &Connection, shared: &Shared, message: Message) {
     let Some(sender) = message
@@ -487,7 +494,56 @@ async fn changed(connection: &Connection, shared: &Shared, message: Message) {
             let changed = player.apply(&interface, fields, now);
             data.publish(&name, changed, was, now);
         }
+        drop(data);
+        refresh_artwork(shared, &name, model::ArtworkRequest::load);
     }
+}
+fn refresh_artwork(
+    shared: &Shared,
+    name: &str,
+    load: impl FnOnce(&model::ArtworkRequest) -> Option<audio_backend::artwork::Artwork>,
+) {
+    let request = {
+        let mut data = lock(&shared.data);
+        data.players.get_mut(name).and_then(Player::take_artwork)
+    };
+    let Some(request) = request else {
+        return;
+    };
+    let artwork = load(&request);
+    let now = Instant::now();
+    let mut data = lock(&shared.data);
+    if let Some(player) = data.players.get_mut(name) {
+        let was = player.state == PlaybackState::Playing;
+        let changed = player.publish_artwork(&request, artwork);
+        data.publish(name, changed, was, now);
+    }
+}
+fn cancellable_command(
+    shared: Arc<Shared>,
+    ticket: u64,
+    future: impl Future<Output = (u64, Result<(), BackendError>)> + Send + 'static,
+) -> CommandFuture {
+    async move {
+        futures::pin_mut!(future);
+        futures::future::poll_fn(move |cx| {
+            let _send = lock(&shared.send_gate);
+            let admitted = {
+                let mut data = lock(&shared.data);
+                data.expire(Instant::now());
+                !shared.stop.load(Ordering::Acquire)
+                    && data.pending.iter().any(|pending| pending.ticket == ticket)
+            };
+            if !admitted {
+                return std::task::Poll::Ready((ticket, Err(BackendError::Cancelled)));
+            }
+            // zbus writes run in Future::poll, including lock/write awaits.
+            // Never poll transport after cancel() has crossed this gate.
+            future.as_mut().poll(cx)
+        })
+        .await
+    }
+    .boxed()
 }
 fn seeked(shared: &Shared, message: Message) {
     let Some(sender) = message
@@ -558,7 +614,7 @@ fn dispatch(shared: &Arc<Shared>, connection: &Connection) -> Option<(u64, Comma
     let shared = shared.clone();
     Some((
         ticket,
-        async move {
+        cancellable_command(shared.clone(), ticket, async move {
             let result = async {
                 if owner(&connection, &name).await? != target {
                     return Err(BackendError::DeviceGone);
@@ -616,31 +672,73 @@ fn dispatch(shared: &Arc<Shared>, connection: &Connection) -> Option<(u64, Comma
             }
             .await;
             (ticket, result)
-        }
-        .boxed(),
+        }),
     ))
+}
+fn position_target(
+    data: &mut Data,
+    now: Instant,
+) -> Option<(String, String, MediaSessionToken, u64)> {
+    let selected = data.selected;
+    data.players
+        .iter_mut()
+        .filter(|(_, player)| {
+            now >= player.next_poll
+                && (player.state == PlaybackState::Playing
+                    || (selected == Some(player.token)
+                        && player.position_refresh
+                        && matches!(player.state, PlaybackState::Paused | PlaybackState::Stopped)))
+        })
+        .min_by_key(|(_, player)| {
+            (
+                selected != Some(player.token) || !player.position_refresh,
+                player.next_poll,
+            )
+        })
+        .map(|(name, player)| {
+            player.position_refresh = false;
+            player.next_poll = now + Duration::from_secs(1);
+            (
+                name.clone(),
+                player.owner.clone(),
+                player.token,
+                player.revision,
+            )
+        })
+}
+fn position_received(
+    data: &mut Data,
+    target: &(String, String, MediaSessionToken, u64),
+    position: i64,
+    now: Instant,
+) {
+    let (name, owner, token, revision) = target;
+    if let Some(player) = data.players.get_mut(name).filter(|player| {
+        &player.owner == owner && player.token == *token && player.revision == *revision
+    }) {
+        let was = player.state == PlaybackState::Playing;
+        let changed = player.seek(position, now);
+        data.publish(name, changed, was, now);
+    }
 }
 async fn poll_position(connection: &Connection, shared: &Shared) {
     let target = {
         let mut data = lock(&shared.data);
-        if !data.pending.is_empty() {
+        if !data.pending.is_empty()
+            && !data
+                .players
+                .values()
+                .any(|player| Some(player.token) == data.selected && player.position_refresh)
+        {
             return;
         }
-        let now = Instant::now();
-        data.players
-            .iter_mut()
-            .filter(|(_, player)| player.state == PlaybackState::Playing && now >= player.next_poll)
-            .min_by_key(|(_, player)| player.next_poll)
-            .map(|(name, player)| {
-                player.next_poll = now + Duration::from_secs(1);
-                (name.clone(), player.owner.clone())
-            })
+        position_target(&mut data, Instant::now())
     };
-    let Some((name, owner)) = target else {
+    let Some(target) = target else {
         return;
     };
     let result: Result<OwnedValue, _> = bounded(RPC_TIMEOUT, async {
-        Proxy::new(connection, owner.as_str(), PATH, PROPERTIES)
+        Proxy::new(connection, target.1.as_str(), PATH, PROPERTIES)
             .await?
             .call("Get", &(PLAYER, "Position"))
             .await
@@ -649,16 +747,7 @@ async fn poll_position(connection: &Connection, shared: &Shared) {
     if let Ok(position) =
         result.and_then(|value| i64::try_from(value).map_err(|_| BackendError::InvalidArgument))
     {
-        let now = Instant::now();
-        let mut data = lock(&shared.data);
-        if let Some(player) = data
-            .players
-            .get_mut(&name)
-            .filter(|player| player.owner == owner)
-        {
-            let changed = player.seek(position, now);
-            data.publish(&name, changed, true, now);
-        }
+        position_received(&mut lock(&shared.data), &target, position, Instant::now());
     }
 }
 async fn run(shared: Arc<Shared>, ready: mpsc::SyncSender<()>) -> Result<(), BackendError> {

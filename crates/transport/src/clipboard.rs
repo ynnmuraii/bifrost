@@ -428,6 +428,9 @@ struct Grant {
     expires_ms: u64,
 }
 
+/// Unused grants are bounded independently of traffic and are never persisted.
+pub const MAX_OPEN_GRANTS: usize = 64;
+
 /// The pure grant bookkeeping: `ClipboardGrant` issuance and one-use `ClipboardBind`
 /// acceptance with the 60 s ttl (`clipboard::CHANNEL_TTL_MS`).
 #[derive(Debug, Default)]
@@ -447,6 +450,23 @@ impl Grants {
         version: (u32, u32),
         now_ms: u64,
     ) -> ([u8; 16], [u8; 32]) {
+        self.prune(now_ms);
+        if let Some((channel, grant)) = self.open.iter().find(|(_, grant)| {
+            grant.peer == peer && grant.parent == parent_connection_id && grant.version == version
+        }) {
+            return (*channel, grant.token);
+        }
+        // Only the current parent may retain an unused grant for a peer.
+        self.open.retain(|_, grant| grant.peer != peer);
+        if self.open.len() == MAX_OPEN_GRANTS {
+            let oldest = self
+                .open
+                .iter()
+                .min_by_key(|(_, grant)| grant.expires_ms)
+                .map(|(channel, _)| *channel)
+                .expect("full grant registry");
+            self.open.remove(&oldest);
+        }
         let channel_id = identity::random16().expect("system entropy source");
         let mut binding_token = [0u8; 32];
         binding_token[..16].copy_from_slice(&identity::random16().expect("system entropy source"));
@@ -475,12 +495,10 @@ impl Grants {
         token: &[u8; 32],
         now_ms: u64,
     ) -> Result<(u32, u32), ClipboardViolation> {
+        self.prune(now_ms);
         let Some(grant) = self.open.get(channel_id) else {
             return Err(ClipboardViolation::BadId);
         };
-        if now_ms > grant.expires_ms {
-            return Err(ClipboardViolation::BadId);
-        }
         if grant.peer != peer || grant.parent != *parent || grant.token != *token {
             return Err(ClipboardViolation::BadId);
         }
@@ -489,10 +507,21 @@ impl Grants {
         Ok(version)
     }
 
+    /// Removes unused grants once their issuer-clock deadline has passed.
+    pub fn prune(&mut self, now_ms: u64) {
+        self.open.retain(|_, grant| now_ms <= grant.expires_ms);
+    }
+
     /// Drops every grant of a parent link: closing the input link closes its clipboard
     /// channel.
     pub fn close_parent(&mut self, parent: &[u8; 16]) {
         self.open.retain(|_, grant| grant.parent != *parent);
+    }
+
+    /// Invalidates superseded parents even when their channels were never bound.
+    pub fn retain_parent(&mut self, peer: NodeId, parent: &[u8; 16]) {
+        self.open
+            .retain(|_, grant| grant.peer != peer || grant.parent == *parent);
     }
 
     /// Grants still open (diagnostics/tests).

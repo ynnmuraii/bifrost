@@ -160,13 +160,11 @@ jobs:
           fi
           df -h "$GITHUB_WORKSPACE"
 
-      # The only native code in the dependency graph is ring (rustls), which
-      # needs a C compiler and an archiver for its C and assembly parts;
-      # binutils supplies `nm` for the agent symbol check below. Everything else
-      # on Linux is pure Rust: x11rb builds its RustConnection, and zbus, ashpd
-      # and reis have no C counterpart, so no X11/Wayland -dev packages are
-      # installed and no X or D-Bus session is needed — the platform tests assert
-      # pure contracts against injected environment data.
+      # ring needs a C compiler/archiver, and the default audio profile builds
+      # vendored Opus through CMake. X11, Wayland and portal clients otherwise use
+      # Rust protocol bindings or runtime-loaded system libraries; no desktop
+      # development headers are required. Agent network ownership is checked
+      # through its dependency/source boundary and runtime guard, not nm.
       #
       # Xvfb is the one exception, and `docs/06-development-plan.md` («CI и
       # выпуск») asks for it: «Linux runner Xvfb/XTest проверяет часть
@@ -189,12 +187,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential binutils xvfb xauth
+          sudo apt-get install --yes --no-install-recommends build-essential cmake binutils xvfb xauth
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
+        env:
+          CARGO_TARGET_DIR: target/clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # ADR-009: the product is MIT, so every crate that ends up in a shipped binary must be
@@ -230,9 +230,14 @@ jobs:
       # agent (`bifrost agent …` from its own executable). Build the workspace first.
       - name: Build
         run: cargo build --workspace
+      - name: No-audio product profile
+        env:
+          CARGO_TARGET_DIR: target/no-audio
+        run: cargo check --locked -p bifrost --no-default-features --all-targets
 
       # docs/03-architecture.md, agent rule 1: the agent owns no network sockets.
       #
+
       # The agent used to be a separate executable, so the Windows build could prove it at
       # link time (no winsock import) and the Linux build by a symbol list. The one
       # `bifrost` executable links winsock for the core, and a symbol list over it says
@@ -335,6 +340,10 @@ jobs:
           TMP: ${{ runner.temp }}\bifrost-roots
           TEMP: ${{ runner.temp }}\bifrost-roots
         run: cargo test -p platform-win -p bifrost-agent -p bifrost-tray -p identity -p config -p ipc
+
+      - name: Windows read-only audio controls
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p platform-audio-win --test windows_read_only
 
       # Windows runners have a session; Linux ones need Xvfb (above). The fault
       # suite in `apps/bifrost-core/tests/fault_injection.rs` is what makes this

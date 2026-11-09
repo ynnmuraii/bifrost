@@ -57,7 +57,10 @@ impl LinkDownReason {
     fn permits_graceful_close(&self) -> bool {
         matches!(
             self,
-            Self::LocalClosed | Self::Incompatible | Self::ProtocolRefused(_)
+            Self::LocalClosed
+                | Self::Incompatible
+                | Self::ProtocolRefused(_)
+                | Self::MembershipFull
         )
     }
 }
@@ -664,10 +667,6 @@ impl LinkHandle {
         self.auxiliary.handle()
     }
 
-    pub(crate) fn invalidate_auxiliary(&self) {
-        self.auxiliary.invalidate();
-    }
-
     /// Published aggregate diagnostics contain durations and counters only.
     pub fn input_metrics(&self) -> crate::input_metrics::InputMetricsSnapshot {
         self.metrics
@@ -968,6 +967,22 @@ impl LinkHandle {
         Arc::clone(&self.lease_diagnostics)
     }
 
+    /// Seals a refused runtime link, flushing only its terminal refusal within the close budget.
+    pub(crate) fn refuse_membership(&self, connection_id: [u8; 16]) {
+        self.auxiliary.invalidate();
+        let (reply, _flushed) = tokio::sync::oneshot::channel();
+        if self
+            .queue
+            .refuse(connection_id, wire::ErrorCode::MembershipFull, 0, reply)
+            .is_err()
+        {
+            self.close();
+            return;
+        }
+        self.queue.begin_close();
+        set_terminal_once(&self.terminal, || LinkDownReason::MembershipFull);
+    }
+
     #[cfg(test)]
     pub(crate) fn for_counter_test(peer: NodeId) -> Self {
         let (terminal, _) = tokio::sync::watch::channel(None);
@@ -1024,6 +1039,8 @@ pub enum LinkReport {
     },
     /// A focus/lease message.
     Message {
+        /// The exact admitted link generation, not merely the authenticated peer.
+        key: [u8; 16],
         /// The peer.
         peer: NodeId,
         /// The message, in the layer that owns it.
@@ -1845,6 +1862,7 @@ impl LinkState {
         static LOG_RATE: logging::LogRateLimit = logging::LogRateLimit::new();
         let result = reports
             .send(LinkReport::Message {
+                key: self.key,
                 peer: self.peer,
                 message,
             })

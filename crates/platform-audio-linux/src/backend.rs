@@ -39,6 +39,7 @@ pub(crate) struct Entry {
     pub(crate) index: u32,
     pub monitor: Option<String>,
     pub serial: Option<u64>,
+    pub server_cookie: u32,
 }
 pub(crate) type Key = (bool, String);
 #[derive(Default)]
@@ -178,6 +179,7 @@ impl State {
                 old.index == entry.index
                     && old.device.format == entry.device.format
                     && old.serial == entry.serial
+                    && old.server_cookie == entry.server_cookie
             }) {
                 entry.generation = old.generation;
             } else {
@@ -396,6 +398,7 @@ fn enumerate(client: &Client) -> Result<(BTreeMap<Key, Entry>, Defaults), Backen
                 index: sink.index,
                 generation: 0,
                 serial: raw::object_serial(&sink.props),
+                server_cookie: server.cookie,
                 monitor: sink
                     .monitor_source_name
                     .as_deref()
@@ -420,6 +423,7 @@ fn enumerate(client: &Client) -> Result<(BTreeMap<Key, Entry>, Defaults), Backen
                 index: source.index,
                 generation: 0,
                 serial: raw::object_serial(&source.props),
+                server_cookie: server.cookie,
                 monitor: None,
             },
         );
@@ -620,6 +624,7 @@ mod tests {
             index,
             monitor: Some("TEST_SINK.monitor".into()),
             serial: Some(u64::from(index) + 1),
+            server_cookie: 5,
         }
     }
     #[test]
@@ -648,6 +653,16 @@ mod tests {
         changed.serial = Some(9);
         state.replace(
             BTreeMap::from([(key.clone(), changed)]),
+            Defaults::default(),
+            true,
+        );
+        assert_ne!(lock(&state.catalog).entries[&key].generation, generation);
+        let generation = lock(&state.catalog).entries[&key].generation;
+        let mut replaced_server = entry(1);
+        replaced_server.serial = Some(9);
+        replaced_server.server_cookie = 6;
+        state.replace(
+            BTreeMap::from([(key.clone(), replaced_server)]),
             Defaults::default(),
             true,
         );

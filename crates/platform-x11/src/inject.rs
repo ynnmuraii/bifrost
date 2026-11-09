@@ -19,7 +19,9 @@
 use std::collections::HashSet;
 
 use input_model::{InputEvent, KeyState, Position};
-use x11rb::connection::Connection as _;
+use x11rb::connection::{
+    Connection as _, DiscardMode, RequestConnection as _, RequestKind, SequenceNumber,
+};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, Window};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -41,20 +43,19 @@ const XTEST_DEFAULT_DEVICE: u8 = 0;
 
 /// The outcome of one injection batch.
 ///
-/// Mirrors the adapter contract: a batch is applied event by event, and a partial
-/// failure reports how many events made it *and* the error, so the caller can
-/// decide to abort without replaying the whole batch (which would double-apply the
-/// events that already landed).
+/// A partial failure reports the proven event prefix and an error. Later queued
+/// events may also have landed; never replay the batch. The held ledger tracks
+/// individually accepted releases and conservative downs independently.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InjectResult {
-    /// Number of events from the batch that were consumed, in order.
+    /// Accepted event prefix for injection; proven individual ups for release_all.
     ///
     /// A `Scroll` whose 120-unit remainder has not yet reached a whole notch is
     /// consumed (the remainder is retained for the next event) without sending a
     /// request, and still counts here — nothing is lost either way.
     pub applied_count: usize,
-    /// `Some` when the batch stopped early (or the flush failed); the failing
-    /// event and everything after it were not applied.
+    /// Set for request, flush or synchronization failure. Events after the proven
+    /// prefix may already have landed; this is not permission to replay them.
     pub os_error: Option<String>,
     /// The pointer position the server reports after a batch that contained an
     /// absolute move. `None` when the batch moved nothing, or when the batch
@@ -66,10 +67,9 @@ pub struct InjectResult {
 ///
 /// Invariants:
 ///
-/// * a keycode/button is present iff the last successful injection for it was a
-///   press,
-/// * an entry only leaves the set on a *successful* release (a failed release
-///   must stay, or the key stays down on the server forever),
+/// * every possibly delivered press stays present until a checked release,
+/// * queueing an up is not delivery proof: request or transport failure keeps
+///   the previous hold, while uncertain downs remain conservative,
 /// * wheel press/release pairs are instantaneous, so a complete notch leaves no
 ///   trace — but a wheel button whose release failed stays in the ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -134,6 +134,33 @@ impl PressedLedger {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LedgerEdge {
+    Key(u8, KeyState),
+    Button(u8, KeyState),
+}
+
+impl LedgerEdge {
+    fn is_down(self) -> bool {
+        match self {
+            Self::Key(_, state) | Self::Button(_, state) => state.is_down(),
+        }
+    }
+
+    fn note(self, ledger: &mut PressedLedger) {
+        match self {
+            Self::Key(key, state) => ledger.note_key(key, state),
+            Self::Button(button, state) => ledger.note_button(button, state),
+        }
+    }
+}
+
+struct PendingRequest {
+    sequence: Result<SequenceNumber, String>,
+    edge: Option<LedgerEdge>,
+    event: usize,
+}
+
 /// XTest-backed input injector.
 pub struct X11Injector {
     conn: RustConnection,
@@ -144,6 +171,8 @@ pub struct X11Injector {
     ledger: PressedLedger,
     scroll_remainder_h: i32,
     scroll_remainder_v: i32,
+    pending: Vec<PendingRequest>,
+    pending_event: usize,
 }
 
 impl X11Injector {
@@ -172,6 +201,8 @@ impl X11Injector {
             ledger: PressedLedger::new(),
             scroll_remainder_h: 0,
             scroll_remainder_v: 0,
+            pending: Vec::new(),
+            pending_event: 0,
         })
     }
 
@@ -227,8 +258,9 @@ impl X11Injector {
 
     /// Applies a batch of normalized events in order.
     ///
-    /// Stops at the first event that could not be pushed and reports it; events
-    /// before it are already on the wire and are *not* rolled back or replayed.
+    /// Queueing stops at the first local error. A single server barrier checks all
+    /// queued requests and reports the accepted event prefix; later queued edges
+    /// can already have landed and are retained accurately by the release ledger.
     pub fn inject(&mut self, events: &[InputEvent]) -> InjectResult {
         if let Err(error) = self.refresh_geometry() {
             return InjectResult {
@@ -240,7 +272,8 @@ impl X11Injector {
         let mut applied_count = 0usize;
         let mut os_error = None;
         let mut moved = false;
-        for event in events {
+        for (index, event) in events.iter().enumerate() {
+            self.pending_event = index;
             if matches!(event, InputEvent::PointerAbsolute(_)) {
                 moved = true;
             }
@@ -252,8 +285,10 @@ impl X11Injector {
                 }
             }
         }
-        if let Err(err) = self.flush() {
-            os_error.get_or_insert_with(|| err.to_string());
+        let (_, failure) = self.confirm_batch();
+        if let Some((index, error)) = failure {
+            applied_count = applied_count.min(index);
+            os_error.get_or_insert(error);
         }
         let actual = if moved && os_error.is_none() {
             self.pointer_position().ok()
@@ -300,26 +335,23 @@ impl X11Injector {
         self.scroll_remainder_v = 0;
         let keys = self.ledger.keys();
         let buttons = self.ledger.buttons();
-        let mut applied_count = 0usize;
         let mut os_error = None;
-        for keycode in keys {
-            match self.fake_key(keycode, KeyState::Up) {
-                Ok(()) => applied_count += 1,
-                Err(err) => {
-                    os_error.get_or_insert_with(|| err.to_string());
-                }
+        for (index, keycode) in keys.into_iter().enumerate() {
+            self.pending_event = index;
+            if let Err(error) = self.fake_key(keycode, KeyState::Up) {
+                os_error.get_or_insert_with(|| error.to_string());
             }
         }
-        for button in buttons {
-            match self.fake_button(button, KeyState::Up) {
-                Ok(()) => applied_count += 1,
-                Err(err) => {
-                    os_error.get_or_insert_with(|| err.to_string());
-                }
+        let key_count = self.pending.len();
+        for (index, button) in buttons.into_iter().enumerate() {
+            self.pending_event = key_count + index;
+            if let Err(error) = self.fake_button(button, KeyState::Up) {
+                os_error.get_or_insert_with(|| error.to_string());
             }
         }
-        if let Err(err) = self.flush() {
-            os_error.get_or_insert_with(|| err.to_string());
+        let (applied_count, failure) = self.confirm_batch();
+        if let Some((_, error)) = failure {
+            os_error.get_or_insert(error);
         }
         InjectResult {
             applied_count,
@@ -349,19 +381,10 @@ impl X11Injector {
         }
     }
 
-    fn fake_absolute_motion(&self, position: Position) -> Result<(), X11Error> {
+    fn fake_absolute_motion(&mut self, position: Position) -> Result<(), X11Error> {
         let x = clamp_coordinate(position.x, self.root_width);
         let y = clamp_coordinate(position.y, self.root_height);
-        self.conn.xtest_fake_input(
-            xproto::MOTION_NOTIFY_EVENT,
-            0,
-            x11rb::CURRENT_TIME,
-            self.root,
-            x,
-            y,
-            XTEST_DEFAULT_DEVICE,
-        )?;
-        Ok(())
+        self.queue_input(xproto::MOTION_NOTIFY_EVENT, 0, self.root, x, y, None)
     }
 
     fn fake_key(&mut self, keycode: u8, state: KeyState) -> Result<(), X11Error> {
@@ -370,17 +393,14 @@ impl X11Injector {
         } else {
             xproto::KEY_RELEASE_EVENT
         };
-        self.conn.xtest_fake_input(
+        self.queue_input(
             type_,
             keycode,
-            x11rb::CURRENT_TIME,
             x11rb::NONE,
             0,
             0,
-            XTEST_DEFAULT_DEVICE,
-        )?;
-        self.ledger.note_key(keycode, state);
-        Ok(())
+            Some(LedgerEdge::Key(keycode, state)),
+        )
     }
 
     fn fake_button(&mut self, button: u8, state: KeyState) -> Result<(), X11Error> {
@@ -389,17 +409,14 @@ impl X11Injector {
         } else {
             xproto::BUTTON_RELEASE_EVENT
         };
-        self.conn.xtest_fake_input(
+        self.queue_input(
             type_,
             button,
-            x11rb::CURRENT_TIME,
             x11rb::NONE,
             0,
             0,
-            XTEST_DEFAULT_DEVICE,
-        )?;
-        self.ledger.note_button(button, state);
-        Ok(())
+            Some(LedgerEdge::Button(button, state)),
+        )
     }
 
     /// Turns 120-unit wheel deltas into press/release pairs, keeping the
@@ -434,6 +451,99 @@ impl X11Injector {
         self.fake_button(button, KeyState::Down)?;
         self.fake_button(button, KeyState::Up)
     }
+
+    fn queue_input(
+        &mut self,
+        type_: u8,
+        detail: u8,
+        root: Window,
+        x: i16,
+        y: i16,
+        edge: Option<LedgerEdge>,
+    ) -> Result<(), X11Error> {
+        // A failed write may already have sent the down; only checked ups retire it.
+        if let Some(edge) = edge.filter(|edge| edge.is_down()) {
+            edge.note(&mut self.ledger);
+        }
+        let request = self.conn.xtest_fake_input(
+            type_,
+            detail,
+            x11rb::CURRENT_TIME,
+            root,
+            x,
+            y,
+            XTEST_DEFAULT_DEVICE,
+        );
+        match request {
+            Ok(cookie) => {
+                let sequence = cookie.sequence_number();
+                // Keep this checked request registered until the batch barrier below.
+                // VoidCookie contains only a borrowed connection and its sequence.
+                std::mem::forget(cookie);
+                self.pending.push(PendingRequest {
+                    sequence: Ok(sequence),
+                    edge,
+                    event: self.pending_event,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.pending.push(PendingRequest {
+                    sequence: Err(error.to_string()),
+                    edge,
+                    event: self.pending_event,
+                });
+                Err(error.into())
+            }
+        }
+    }
+
+    fn confirm_batch(&mut self) -> (usize, Option<(usize, String)>) {
+        let synchronized = if self.pending.is_empty() {
+            self.flush()
+        } else {
+            // One reply covers all earlier XTest requests; checks below add no round trips.
+            (|| -> Result<(), X11Error> {
+                self.conn.get_input_focus()?.reply()?;
+                Ok(())
+            })()
+        };
+        if let Err(error) = synchronized {
+            for request in self.pending.drain(..) {
+                if let Ok(sequence) = request.sequence {
+                    self.conn.discard_reply(
+                        sequence,
+                        RequestKind::IsVoid,
+                        DiscardMode::DiscardReplyAndError,
+                    );
+                }
+            }
+            return (0, Some((0, error.to_string())));
+        }
+        let mut applied = 0;
+        let mut failure = None;
+        for request in self.pending.drain(..) {
+            let result = request.sequence.and_then(|sequence| {
+                self.conn
+                    .check_for_error(sequence)
+                    .map_err(|error| error.to_string())
+            });
+            settle_edge(&mut self.ledger, request.edge, result.is_ok());
+            match result {
+                Ok(()) => applied += 1,
+                Err(error) => {
+                    failure.get_or_insert((request.event, error));
+                }
+            }
+        }
+        (applied, failure)
+    }
+}
+
+fn settle_edge(ledger: &mut PressedLedger, edge: Option<LedgerEdge>, accepted: bool) {
+    if let Some(edge) = edge.filter(|edge| accepted || edge.is_down()) {
+        edge.note(ledger);
+    }
 }
 
 /// Consumes whole 120-unit notches out of an accumulator, leaving the remainder
@@ -461,6 +571,100 @@ pub(crate) fn clamp_coordinate(value: f64, extent: u16) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::{clamp_coordinate, take_notches};
+
+    #[test]
+    fn uncertain_ups_and_later_failed_downs_keep_the_release_ledger() {
+        use super::{settle_edge, LedgerEdge, PressedLedger};
+        use input_model::KeyState::{Down, Up};
+        let mut ledger = PressedLedger::new();
+        for edge in [LedgerEdge::Key(38, Down), LedgerEdge::Button(1, Down)] {
+            settle_edge(&mut ledger, Some(edge), false);
+        }
+        settle_edge(&mut ledger, Some(LedgerEdge::Key(38, Up)), false);
+        settle_edge(&mut ledger, Some(LedgerEdge::Button(1, Up)), false);
+        assert_eq!(ledger.keys(), [38]);
+        assert_eq!(ledger.buttons(), [1]);
+        settle_edge(&mut ledger, Some(LedgerEdge::Key(38, Up)), true);
+        settle_edge(&mut ledger, Some(LedgerEdge::Key(38, Down)), false);
+        assert_eq!(ledger.keys(), [38]);
+        settle_edge(&mut ledger, Some(LedgerEdge::Key(38, Up)), true);
+        assert!(ledger.keys().is_empty());
+        assert_eq!(ledger.buttons(), [1]);
+    }
+
+    #[test]
+    fn checked_xtest_failure_retires_only_proven_releases() {
+        let Some(_native) = crate::capture::isolated_native_test() else {
+            return;
+        };
+        use input_model::KeyState::{Down, Up};
+        let mut injector = super::X11Injector::new().unwrap();
+        injector.ledger.note_key(38, Down);
+        injector.ledger.note_key(39, Down);
+        injector.fake_key(38, Up).unwrap();
+        injector.pending_event = 1;
+        injector
+            .queue_input(
+                u8::MAX,
+                39,
+                x11rb::NONE,
+                0,
+                0,
+                Some(super::LedgerEdge::Key(39, Up)),
+            )
+            .unwrap();
+        let (applied, error) = injector.confirm_batch();
+        assert_eq!(applied, 1);
+        assert_eq!(error.unwrap().0, 1);
+        assert_eq!(injector.pressed_keys(), [39]);
+        assert!(injector.inject(&[]).os_error.is_none());
+        assert_eq!(injector.pressed_keys(), [39]);
+        let released = injector.release_all();
+        assert_eq!(released.applied_count, 1);
+        assert!(released.os_error.is_none());
+        assert!(injector.is_empty());
+    }
+
+    #[test]
+    fn lost_connection_cannot_turn_queued_ups_into_empty_release_success() {
+        let Some(_native) = crate::capture::isolated_native_test() else {
+            return;
+        };
+        use input_model::KeyState::{Down, Up};
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+        let mut injector = super::X11Injector::new().unwrap();
+        let window = injector.conn.generate_id().unwrap();
+        injector
+            .conn
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                injector.root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        injector.ledger.note_key(38, Down);
+        injector.fake_key(38, Up).unwrap();
+        let (killer, _) = x11rb::connect(None).unwrap();
+        killer.kill_client(window).unwrap().check().unwrap();
+        let (_, failure) = injector.confirm_batch();
+        assert!(failure.is_some());
+        assert_eq!(injector.pressed_keys(), [38]);
+        let released = injector.release_all();
+        assert!(released.os_error.is_some());
+        assert_eq!(released.applied_count, 0);
+        assert_eq!(injector.pressed_keys(), [38]);
+    }
 
     #[test]
     fn root_resize_updates_the_existing_injectors_clamp_without_input() {
@@ -507,6 +711,8 @@ mod tests {
             ledger: super::PressedLedger::new(),
             scroll_remainder_h: 0,
             scroll_remainder_v: 0,
+            pending: Vec::new(),
+            pending_event: 0,
         };
         for (width, height) in [(800, 600), (240, 160)] {
             injector

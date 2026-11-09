@@ -9,10 +9,41 @@ use protocol::ipc;
 const CAPACITY: usize = 30;
 const PREVIEW_CHARS: usize = 120;
 
+/// Immutable UTF-8, validated once and shared with carry, agent handoff and wire transfers.
+#[derive(Clone)]
+pub struct SharedText(Arc<Vec<u8>>);
+
+impl SharedText {
+    pub fn from_string(text: String) -> Self {
+        Self(Arc::new(text.into_bytes()))
+    }
+
+    pub fn from_payload(payload: Arc<Vec<u8>>) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(&payload)?;
+        Ok(Self(payload))
+    }
+
+    pub fn payload(&self) -> Arc<Vec<u8>> {
+        Arc::clone(&self.0)
+    }
+
+    pub fn as_str(&self) -> &str {
+        // SAFETY: both constructors establish UTF-8; the shared bytes are never mutable.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl std::fmt::Debug for SharedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedText")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
 struct Item {
     entry: ipc::ClipboardHistoryEntry,
-    text: String,
-    payload: Arc<Vec<u8>>,
+    text: SharedText,
     sha256: [u8; 32],
 }
 
@@ -30,8 +61,7 @@ impl History {
         &mut self,
         direction: ipc::ClipboardHistoryDirection,
         peer_name: String,
-        text: String,
-        payload: Arc<Vec<u8>>,
+        text: SharedText,
         sha256: [u8; 32],
         secret: bool,
     ) -> Option<u64> {
@@ -50,8 +80,8 @@ impl History {
             direction: direction as i32,
             peer_name,
             time_unix_ms,
-            size_bytes: text.len() as u64,
-            preview: text.chars().take(PREVIEW_CHARS).collect(),
+            size_bytes: text.as_str().len() as u64,
+            preview: text.as_str().chars().take(PREVIEW_CHARS).collect(),
         };
         if self.items.len() == CAPACITY {
             self.items.pop_back();
@@ -59,7 +89,6 @@ impl History {
         self.items.push_front(Item {
             entry,
             text,
-            payload,
             sha256,
         });
         self.last_id = id;
@@ -74,11 +103,11 @@ impl History {
         text: String,
         secret: bool,
     ) -> Option<u64> {
-        let payload = Arc::new(text.as_bytes().to_vec());
-        let sha256 = clipboard::sha256(text.as_bytes())
+        let text = SharedText::from_string(text);
+        let sha256 = clipboard::sha256(text.as_str().as_bytes())
             .try_into()
             .expect("SHA-256 length");
-        self.record_prepared(direction, peer_name, text, payload, sha256, secret)
+        self.record_prepared(direction, peer_name, text, sha256, secret)
     }
 
     /// Reuses worker-prepared bytes and digest without hashing or copying on the session.
@@ -86,7 +115,7 @@ impl History {
         self.items
             .iter()
             .find(|item| item.entry.id == id)
-            .map(|item| (Arc::clone(&item.payload), item.sha256))
+            .map(|item| (item.text.payload(), item.sha256))
     }
 
     /// Returns metadata only, newest first; full payloads are fetched separately.
@@ -115,25 +144,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_payload_reuses_the_verified_allocation_and_digest() {
+    fn shared_text_rejects_invalid_utf8_and_history_outlives_transfer_and_carry() {
+        assert!(SharedText::from_payload(Arc::new(vec![0xff])).is_err());
+        let text = SharedText::from_string("Текст retained".to_owned());
+        let mut carry = text.payload();
+        let digest = clipboard::sha256(&carry).try_into().unwrap();
         let mut history = History::default();
-        let payload = Arc::new(b"prepared text".to_vec());
-        let digest = [7; 32];
         let id = history
             .record_prepared(
-                ipc::ClipboardHistoryDirection::Copied,
-                "WORKSTATION".to_owned(),
-                "prepared text".to_owned(),
-                Arc::clone(&payload),
+                ipc::ClipboardHistoryDirection::Sent,
+                "LAPTOP".into(),
+                text,
                 digest,
                 false,
             )
-            .expect("retained");
-        let (retained, hash) = history.prepared(id).expect("prepared item");
-        assert!(Arc::ptr_eq(&retained, &payload));
+            .unwrap();
+        // A newer copy mutates only a detached allocation, never the retained UTF-8.
+        Arc::make_mut(&mut carry).clear();
+        drop(carry);
+        assert_eq!(history.text(id), Some("Текст retained"));
+        let (transfer, hash) = history.prepared(id).unwrap();
         assert_eq!(hash, digest);
         history.clear();
-        assert!(history.prepared(id).is_none());
+        assert_eq!(transfer.as_slice(), "Текст retained".as_bytes());
+        assert_eq!(history.text(id), None);
     }
 
     #[test]

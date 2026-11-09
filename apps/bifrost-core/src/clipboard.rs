@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::clipboard_history::SharedText;
 use clipboard as cb;
 use geometry::NodeId;
 use protocol::ipc;
@@ -275,9 +276,7 @@ pub enum Out {
         /// Which side sent the payload.
         direction: ipc::ClipboardHistoryDirection,
         /// Full verified UTF-8 text.
-        text: String,
-        /// Shared verified payload, reused by addressed history sends.
-        payload: Arc<Vec<u8>>,
+        text: SharedText,
         /// Digest prepared outside the session.
         sha256: [u8; 32],
         /// Secret text must be discarded by history.
@@ -313,7 +312,7 @@ pub enum Inbound {
         /// Digest of the sent payload.
         sha256: [u8; 32],
         /// Text-only history data; image success still reports transfer identity.
-        history: Option<(String, Arc<Vec<u8>>)>,
+        history: Option<SharedText>,
         /// Secret classification captured with the request.
         secret: bool,
     },
@@ -463,7 +462,7 @@ impl Drop for Incoming {
     }
 }
 
-type VerifiedContent = Result<(Option<String>, Arc<Vec<u8>>, [u8; 32]), cb::ClipboardError>;
+type VerifiedContent = Result<(Option<SharedText>, Arc<Vec<u8>>, [u8; 32]), cb::ClipboardError>;
 
 /// Internal completion; its reservation survives cancelled/stale jobs.
 pub struct Verified {
@@ -521,7 +520,7 @@ struct LocalAssembly {
 /// A prepared copy shares immutable transfer bytes; only text has a history representation.
 pub struct PreparedCopy {
     payload: Arc<Vec<u8>>,
-    text: Option<String>,
+    text: Option<SharedText>,
     kind: cb::ContentKind,
     sha256: [u8; 32],
     markers: Vec<cb::Marker>,
@@ -591,10 +590,11 @@ fn prepare_copy(
     })
 }
 
-fn retain_content(content: cb::ClipboardContent) -> (Option<String>, Arc<Vec<u8>>) {
+fn retain_content(content: cb::ClipboardContent) -> (Option<SharedText>, Arc<Vec<u8>>) {
     match content {
         cb::ClipboardContent::Text(text) => {
-            let payload = Arc::new(text.as_bytes().to_vec());
+            let text = SharedText::from_string(text);
+            let payload = text.payload();
             (Some(text), payload)
         }
         cb::ClipboardContent::Image { png } => (None, Arc::new(png)),
@@ -1163,7 +1163,6 @@ impl Clipboard {
                 peer: offer.origin.into(),
                 direction: ipc::ClipboardHistoryDirection::Copied,
                 text,
-                payload: Arc::clone(&payload),
                 sha256,
                 secret: false,
             });
@@ -1558,6 +1557,13 @@ impl Clipboard {
             // A disabled node does not open the channel either: nothing would be applied.
             return Vec::new();
         }
+        if !self
+            .peers
+            .get(&peer)
+            .is_some_and(|state| state.parent == Some(parent))
+        {
+            return Vec::new();
+        }
         // The port is the granting node's, so a workspace that moved it off the default still
         // works; the IP is the one its input link comes from, which is the only address this
         // node knows is live (`docs/05-protocol.md`, «Clipboard канал»).
@@ -1690,7 +1696,6 @@ impl Clipboard {
                 peer,
                 direction: ipc::ClipboardHistoryDirection::Received,
                 text,
-                payload,
                 sha256,
                 secret: false,
             });
@@ -2179,6 +2184,11 @@ impl Clipboard {
 
     /// Learns the epoch only from authenticated input Hello, never from an offer.
     pub fn set_peer_session(&mut self, peer: NodeId, parent: [u8; 16], epoch: Option<[u8; 16]>) {
+        self.runtime
+            .admission
+            .lock()
+            .expect("clipboard admission")
+            .set_parent(peer, parent);
         let state = self.peers.entry(peer).or_default();
         if state.parent != Some(parent) || state.epoch != epoch {
             self.incoming.retain(|_, incoming| incoming.peer != peer);
@@ -2211,6 +2221,25 @@ impl Clipboard {
         text_clipboard: bool,
         remote_ip: std::net::IpAddr,
     ) -> Vec<Out> {
+        self.runtime
+            .admission
+            .lock()
+            .expect("clipboard admission")
+            .set_parent(peer, connection_id);
+        {
+            let mut inner = self.runtime.inner.lock().await;
+            inner.grants.prune(self.runtime.now_ms());
+            inner.grants.retain_parent(peer, &connection_id);
+            if let Some(old) = inner
+                .conns
+                .get(&peer)
+                .filter(|conn| conn.parent != connection_id)
+            {
+                let parent = old.parent;
+                inner.grants.close_parent(&parent);
+                inner.conns.remove(&peer);
+            }
+        }
         self.down.remove(&peer);
         let state = self.peers.entry(peer).or_default();
         if state.parent != Some(connection_id) {
@@ -2360,6 +2389,7 @@ const MARKER_NAMES: [&str; 5] = [
 // the endpoint aborts its tasks instead of leaving an Arc cycle around the listener.
 struct Handle {
     inner: Arc<Mutex<Inner>>,
+    admission: Arc<std::sync::Mutex<Admission>>,
     identity: Arc<identity::NodeIdentity>,
     trusted_peers: Arc<std::sync::RwLock<std::collections::BTreeSet<NodeId>>>,
     events: mpsc::Sender<Inbound>,
@@ -2382,6 +2412,66 @@ struct TaskState {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     acceptor: Option<tokio::task::JoinHandle<()>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+const MAX_CLIPBOARD_PARENTS: usize = 64;
+const MAX_PENDING_CLIPBOARD_DIALS: usize = 16;
+const MAX_PARENT_CHANNELS: usize = 64;
+
+struct Admission {
+    parents: BTreeMap<NodeId, ParentAdmission>,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            parents: BTreeMap::new(),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_CLIPBOARD_DIALS)),
+        }
+    }
+}
+
+struct ParentAdmission {
+    parent: [u8; 16],
+    channels: BTreeMap<[u8; 16], Instant>,
+    dial: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for ParentAdmission {
+    fn drop(&mut self) {
+        if let Some(dial) = &self.dial {
+            dial.abort();
+        }
+    }
+}
+
+impl Admission {
+    fn set_parent(&mut self, peer: NodeId, parent: [u8; 16]) {
+        if self
+            .parents
+            .get(&peer)
+            .is_some_and(|state| state.parent == parent)
+        {
+            return;
+        }
+        if self.parents.contains_key(&peer) || self.parents.len() < MAX_CLIPBOARD_PARENTS {
+            self.parents.insert(
+                peer,
+                ParentAdmission {
+                    parent,
+                    channels: BTreeMap::new(),
+                    dial: None,
+                },
+            );
+        }
+    }
+
+    fn current(&self, peer: NodeId, parent: [u8; 16]) -> bool {
+        self.parents
+            .get(&peer)
+            .is_some_and(|state| state.parent == parent)
+    }
 }
 
 impl TaskState {
@@ -2410,6 +2500,7 @@ impl Clone for Handle {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            admission: Arc::clone(&self.admission),
             identity: Arc::clone(&self.identity),
             trusted_peers: Arc::clone(&self.trusted_peers),
             events: self.events.clone(),
@@ -2482,6 +2573,7 @@ impl Handle {
         tracing::info!(address = %local_addr, "clipboard channel listening");
         let tasks = Arc::new(TaskRegistry::default());
         let handle = Handle {
+            admission: Arc::new(std::sync::Mutex::new(Admission::default())),
             inner: Arc::new(Mutex::new(Inner {
                 grants: Grants::default(),
                 conns: BTreeMap::new(),
@@ -2522,6 +2614,51 @@ impl Handle {
         }
         state.prune();
         state.tasks.push(tokio::spawn(future));
+    }
+
+    /// Admits work before spawning: a timeout bounds duration, not concurrent sockets.
+    fn spawn_dial(
+        &self,
+        peer: NodeId,
+        parent: [u8; 16],
+        channel: [u8; 16],
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let mut admission = self.admission.lock().expect("clipboard admission");
+        let slots = Arc::clone(&admission.slots);
+        let Some(state) = admission.parents.get_mut(&peer) else {
+            return false;
+        };
+        let now = Instant::now();
+        state.channels.retain(|_, expires| *expires >= now);
+        if state.parent != parent
+            || state.channels.contains_key(&channel)
+            || state.channels.len() == MAX_PARENT_CHANNELS
+            || state.dial.as_ref().is_some_and(|dial| !dial.is_finished())
+        {
+            return false;
+        }
+        let Ok(slot) = slots.try_acquire_owned() else {
+            return false;
+        };
+        let Some(tasks) = self.tasks.upgrade() else {
+            return false;
+        };
+        let mut tasks = tasks.state.lock().expect("task registry");
+        if tasks.closed {
+            return false;
+        }
+        tasks.prune();
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            future.await;
+        });
+        state
+            .channels
+            .insert(channel, now + Duration::from_millis(cb::CHANNEL_TTL_MS));
+        state.dial = Some(task.abort_handle());
+        tasks.tasks.push(task);
+        true
     }
 
     async fn stop(&self) {
@@ -2565,6 +2702,10 @@ impl Handle {
         parent: [u8; 16],
         version: (u32, u32),
     ) -> ([u8; 16], [u8; 32]) {
+        self.admission
+            .lock()
+            .expect("clipboard admission")
+            .set_parent(peer, parent);
         let now_ms = self.now_ms();
         self.inner
             .lock()
@@ -2703,14 +2844,10 @@ impl Handle {
                 }
                 let payload = outgoing.into_payload();
                 let history = if kind == cb::ContentKind::Text {
-                    let history_payload = Arc::clone(&payload);
-                    tokio::task::spawn_blocking(move || {
-                        String::from_utf8(history_payload.as_ref().to_vec()).ok()
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|text| (text, payload))
+                    tokio::task::spawn_blocking(move || SharedText::from_payload(payload).ok())
+                        .await
+                        .ok()
+                        .flatten()
                 } else {
                     None
                 };
@@ -2799,7 +2936,20 @@ impl Handle {
 
     /// Drops the channel to `peer` and closes its connection.
     async fn close(&self, peer: NodeId) {
-        let conn = self.inner.lock().await.conns.remove(&peer);
+        let parent = self
+            .admission
+            .lock()
+            .expect("clipboard admission")
+            .parents
+            .remove(&peer)
+            .map(|state| state.parent);
+        let conn = {
+            let mut inner = self.inner.lock().await;
+            if let Some(parent) = &parent {
+                inner.grants.close_parent(parent);
+            }
+            inner.conns.remove(&peer)
+        };
         if let Some(conn) = conn {
             // Aborting drops the reader half; with the sender gone too the whole TLS stream is
             // closed, so a revoked peer's bound channel does not survive.
@@ -2818,6 +2968,13 @@ impl Handle {
             biased;
             _ = &mut stopping => {}
             _ = self.accept_connections(&mut listener, queue_capacity) => {}
+            _ = async {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    self.inner.lock().await.grants.prune(self.now_ms());
+                }
+            } => {}
         }
         listener.shutdown().await;
     }
@@ -2901,6 +3058,10 @@ impl Handle {
         // closes at once cannot clean up before it is registered and leave a dead entry.
         let replaced = {
             let mut inner = self.inner.lock().await;
+            let admission = self.admission.lock().expect("clipboard admission");
+            if !admission.current(peer, parent) {
+                return;
+            }
             let Some(tasks) = self.tasks.upgrade() else {
                 return;
             };
@@ -3048,7 +3209,7 @@ impl Handle {
         queue_capacity: usize,
     ) {
         let handle = self.clone();
-        self.spawn(async move {
+        self.spawn_dial(peer, parent.connection_id, channel_id, async move {
             let result = tokio::time::timeout(
                 DIAL_TIMEOUT,
                 dial_clipboard(
@@ -3143,6 +3304,162 @@ async fn write_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clipboard_dials_are_parent_scoped_deduplicated_and_globally_bounded() {
+        let (endpoint, root) = started_clipboard("dial-admission").await;
+        let runtime = &endpoint.runtime;
+        let parent = [1; 16];
+        let peer: NodeId = [1; 32].into();
+        runtime.admission.lock().unwrap().set_parent(peer, parent);
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (cancelled, cancel) = tokio::sync::oneshot::channel::<()>();
+        assert!(runtime.spawn_dial(peer, parent, [1; 16], async move {
+            let _cancelled = cancelled;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        }));
+        start.await.unwrap();
+        for index in 0..200u16 {
+            let mut channel = [0; 16];
+            channel[..2].copy_from_slice(&index.to_be_bytes());
+            assert!(!runtime.spawn_dial(peer, parent, channel, async {}));
+        }
+        runtime.admission.lock().unwrap().set_parent(peer, [2; 16]);
+        assert!(tokio::time::timeout(Duration::from_secs(1), cancel)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(!runtime.spawn_dial(peer, parent, [2; 16], async {}));
+        assert!(runtime.spawn_dial(peer, [2; 16], [2; 16], async {}));
+        let finished = runtime.admission.lock().unwrap().parents[&peer]
+            .dial
+            .clone()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !finished.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!runtime.spawn_dial(peer, [2; 16], [2; 16], async {}));
+        runtime.close(peer).await;
+        for index in 0..MAX_PENDING_CLIPBOARD_DIALS {
+            let peer: NodeId = [index as u8 + 1; 32].into();
+            runtime.admission.lock().unwrap().set_parent(peer, parent);
+            assert!(runtime.spawn_dial(peer, parent, [1; 16], std::future::pending()));
+        }
+        let excess: NodeId = [100; 32].into();
+        runtime.admission.lock().unwrap().set_parent(excess, parent);
+        assert!(!runtime.spawn_dial(excess, parent, [1; 16], std::future::pending()));
+        let closing = runtime.admission.lock().unwrap().parents[&NodeId::from([1; 32])]
+            .dial
+            .clone()
+            .unwrap();
+        runtime.close([1; 32].into()).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !closing.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (cancelled, cancel) = tokio::sync::oneshot::channel::<()>();
+        assert!(runtime.spawn_dial(excess, parent, [1; 16], async move {
+            let _cancelled = cancelled;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        }));
+        start.await.unwrap();
+        runtime.close(excess).await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), cancel)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(!runtime.spawn_dial(excess, parent, [2; 16], async {}));
+        {
+            let mut admission = runtime.admission.lock().unwrap();
+            for index in 0..200u16 {
+                let mut peer = [0; 32];
+                peer[..2].copy_from_slice(&index.to_be_bytes());
+                admission.set_parent(peer.into(), parent);
+            }
+            assert_eq!(admission.parents.len(), MAX_CLIPBOARD_PARENTS);
+        }
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unused_grants_end_with_the_authenticated_parent() {
+        let (mut endpoint, root) = started_clipboard("unused-parent-grants").await;
+        let peer: NodeId = [0x21; 32].into();
+        let ip = "127.0.0.1".parse().unwrap();
+        endpoint.on_link_up(peer, [1; 16], (1, 0), true, ip).await;
+        let old = endpoint.runtime.issue(peer, [1; 16], (1, 0)).await;
+        assert_eq!(endpoint.runtime.inner.lock().await.grants.open(), 1);
+        endpoint.on_link_up(peer, [2; 16], (1, 0), true, ip).await;
+        assert_eq!(endpoint.runtime.inner.lock().await.grants.open(), 0);
+        assert!(
+            !endpoint
+                .runtime
+                .accepts(peer, &[1; 16], &old.0, &old.1, endpoint.runtime.now_ms())
+                .await
+        );
+        let current = endpoint.runtime.issue(peer, [2; 16], (1, 0)).await;
+        endpoint.on_link_down(peer).await;
+        assert_eq!(endpoint.runtime.inner.lock().await.grants.open(), 0);
+        assert!(
+            !endpoint
+                .runtime
+                .accepts(
+                    peer,
+                    &[2; 16],
+                    &current.0,
+                    &current.1,
+                    endpoint.runtime.now_ms()
+                )
+                .await
+        );
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prepared_copy_history_survives_carry_replacement_and_rejects_invalid_text() {
+        assert!(prepare_copy(vec![vec![0xff]], None, Vec::new(), cb::ContentKind::Text).is_err());
+        let (mut endpoint, root) = started_clipboard("history-backing").await;
+        let out = endpoint
+            .on_local_copy("Текст carried".as_bytes().to_vec(), Vec::new())
+            .await;
+        let mut history = crate::clipboard_history::History::default();
+        let mut id = None;
+        for action in out {
+            if let Out::History {
+                direction,
+                text,
+                sha256,
+                secret,
+                ..
+            } = action
+            {
+                id = history.record_prepared(direction, "WORKSTATION".into(), text, sha256, secret);
+            }
+        }
+        endpoint
+            .on_local_copy(b"replacement".to_vec(), Vec::new())
+            .await;
+        endpoint.stop().await;
+        let id = id.expect("valid nonsecret copy retained");
+        assert_eq!(history.text(id), Some("Текст carried"));
+        let (payload, digest) = history.prepared(id).unwrap();
+        assert_eq!(cb::sha256(&payload).as_slice(), digest.as_slice());
+        history.clear();
+        assert_eq!(payload.as_slice(), "Текст carried".as_bytes());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn finishing_an_image_retains_the_vec_allocation() {
@@ -4500,7 +4817,7 @@ mod tests {
                         assert!(applied.iter().any(|event| matches!(
                         event,
                         Out::History { text, direction: ipc::ClipboardHistoryDirection::Received, .. }
-                            if text == "text"
+                            if text.as_str() == "text"
                     )));
                         assert!(receiver.pending_request.is_none());
                         break;
@@ -4548,7 +4865,7 @@ mod tests {
         )));
         assert!(out.iter().any(|event| matches!(event,
             Out::History { direction: ipc::ClipboardHistoryDirection::Copied, text, secret: false, .. }
-                if text == "carry"
+                if text.as_str() == "carry"
         )));
         assert!(!out
             .iter()
@@ -4589,7 +4906,7 @@ mod tests {
         assert!(!out.iter().any(|event| matches!(event, Out::Carried { .. })));
         assert!(out.iter().any(|event| matches!(event,
             Out::History { direction: ipc::ClipboardHistoryDirection::Copied, text, secret: false, .. }
-                if text == "broadcast"
+                if text.as_str() == "broadcast"
         )));
         assert!(out
             .iter()
@@ -4955,10 +5272,28 @@ mod tests {
                 .send(success)
                 .expect("sender");
             let event = tokio::time::timeout(Duration::from_millis(100), received.recv()).await;
+            let mut history = crate::clipboard_history::History::default();
+            let mut retained = None;
             if success {
-                assert!(
-                    matches!(event, Ok(Some(Inbound::Sent { peer: sent_peer, history: Some((text, _)), secret: marked, .. }))
-                    if sent_peer == peer && text == "text" && marked == secret)
+                let Ok(Some(Inbound::Sent {
+                    peer: sent_peer,
+                    history: Some(text),
+                    sha256,
+                    secret: marked,
+                    ..
+                })) = event
+                else {
+                    panic!("successful final write must publish prepared history");
+                };
+                assert_eq!(sent_peer, peer);
+                assert_eq!(text.as_str(), "text");
+                assert_eq!(marked, secret);
+                retained = history.record_prepared(
+                    ipc::ClipboardHistoryDirection::Sent,
+                    "LAPTOP".into(),
+                    text,
+                    sha256,
+                    marked,
                 );
             } else {
                 assert!(matches!(
@@ -4967,6 +5302,16 @@ mod tests {
                 ));
             }
             endpoint.stop().await;
+            assert_eq!(
+                history.entries().items.len(),
+                usize::from(success && !secret)
+            );
+            if let Some(id) = retained {
+                assert_eq!(history.text(id), Some("text"));
+                let (payload, digest) = history.prepared(id).unwrap();
+                assert_eq!(payload.as_slice(), b"text");
+                assert_eq!(digest.as_slice(), cb::sha256(b"text").as_slice());
+            }
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -5133,7 +5478,7 @@ mod tests {
             assert!(out.iter().any(|event| matches!(event, Out::History {
                 peer: sender, direction: ipc::ClipboardHistoryDirection::Received,
                 text, secret: marked, ..
-            } if *sender == peer && text == "text" && *marked == secret)));
+            } if *sender == peer && text.as_str() == "text" && *marked == secret)));
             assert_eq!(
                 endpoint.carried.is_some(),
                 policy == config::ClipboardRoutingPolicy::Follow
@@ -5403,6 +5748,11 @@ mod tests {
             .expect("listener");
         let address = silent.local_addr().expect("address");
         let worker = endpoint.runtime.clone();
+        worker
+            .admission
+            .lock()
+            .unwrap()
+            .set_parent([0x21; 32].into(), [1; 16]);
         worker
             .dial(
                 [0x21; 32].into(),
@@ -6010,6 +6360,7 @@ mod tests {
         let b_pins = Arc::new(RwLock::new(BTreeSet::from([id_a])));
 
         let mut dialers = Vec::new();
+        let mut unused = None;
         for parent in [[7u8; 16], [8u8; 16]] {
             let (channel, token) = handle.issue(id_b, parent, (1, 0)).await;
             let identity_b = Arc::clone(&identity_b);
@@ -6030,20 +6381,51 @@ mod tests {
                 )
                 .await
             }));
-        }
-        let mut bound = 0;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events.recv().await {
-                if matches!(event, Inbound::Bound { peer, .. } if peer == id_b) {
-                    bound += 1;
-                    if bound == 2 {
-                        return;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if matches!(events.recv().await, Some(Inbound::Bound { peer, parent: bound_parent, .. })
+                        if peer == id_b && bound_parent == parent)
+                    {
+                        break;
                     }
                 }
+            }).await.expect("current parent binds before replacement");
+            if parent == [7; 16] {
+                unused = Some(handle.issue(id_b, parent, (1, 0)).await);
             }
-        })
-        .await
-        .expect("both channels bind");
+        }
+        let current_generation = handle.inner.lock().await.conns[&id_b].generation;
+        let (channel, token) = unused.unwrap();
+        let stale = dial_clipboard(
+            &identity_b,
+            Arc::clone(&b_pins),
+            id_a,
+            address,
+            protocol::hello::Negotiated {
+                connection_id: [7; 16],
+                major: 1,
+                minor: 0,
+            },
+            channel,
+            token,
+        )
+        .await;
+        if let Ok(connection) = stale {
+            let (mut reader, _writer) = connection.into_split();
+            assert!(
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(3), reader.recv()).await,
+                    Ok(Err(_))
+                ),
+                "unused old-parent grant must be refused"
+            );
+        }
+        {
+            let inner = handle.inner.lock().await;
+            assert_eq!(inner.conns[&id_b].parent, [8; 16]);
+            assert_eq!(inner.conns[&id_b].generation, current_generation);
+            assert_eq!(inner.grants.open(), 0);
+        }
 
         handle.close(id_b).await;
 
@@ -6056,6 +6438,7 @@ mod tests {
                 "every connection of a revoked peer must close, got {closed:?}"
             );
         }
+        handle.stop().await;
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6064,38 +6447,76 @@ mod tests {
     /// and the GUI.
     #[tokio::test]
     async fn dialing_a_silent_peer_does_not_block_the_caller() {
-        let handle = test_handle().await;
-        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        use tokio::io::AsyncReadExt;
+
+        let (mut endpoint, root) = started_clipboard("grant-flood").await;
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = silent.local_addr().unwrap();
+        let peer: NodeId = [0x55; 32].into();
+        let parent = [1; 16];
+        endpoint
+            .on_link_up(peer, parent, (1, 0), true, address.ip())
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for index in 0..200u16 {
+                let mut channel = [0; 16];
+                channel[..2].copy_from_slice(&index.to_be_bytes());
+                let grant = ClipboardMessage::Grant {
+                    channel_id: channel,
+                    binding_token: [3; 32],
+                    ttl_ms: cb::CHANNEL_TTL_MS as u32,
+                    clipboard_port: u32::from(address.port()),
+                };
+                for action in endpoint.on_grant(peer, parent, &grant) {
+                    if let Out::Dial {
+                        peer,
+                        address,
+                        parent,
+                        channel_id,
+                        token,
+                    } = action
+                    {
+                        endpoint
+                            .dial(peer, address, parent, channel_id, token)
+                            .await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("grant flood must not stall the session caller");
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), silent.accept())
             .await
-            .expect("a silent listener");
-        let address = silent.local_addr().expect("its address");
-        let accepter = tokio::spawn(async move {
-            // Accept and hold the socket open without ever answering the TLS handshake.
-            let held = silent.accept().await;
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            drop(held);
-        });
-        let returned = tokio::time::timeout(
-            Duration::from_millis(500),
-            handle.dial(
-                [0x55u8; 32].into(),
-                address,
-                protocol::hello::Negotiated {
-                    connection_id: [1; 16],
-                    major: 1,
-                    minor: 0,
-                },
-                [2u8; 16],
-                [3u8; 32],
-                4,
-            ),
-        )
-        .await;
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 4096];
         assert!(
-            returned.is_ok(),
-            "dial must hand the work to a task and return"
+            stream.read(&mut bytes).await.unwrap() > 0,
+            "real TLS dial started"
         );
-        accepter.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), silent.accept())
+                .await
+                .is_err(),
+            "one parent may open only one outstanding socket"
+        );
+        assert_eq!(
+            endpoint
+                .runtime
+                .admission
+                .lock()
+                .unwrap()
+                .slots
+                .available_permits(),
+            MAX_PENDING_CLIPBOARD_DIALS - 1
+        );
+        endpoint.on_link_down(peer).await;
+        let closed = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut bytes))
+            .await
+            .expect("parent loss cancels a silent dial before its timeout");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        endpoint.stop().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

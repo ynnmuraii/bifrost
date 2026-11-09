@@ -37,9 +37,9 @@ use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, Error};
 use windows::Win32::Foundation::{
@@ -90,9 +90,28 @@ pub enum CaptureEvent {
     /// The emergency combination fired; local mode has already been restored.
     Emergency,
     /// Action index (one through three); the trigger and its release are swallowed.
-    HotkeyPressed(u8),
+    HotkeyPressed(u8, Instant),
     /// The bounded queue overflowed; the agent must end the remote session.
     QueueOverflow,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueuedEvent {
+    event: CaptureEvent,
+    epoch: u64,
+    suppressed: bool,
+}
+
+impl QueuedEvent {
+    fn current(self, shared: &Shared) -> Option<CaptureEvent> {
+        if matches!(self.event, CaptureEvent::Input(_))
+            && (self.epoch != shared.epoch.load(Ordering::SeqCst)
+                || self.suppressed != remote(shared))
+        {
+            return None;
+        }
+        Some(self.event)
+    }
 }
 
 /// Capture configuration.
@@ -213,12 +232,15 @@ impl std::error::Error for CaptureError {}
 
 /// State shared between the caller and the capture thread.
 struct Shared {
-    tx: SyncSender<CaptureEvent>,
+    tx: SyncSender<QueuedEvent>,
     mode: AtomicU8,
+    epoch: AtomicU64,
+    // The hook's physical state and its suppression decision share this lock with commit.
+    physical: Mutex<[u64; 4]>,
     /// Packed hold point `(x << 32) | y`.
     hold: AtomicI64,
     hold_valid: AtomicBool,
-    emergency_fired: AtomicBool,
+    terminal_acknowledged: AtomicU64,
     modifiers: AtomicU32,
     hotkeys: AtomicU64,
     swallowed_keys: [AtomicU64; 4],
@@ -235,6 +257,8 @@ struct Shared {
     overflowed: AtomicBool,
     overflow_pending: AtomicBool,
     emergency_pending: AtomicBool,
+    terminal_generation: AtomicU64,
+    terminal_delivered: AtomicU64,
     raw_input_ok: AtomicBool,
     hook_calls: AtomicU64,
     capture_injected: AtomicBool,
@@ -274,7 +298,7 @@ impl CursorProbe {
 
 /// A running capture.
 pub struct Capture {
-    rx: Receiver<CaptureEvent>,
+    rx: Receiver<QueuedEvent>,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
     thread_id: Arc<AtomicU32>,
@@ -291,9 +315,11 @@ impl Capture {
         let shared = Arc::new(Shared {
             tx,
             mode: AtomicU8::new(config.mode as u8),
+            epoch: AtomicU64::new(1),
+            physical: Mutex::new([0; 4]),
             hold: AtomicI64::new(0),
             hold_valid: AtomicBool::new(false),
-            emergency_fired: AtomicBool::new(false),
+            terminal_acknowledged: AtomicU64::new(0),
             modifiers: AtomicU32::new(0),
             hotkeys: AtomicU64::new(
                 crate::event::Hotkeys::new([Some(config.emergency), None, None, None, None]).0,
@@ -324,6 +350,8 @@ impl Capture {
             overflowed: AtomicBool::new(false),
             overflow_pending: AtomicBool::new(false),
             emergency_pending: AtomicBool::new(false),
+            terminal_generation: AtomicU64::new(0),
+            terminal_delivered: AtomicU64::new(0),
             raw_input_ok: AtomicBool::new(false),
             hook_calls: AtomicU64::new(0),
         });
@@ -353,6 +381,92 @@ impl Capture {
         }
     }
 
+    /// Complete hook-tracked state, seeded before readiness and updated even in Temporary.
+    pub fn physical_pressed(&self) -> Option<input_model::PressedState> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
+        let physical = self.shared.physical.lock().ok()?;
+        let mut pressed = input_model::PressedState::default();
+        for vk in 8..=255u16 {
+            if physical[usize::from(vk / 64)] & (1 << (vk % 64)) == 0 {
+                continue;
+            }
+            // SAFETY: scalar virtual-key code.
+            let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) } as u16;
+            pressed
+                .keys
+                .insert(HidKey::keyboard(hid::scancode_to_hid(scan)?));
+        }
+        for (vk, button) in [
+            (1u16, MouseButton::Left),
+            (2, MouseButton::Right),
+            (4, MouseButton::Middle),
+            (5, MouseButton::Back),
+            (6, MouseButton::Forward),
+        ] {
+            if physical[0] & (1 << vk) != 0 {
+                pressed.buttons.insert(button);
+            }
+        }
+        Some(pressed)
+    }
+
+    /// Atomically refuse suppression while input is held or terminal capture loss is unacknowledged.
+    pub fn try_set_mode(&self, mode: CaptureKind) -> bool {
+        self.try_set_mode_with(mode, || {
+            let mut point = POINT::default();
+            // SAFETY: GetCursorPos writes into this valid POINT.
+            unsafe { GetCursorPos(&mut point) }
+                .ok()
+                .map(|()| (point.x, point.y))
+        })
+    }
+
+    fn try_set_mode_with(
+        &self,
+        mode: CaptureKind,
+        hold: impl FnOnce() -> Option<(i32, i32)>,
+    ) -> bool {
+        let physical = match self.shared.physical.lock() {
+            Ok(physical) => physical,
+            Err(_) if mode != CaptureKind::Remote => {
+                self.set_mode_locked(mode, hold);
+                return true;
+            }
+            Err(_) => return false,
+        };
+        let generation = self.shared.terminal_generation.load(Ordering::SeqCst);
+        if mode == CaptureKind::Remote
+            && (physical.iter().any(|bits| *bits != 0)
+                || generation != self.shared.terminal_acknowledged.load(Ordering::SeqCst))
+        {
+            return false;
+        }
+        self.set_mode_locked(mode, hold);
+        if mode == CaptureKind::Remote
+            && generation != self.shared.terminal_generation.load(Ordering::SeqCst)
+        {
+            self.set_mode_locked(CaptureKind::Observe, || None);
+            return false;
+        }
+        true
+    }
+
+    /// Called by terminal teardown, never by dequeue or a new capture request.
+    pub fn acknowledge_terminal(&self) {
+        let Ok(_physical) = self.shared.physical.lock() else {
+            return;
+        };
+        let delivered = self.shared.terminal_delivered.load(Ordering::SeqCst);
+        if !self.shared.emergency_pending.load(Ordering::SeqCst)
+            && !self.shared.overflow_pending.load(Ordering::SeqCst)
+            && self.shared.terminal_generation.load(Ordering::SeqCst) == delivered
+        {
+            self.shared
+                .terminal_acknowledged
+                .store(delivered, Ordering::SeqCst);
+        }
+    }
+
     /// Current physical cursor position, used once to seed a fresh source capture.
     pub fn cursor_position() -> Result<Position, Error> {
         let mut point = POINT::default();
@@ -361,31 +475,52 @@ impl Capture {
         Ok(Position::new(f64::from(point.x), f64::from(point.y)))
     }
 
-    /// Event stream. Use the convenience methods below instead of draining this
-    /// in a hot loop when a bounded wait is enough.
-    #[must_use]
-    pub fn events(&self) -> &Receiver<CaptureEvent> {
-        &self.rx
-    }
-
     /// Wait up to `timeout` for the next event.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, RecvTimeoutError> {
-        if let Some(control) = self.take_control() {
-            return Ok(control);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(control) = self.take_control() {
+                return Ok(control);
+            }
+            let queued = self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+            if let Some(event) = queued.current(&self.shared) {
+                return Ok(event);
+            }
         }
-        self.rx.recv_timeout(timeout)
     }
 
     /// Non-blocking poll.
     pub fn try_recv(&self) -> Option<CaptureEvent> {
-        self.take_control().or_else(|| self.rx.try_recv().ok())
+        loop {
+            if let Some(control) = self.take_control() {
+                return Some(control);
+            }
+            if let Some(event) = self.rx.try_recv().ok()?.current(&self.shared) {
+                return Some(event);
+            }
+        }
     }
 
     /// Safety signals never compete with input for bounded queue capacity.
     fn take_control(&self) -> Option<CaptureEvent> {
+        let _physical = self
+            .shared
+            .physical
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if self.shared.emergency_pending.swap(false, Ordering::SeqCst) {
+            self.shared.terminal_delivered.store(
+                self.shared.terminal_generation.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             Some(CaptureEvent::Emergency)
         } else if self.shared.overflow_pending.swap(false, Ordering::SeqCst) {
+            self.shared.terminal_delivered.store(
+                self.shared.terminal_generation.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             Some(CaptureEvent::QueueOverflow)
         } else {
             None
@@ -407,16 +542,19 @@ impl Capture {
     ///
     /// Entering [`CaptureKind::Remote`] snapshots the cursor position as the hold
     /// point; leaving it releases the hold. Temporary leaves all local input
-    /// untouched. The mode flip is a single atomic store.
-    pub fn set_mode(&self, mode: CaptureKind) {
+    /// untouched. Returns false if physical state or an unacknowledged emergency forbids it.
+    pub fn set_mode(&self, mode: CaptureKind) -> bool {
+        self.try_set_mode(mode)
+    }
+
+    fn set_mode_locked(&self, mode: CaptureKind, hold: impl FnOnce() -> Option<(i32, i32)>) {
+        if capture_kind(&self.shared) != mode {
+            self.shared.epoch.fetch_add(1, Ordering::SeqCst);
+        }
         match mode {
             CaptureKind::Remote => {
-                let mut point = POINT { x: 0, y: 0 };
-                // SAFETY: `GetCursorPos` writes into a valid `POINT`.
-                if unsafe { GetCursorPos(&mut point) }.is_ok() {
-                    self.shared
-                        .hold
-                        .store(pack(point.x, point.y), Ordering::SeqCst);
+                if let Some((x, y)) = hold() {
+                    self.shared.hold.store(pack(x, y), Ordering::SeqCst);
                     self.shared.hold_valid.store(true, Ordering::SeqCst);
                 } else {
                     self.shared.hold_valid.store(false, Ordering::SeqCst);
@@ -426,7 +564,7 @@ impl Capture {
                 self.shared.hold_valid.store(false, Ordering::SeqCst);
             }
         }
-        self.shared.emergency_fired.store(false, Ordering::SeqCst);
+        // Only terminal acknowledgement may clear the capture-loss fence.
         self.shared.mode.store(mode as u8, Ordering::SeqCst);
     }
 
@@ -650,6 +788,18 @@ unsafe fn install(
     // SAFETY: `None` selects the default (message-based) timer.
     let _ = unsafe { SetTimer(Some(window), HOLD_TIMER_ID, HOLD_TIMER_MS, None) };
 
+    if let Ok(mut physical) = shared.physical.lock() {
+        for vk in 1..=255u16 {
+            // Generic Shift/Ctrl/Alt duplicate the left/right identities and have no own up.
+            if matches!(vk, 0x10..=0x12) {
+                continue;
+            }
+            // SAFETY: read-only state query, before callbacks are pumped.
+            if unsafe { GetAsyncKeyState(i32::from(vk)) } < 0 {
+                physical[usize::from(vk / 64)] |= 1 << (vk % 64);
+            }
+        }
+    }
     let _ = ready.send(Ok(()));
     true
 }
@@ -718,16 +868,18 @@ fn push(shared: &Shared, event: InputEvent) {
     if let Some(counter) = edge {
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    match shared.tx.try_send(CaptureEvent::Input(event)) {
+    let queued = QueuedEvent {
+        event: CaptureEvent::Input(event),
+        epoch: shared.epoch.load(Ordering::SeqCst),
+        suppressed: remote(shared),
+    };
+    match shared.tx.try_send(queued) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             shared.dropped.fetch_add(1, Ordering::Relaxed);
             shared.overflowed.store(true, Ordering::Relaxed);
-            // Restore local suppression immediately, even if the consumer is stalled.
-            shared
-                .mode
-                .store(CaptureKind::Observe as u8, Ordering::SeqCst);
-            shared.hold_valid.store(false, Ordering::SeqCst);
+            // Raw Input may overflow concurrently with a native capture commit.
+            fence_capture(shared);
             shared.overflow_pending.store(true, Ordering::SeqCst);
         }
         Err(TrySendError::Disconnected(_)) => {
@@ -748,7 +900,12 @@ fn unpack(value: i64) -> (i32, i32) {
 fn capture_kind(shared: &Shared) -> CaptureKind {
     match shared.mode.load(Ordering::Relaxed) {
         mode if mode == CaptureKind::Temporary as u8 => CaptureKind::Temporary,
-        mode if mode == CaptureKind::Remote as u8 => CaptureKind::Remote,
+        mode if mode == CaptureKind::Remote as u8
+            && shared.terminal_generation.load(Ordering::SeqCst)
+                == shared.terminal_acknowledged.load(Ordering::SeqCst) =>
+        {
+            CaptureKind::Remote
+        }
         _ => CaptureKind::Observe,
     }
 }
@@ -809,15 +966,19 @@ fn physical_modifiers() -> u32 {
 
 /// Restore local mode unconditionally. This is the one path that must work even
 /// if everything else in the agent is stuck: atomic stores and a separate control flag.
-fn fire_emergency(shared: &Shared) {
+fn fence_capture(shared: &Shared) {
+    shared.terminal_generation.fetch_add(1, Ordering::SeqCst);
+    shared.epoch.fetch_add(1, Ordering::SeqCst);
     shared
         .mode
         .store(CaptureKind::Observe as u8, Ordering::SeqCst);
     shared.hold_valid.store(false, Ordering::SeqCst);
-    if !shared.emergency_fired.swap(true, Ordering::SeqCst) {
-        shared.emergencies.fetch_add(1, Ordering::Relaxed);
-        shared.emergency_pending.store(true, Ordering::SeqCst);
-    }
+}
+
+fn fire_emergency(shared: &Shared) {
+    fence_capture(shared);
+    shared.emergencies.fetch_add(1, Ordering::Relaxed);
+    shared.emergency_pending.store(true, Ordering::SeqCst);
 }
 
 /// Handle one keyboard hook event. `Some(true)` means "swallow".
@@ -852,6 +1013,20 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
         return None;
     }
 
+    let Ok(mut physical) = shared.physical.lock() else {
+        fire_emergency(shared);
+        return Some(false);
+    };
+    if !injected {
+        let vk = kb.vkCode as u16;
+        let bucket = &mut physical[usize::from(vk / 64).min(3)];
+        let bit = 1 << (vk % 64);
+        if down {
+            *bucket |= bit;
+        } else {
+            *bucket &= !bit;
+        }
+    }
     let vk = kb.vkCode as u16;
     if !injected {
         update_modifiers(shared, vk, down);
@@ -881,7 +1056,11 @@ fn handle_keyboard(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bo
             if action == 0 {
                 fire_emergency(shared);
             } else {
-                let _ = shared.tx.try_send(CaptureEvent::HotkeyPressed(action));
+                let _ = shared.tx.try_send(QueuedEvent {
+                    event: CaptureEvent::HotkeyPressed(action, Instant::now()),
+                    epoch: shared.epoch.load(Ordering::SeqCst),
+                    suppressed: false,
+                });
             }
             return Some(true);
         }
@@ -937,6 +1116,29 @@ fn handle_mouse(shared: &Shared, wparam: WPARAM, lparam: LPARAM) -> Option<bool>
         return None;
     }
 
+    let Ok(mut physical) = shared.physical.lock() else {
+        fire_emergency(shared);
+        return Some(false);
+    };
+    if !injected {
+        let edge = match message {
+            WM_LBUTTONDOWN | WM_LBUTTONUP => Some((1, message == WM_LBUTTONDOWN)),
+            WM_RBUTTONDOWN | WM_RBUTTONUP => Some((2, message == WM_RBUTTONDOWN)),
+            WM_MBUTTONDOWN | WM_MBUTTONUP => Some((4, message == WM_MBUTTONDOWN)),
+            WM_XBUTTONDOWN | WM_XBUTTONUP => Some((
+                if ms.mouseData >> 16 == 1 { 5 } else { 6 },
+                message == WM_XBUTTONDOWN,
+            )),
+            _ => None,
+        };
+        if let Some((vk, down)) = edge {
+            if down {
+                physical[0] |= 1 << vk;
+            } else {
+                physical[0] &= !(1 << vk);
+            }
+        }
+    }
     let swallow = remote(shared);
     if capture_kind(shared) == CaptureKind::Temporary && message != WM_MOUSEMOVE {
         return Some(false);
@@ -1227,15 +1429,17 @@ mod tests {
     }
     fn hook_state(
         mode: super::CaptureKind,
-    ) -> (super::Shared, super::Receiver<super::CaptureEvent>) {
+    ) -> (super::Shared, super::Receiver<super::QueuedEvent>) {
         use super::*;
         let (tx, rx) = mpsc::sync_channel(16);
         let shared = Shared {
             tx,
             mode: AtomicU8::new(mode as u8),
+            epoch: AtomicU64::new(1),
+            physical: Mutex::new([0; 4]),
             hold: AtomicI64::new(0),
             hold_valid: AtomicBool::new(true),
-            emergency_fired: AtomicBool::new(false),
+            terminal_acknowledged: AtomicU64::new(0),
             modifiers: AtomicU32::new(MOD_CTRL | MOD_ALT | MOD_SHIFT),
             hotkeys: AtomicU64::new(
                 crate::event::Hotkeys::new([
@@ -1261,6 +1465,8 @@ mod tests {
             overflowed: AtomicBool::new(false),
             overflow_pending: AtomicBool::new(false),
             emergency_pending: AtomicBool::new(false),
+            terminal_generation: AtomicU64::new(0),
+            terminal_delivered: AtomicU64::new(0),
             raw_input_ok: AtomicBool::new(false),
             hook_calls: AtomicU64::new(0),
             capture_injected: AtomicBool::new(false),
@@ -1277,6 +1483,201 @@ mod tests {
             wheel_h: AtomicU64::new(0),
         };
         (shared, rx)
+    }
+
+    fn controlled_capture(mode: super::CaptureKind) -> super::Capture {
+        use super::*;
+        let (shared, rx) = hook_state(mode);
+        Capture {
+            rx,
+            shared: Arc::new(shared),
+            thread: None,
+            thread_id: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    #[test]
+    fn queued_local_complete_click_and_tap_never_cross_commit_but_suppressed_edges_do() {
+        use super::*;
+        let capture = controlled_capture(CaptureKind::Observe);
+        let kb = KBDLLHOOKSTRUCT {
+            vkCode: 0x41,
+            scanCode: 0x1e,
+            ..Default::default()
+        };
+        let ms = MSLLHOOKSTRUCT::default();
+        for message in [WM_KEYDOWN, WM_KEYUP] {
+            assert_eq!(
+                handle_keyboard(
+                    &capture.shared,
+                    WPARAM(message as usize),
+                    LPARAM(&kb as *const _ as isize)
+                ),
+                Some(false)
+            );
+        }
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+            assert_eq!(
+                handle_mouse(
+                    &capture.shared,
+                    WPARAM(message as usize),
+                    LPARAM(&ms as *const _ as isize)
+                ),
+                Some(false)
+            );
+        }
+        assert!(capture.try_set_mode_with(CaptureKind::Remote, || None));
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+            assert_eq!(
+                handle_mouse(
+                    &capture.shared,
+                    WPARAM(message as usize),
+                    LPARAM(&ms as *const _ as isize)
+                ),
+                Some(true)
+            );
+        }
+        for state in [KeyState::Down, KeyState::Up] {
+            assert_eq!(
+                capture.try_recv(),
+                Some(CaptureEvent::Input(InputEvent::Button {
+                    button: MouseButton::Left,
+                    state,
+                }))
+            );
+        }
+        assert_eq!(capture.try_recv(), None);
+        // A suppressed old epoch cannot become input for a later capture either.
+        push(&capture.shared, InputEvent::Scroll { h120: 0, v120: 120 });
+        assert!(capture.try_set_mode_with(CaptureKind::Observe, || None));
+        assert!(capture.try_set_mode_with(CaptureKind::Remote, || None));
+        assert_eq!(capture.try_recv(), None);
+    }
+
+    #[test]
+    fn emergency_fences_commit_until_delivered_generation_is_terminally_acknowledged() {
+        use super::*;
+        let capture = controlled_capture(CaptureKind::Remote);
+        fire_emergency(&capture.shared);
+        capture.acknowledge_terminal();
+        assert!(!capture.try_set_mode_with(CaptureKind::Remote, || panic!(
+            "must refuse before native work"
+        )));
+        assert!(capture.try_set_mode_with(CaptureKind::Temporary, || None));
+        assert!(!capture.try_set_mode_with(CaptureKind::Remote, || None));
+        assert_eq!(capture.try_recv(), Some(CaptureEvent::Emergency));
+        assert!(
+            !capture.try_set_mode_with(CaptureKind::Remote, || None),
+            "dequeue is not terminal handling"
+        );
+        fire_emergency(&capture.shared);
+        capture.acknowledge_terminal();
+        assert!(
+            !capture.try_set_mode_with(CaptureKind::Remote, || None),
+            "new generation must stay fenced"
+        );
+        assert_eq!(capture.try_recv(), Some(CaptureEvent::Emergency));
+        capture.acknowledge_terminal();
+        assert!(capture.try_set_mode_with(CaptureKind::Remote, || None));
+    }
+
+    #[test]
+    fn overflow_during_commit_stays_fenced_until_its_terminal_acknowledgement() {
+        use super::*;
+        let capture = controlled_capture(CaptureKind::Observe);
+        let scroll = InputEvent::Scroll { h120: 0, v120: 120 };
+        assert!(!capture.try_set_mode_with(CaptureKind::Remote, || {
+            // Fill the hook fixture's sixteen-entry queue, then overflow it.
+            for _ in 0..=16 {
+                push(&capture.shared, scroll);
+            }
+            Some((10, 20))
+        }));
+        assert_eq!(capture.mode(), CaptureKind::Observe);
+        capture.acknowledge_terminal();
+        assert!(!capture.try_set_mode_with(CaptureKind::Remote, || None));
+        assert_eq!(capture.try_recv(), Some(CaptureEvent::QueueOverflow));
+        assert!(!capture.try_set_mode_with(CaptureKind::Remote, || None));
+
+        // A terminal acknowledgement for the first overflow cannot clear a newer one.
+        push(&capture.shared, scroll);
+        capture.acknowledge_terminal();
+        assert!(!capture.try_set_mode_with(CaptureKind::Remote, || None));
+        assert_eq!(capture.try_recv(), Some(CaptureEvent::QueueOverflow));
+        capture.acknowledge_terminal();
+        assert_eq!(capture.try_recv(), None);
+        assert!(capture.try_set_mode_with(CaptureKind::Remote, || None));
+        push(&capture.shared, scroll);
+        assert_eq!(capture.try_recv(), Some(CaptureEvent::Input(scroll)));
+    }
+
+    #[test]
+    fn unavailable_physical_lock_never_prevents_local_release_or_terminal_delivery() {
+        use super::*;
+        let capture = controlled_capture(CaptureKind::Remote);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = capture.shared.physical.lock().unwrap();
+            panic!("controlled physical-state failure");
+        }));
+        assert!(!capture.try_set_mode_with(CaptureKind::Remote, || panic!("must not call native")));
+        assert!(capture.try_set_mode_with(CaptureKind::Observe, || None));
+        assert_eq!(capture.mode(), CaptureKind::Observe);
+        fire_emergency(&capture.shared);
+        assert_eq!(capture.try_recv(), Some(CaptureEvent::Emergency));
+    }
+
+    #[test]
+    fn temporary_physical_down_atomically_blocks_commit_and_synthetic_up_cannot_clear_it() {
+        use super::*;
+        let (shared, rx) = hook_state(CaptureKind::Temporary);
+        let capture = Capture {
+            rx,
+            shared: Arc::new(shared),
+            thread: None,
+            thread_id: Arc::new(AtomicU32::new(0)),
+        };
+        let mut kb = KBDLLHOOKSTRUCT {
+            vkCode: 0x41,
+            scanCode: 0x1e,
+            ..Default::default()
+        };
+        assert_eq!(
+            handle_keyboard(
+                &capture.shared,
+                WPARAM(WM_KEYDOWN as usize),
+                LPARAM(&kb as *const _ as isize)
+            ),
+            Some(false)
+        );
+        assert!(!capture.try_set_mode(CaptureKind::Remote));
+        kb.flags = LLKHF_INJECTED;
+        let _ = handle_keyboard(
+            &capture.shared,
+            WPARAM(WM_KEYUP as usize),
+            LPARAM(&kb as *const _ as isize),
+        );
+        assert!(
+            !capture.try_set_mode(CaptureKind::Remote),
+            "synthetic up erased a physical hold"
+        );
+        kb.flags = Default::default();
+        let _ = handle_keyboard(
+            &capture.shared,
+            WPARAM(WM_KEYUP as usize),
+            LPARAM(&kb as *const _ as isize),
+        );
+        assert!(capture
+            .shared
+            .physical
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|bits| *bits == 0));
+        assert_eq!(capture.mode(), CaptureKind::Temporary);
+        assert!(
+            capture.rx.try_recv().is_err(),
+            "Temporary must not forward locally delivered edges"
+        );
     }
 
     #[test]
@@ -1375,7 +1776,7 @@ mod tests {
             Some(false)
         );
         assert!(matches!(
-            rx.try_recv(),
+            rx.try_recv().map(|queued| queued.event),
             Ok(CaptureEvent::Input(InputEvent::PointerAbsolute(_)))
         ));
     }
@@ -1398,7 +1799,7 @@ mod tests {
                 Some(true)
             );
             assert!(matches!(
-                rx.try_recv(),
+                rx.try_recv().map(|queued| queued.event),
                 Ok(CaptureEvent::Input(InputEvent::Button {
                     button: MouseButton::Left,
                     state: actual,
@@ -1461,7 +1862,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    rx.try_recv(),
+                    rx.try_recv().map(|queued| queued.event),
                     Ok(CaptureEvent::Input(event)) if event == expected
                 ),
                 "message {message:#x} delta {delta} must queue {expected:?}"
@@ -1506,7 +1907,7 @@ mod tests {
         first.stop();
         let first_count = first.stats().captured;
         let second = Capture::start(config).expect("second capture");
-        second.set_mode(CaptureKind::Remote);
+        assert!(second.set_mode(CaptureKind::Remote));
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {

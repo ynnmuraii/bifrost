@@ -176,6 +176,18 @@ static TABLE: &[(u16, u16)] = &[
     (0x0056, 0x64), // 102nd key (ISO non-US \|, between LShift and Z)
     (0x0057, 0x44), // F11
     (0x0058, 0x45), // F12
+    (0x0064, 0x68), // F13
+    (0x0065, 0x69), // F14
+    (0x0066, 0x6A), // F15
+    (0x0067, 0x6B), // F16
+    (0x0068, 0x6C), // F17
+    (0x0069, 0x6D), // F18
+    (0x006A, 0x6E), // F19
+    (0x006B, 0x6F), // F20
+    (0x006C, 0x70), // F21
+    (0x006D, 0x71), // F22
+    (0x006E, 0x72), // F23
+    (0x0076, 0x73), // F24
     (0xE01C, 0x58), // Keypad Enter
     (0xE01D, 0xE4), // Right Ctrl
     (0xE035, 0x54), // Keypad /
@@ -196,14 +208,27 @@ static TABLE: &[(u16, u16)] = &[
     (0xE05D, 0x65), // Application / Menu
 ];
 
-/// Number of physical keys described by [`TABLE`].
-#[must_use]
-pub const fn table_len() -> usize {
-    TABLE.len()
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extended_function_keys_roundtrip_without_e0() {
+        for usage in 0x68..=0x73 {
+            let scan = super::hid_to_scancode(usage).unwrap();
+            assert_eq!(super::scancode_to_hid(scan), Some(usage));
+            assert_eq!(
+                super::scancode_parts(scan),
+                (
+                    if usage == 0x73 {
+                        0x76
+                    } else {
+                        0x64 + usage - 0x68
+                    },
+                    false
+                )
+            );
+        }
+    }
+
     #[test]
     fn scancode_table_is_strictly_sorted_and_usages_are_unique() {
         // Binary search requires strict ordering. Inspect the actual rows so a

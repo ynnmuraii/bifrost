@@ -85,6 +85,7 @@ fn arguments_reject_secrets_and_implicit_backend_switches() {
 }
 #[cfg(any(unix, windows))]
 mod local {
+    mod lifecycle;
     mod m5;
     mod m6;
     mod privacy;

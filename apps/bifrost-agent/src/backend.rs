@@ -201,7 +201,10 @@ pub enum Event {
     /// The emergency combination was recognised; the agent already restored local
     /// control (rule 3).
     Emergency,
-    HotkeyPressed(config::HotkeyAction),
+    HotkeyPressed {
+        action: config::HotkeyAction,
+        issued_at: Instant,
+    },
     #[cfg(target_os = "linux")]
     HotkeysResult(ipc::HotkeysResult),
     /// The pointer reached the edge of this node and the compositor handed input over.
@@ -482,6 +485,12 @@ fn takeover_plan(
 #[derive(Debug)]
 pub struct Dry {
     ready: Ready,
+    simulated_input: bool,
+    synthetic: input_model::PressedState,
+    #[cfg(test)]
+    pub(crate) release_calls: usize,
+    #[cfg(test)]
+    fail_next_release: bool,
     /// Synthetic events still to be reported (`--dry-input-events`, a smoke aid).
     scheduled: Vec<InputEvent>,
     /// One entry per poll tick: an event, or `None` for a tick that says nothing.
@@ -878,6 +887,12 @@ impl Dry {
         ready.set_image_clipboard(false);
         Dry {
             ready,
+            simulated_input: true,
+            synthetic: Default::default(),
+            #[cfg(test)]
+            release_calls: 0,
+            #[cfg(test)]
+            fail_next_release: false,
             scheduled,
             motion: if motion && std::env::var_os("BIFROST_DRY_CONTROL_DIR").is_none() {
                 motion_schedule()
@@ -1069,6 +1084,22 @@ pub enum ClipboardApplyReceipt {
 }
 
 impl Backend {
+    #[cfg(test)]
+    pub(crate) fn dry_input_state(&self) -> Option<(&input_model::PressedState, bool, usize)> {
+        match self {
+            Backend::Dry(dry) => Some((&dry.synthetic, dry.armed, dry.release_calls)),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_dry_release(&mut self) {
+        let Backend::Dry(dry) = self else {
+            panic!("controlled release failure requires a dry backend");
+        };
+        dry.fail_next_release = true;
+    }
+
     /// Probes the session, honours a core-supplied override and builds the backend.
     ///
     /// `dry` selects [`Backend::Dry`] whatever the session is; a session this build
@@ -1526,6 +1557,22 @@ impl Backend {
         }
     }
 
+    /// Complete physical state when the native source can establish it.
+    pub fn physical_pressed(
+        &self,
+        observed: &input_model::PressedState,
+    ) -> Option<input_model::PressedState> {
+        match self {
+            Backend::Dry(dry) => dry.simulated_input.then(|| observed.clone()),
+            #[cfg(windows)]
+            Backend::Win(backend) => backend.physical_pressed(),
+            #[cfg(target_os = "linux")]
+            Backend::X11(backend) => backend.physical_pressed(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(backend) => backend.physical_pressed(),
+        }
+    }
+
     /// Starts (or re-arms) capture.
     pub async fn begin_capture(
         &mut self,
@@ -1557,7 +1604,11 @@ impl Backend {
     }
 
     /// Ends capture and releases everything this session-owned state holds.
-    pub async fn end_capture(&mut self, replay_buffered_locally: bool) -> Result<Released, String> {
+    pub async fn end_capture(
+        &mut self,
+        replay_buffered_locally: bool,
+        release_injected: bool,
+    ) -> Result<Released, String> {
         match self {
             Backend::Dry(dry) => {
                 if replay_buffered_locally {
@@ -1569,11 +1620,15 @@ impl Backend {
                 Ok(Released::default())
             }
             #[cfg(windows)]
-            Backend::Win(backend) => backend.end_capture(),
+            Backend::Win(backend) => backend.end_capture(release_injected),
             #[cfg(target_os = "linux")]
-            Backend::X11(backend) => backend.end_capture(),
+            Backend::X11(backend) => backend.end_capture(release_injected),
             #[cfg(target_os = "linux")]
-            Backend::Wayland(backend) => backend.end_capture(replay_buffered_locally).await,
+            Backend::Wayland(backend) => {
+                backend
+                    .end_capture(replay_buffered_locally, release_injected)
+                    .await
+            }
         }
     }
 
@@ -1594,6 +1649,9 @@ impl Backend {
     pub async fn inject(&mut self, events: &[InputEvent]) -> Injected {
         match self {
             Backend::Dry(dry) => {
+                for event in events {
+                    dry.synthetic.apply(event);
+                }
                 if let Some(dir) = &dry.control_dir {
                     use std::fmt::Write as _;
                     use std::io::Write as _;
@@ -1664,10 +1722,27 @@ impl Backend {
         }
     }
 
-    /// Releases the state this session put into the desktop.
-    pub async fn release_session(&mut self) -> Released {
+    /// Releases the state this session put into the desktop, or preserves uncertain holds.
+    pub async fn release_session(&mut self) -> Result<Released, String> {
         match self {
-            Backend::Dry(_) => Released::default(),
+            Backend::Dry(dry) => {
+                #[cfg(test)]
+                {
+                    dry.release_calls += 1;
+                    if std::mem::take(&mut dry.fail_next_release) {
+                        return Err("controlled native release failure".to_owned());
+                    }
+                }
+                if !dry.simulated_input && !dry.synthetic.is_empty() {
+                    return Err("native session release input backend unavailable".to_owned());
+                }
+                let released = Released {
+                    keys: dry.synthetic.keys.len() as u32,
+                    buttons: dry.synthetic.buttons.len() as u32,
+                };
+                dry.synthetic = Default::default();
+                Ok(released)
+            }
             #[cfg(windows)]
             Backend::Win(backend) => backend.release_session(),
             #[cfg(target_os = "linux")]
@@ -1707,12 +1782,29 @@ impl Backend {
     }
 
     /// `RECOVERY`: let go of exactly these keys and buttons (rule 7).
-    pub async fn release_keys(&mut self, keys: &[HidKey], buttons: &[MouseButton]) -> Released {
+    pub async fn release_keys(
+        &mut self,
+        keys: &[HidKey],
+        buttons: &[MouseButton],
+    ) -> Result<Released, String> {
         match self {
-            Backend::Dry(_) => Released {
-                keys: keys.len() as u32,
-                buttons: buttons.len() as u32,
-            },
+            Backend::Dry(dry) if dry.simulated_input || (keys.is_empty() && buttons.is_empty()) => {
+                for key in keys {
+                    dry.synthetic.keys.remove(key);
+                }
+                for button in buttons {
+                    dry.synthetic.buttons.remove(button);
+                }
+                Ok(Released {
+                    keys: keys.len() as u32,
+                    buttons: buttons.len() as u32,
+                })
+            }
+            Backend::Dry(dry) => {
+                dry.synthetic.keys.extend(keys.iter().copied());
+                dry.synthetic.buttons.extend(buttons.iter().copied());
+                Err("native recovery input backend unavailable".to_owned())
+            }
             #[cfg(windows)]
             Backend::Win(backend) => backend.release_keys(keys, buttons),
             #[cfg(target_os = "linux")]
@@ -1746,7 +1838,10 @@ impl Backend {
                             };
                             if let Some(action) = action {
                                 if !dry.hotkeys.get(action).is_empty() {
-                                    return Some(Event::HotkeyPressed(action));
+                                    return Some(Event::HotkeyPressed {
+                                        action,
+                                        issued_at: Instant::now(),
+                                    });
                                 }
                             }
                         }
@@ -1883,11 +1978,9 @@ fn refuse(snapshot: &EnvSnapshot, reason: &str) -> (Backend, Ready, Vec<Refusal>
         "session not supported by this build: staying local"
     );
     let ready = Ready::degraded(reason, &platform, &session_kind);
-    (
-        Backend::Dry(Box::new(Dry::new(ready.clone(), 0, false, None, false))),
-        ready,
-        Vec::new(),
-    )
+    let mut backend = Dry::new(ready.clone(), 0, false, None, false);
+    backend.simulated_input = false;
+    (Backend::Dry(Box::new(backend)), ready, Vec::new())
 }
 
 /// How long a non-blocking backend poll waits before reporting "no event".
@@ -1929,9 +2022,14 @@ pub fn capture_kind_from_i32(value: i32) -> Result<CaptureKind, String> {
 /// either direction because `protocol` already depends on it.
 pub fn to_input_event(event: &ipc::LocalEvent) -> Option<InputEvent> {
     match event.ev.as_ref()? {
-        ipc::local_event::Ev::Pointer(pointer) => Some(InputEvent::PointerAbsolute(Position::new(
-            pointer.x, pointer.y,
-        ))),
+        ipc::local_event::Ev::Pointer(pointer)
+            if pointer.x.is_finite() && pointer.y.is_finite() =>
+        {
+            Some(InputEvent::PointerAbsolute(Position::new(
+                pointer.x, pointer.y,
+            )))
+        }
+        ipc::local_event::Ev::Pointer(_) => None,
         ipc::local_event::Ev::Key(key) => Some(InputEvent::Key {
             key: HidKey {
                 page: u16::try_from(key.usage_page).ok()?,
@@ -2007,6 +2105,105 @@ fn describe_session(snapshot: &EnvSnapshot) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn simulated_session_release_reports_exact_holds_and_clears_only_on_success() {
+        let mut dry = Dry::new(
+            Ready::degraded("test", "platform-test", "windows"),
+            0,
+            false,
+            None,
+            false,
+        );
+        dry.control_dir = None;
+        let mut backend = Backend::Dry(Box::new(dry));
+        let key = HidKey::keyboard(0x04);
+        let events = [
+            InputEvent::Key {
+                key,
+                state: input_model::KeyState::Down,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: input_model::KeyState::Down,
+            },
+            InputEvent::Button {
+                button: MouseButton::Right,
+                state: input_model::KeyState::Down,
+            },
+            InputEvent::Button {
+                button: MouseButton::Right,
+                state: input_model::KeyState::Up,
+            },
+        ];
+        let injected = backend.inject(&events).await;
+        assert_eq!(injected.applied, events.len());
+        assert!(injected.os_error.is_empty());
+        let (held, _, _) = backend.dry_input_state().unwrap();
+        assert_eq!(held.keys, std::collections::BTreeSet::from([key]));
+        assert_eq!(
+            held.buttons,
+            std::collections::BTreeSet::from([MouseButton::Left])
+        );
+
+        backend.fail_next_dry_release();
+        assert_eq!(
+            backend.release_session().await.unwrap_err(),
+            "controlled native release failure"
+        );
+        let (held, _, _) = backend.dry_input_state().unwrap();
+        assert_eq!(held.keys, std::collections::BTreeSet::from([key]));
+        assert_eq!(
+            held.buttons,
+            std::collections::BTreeSet::from([MouseButton::Left])
+        );
+
+        let released = backend.release_session().await.expect("simulated release");
+        assert_eq!((released.keys, released.buttons), (1, 1));
+        assert!(backend.dry_input_state().unwrap().0.is_empty());
+        let released = backend.release_session().await.expect("already released");
+        assert_eq!((released.keys, released.buttons), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn unsupported_recovery_cannot_become_an_empty_normal_release_ack() {
+        let snapshot = EnvSnapshot::new(if cfg!(windows) {
+            platform_probe::HostOs::Windows
+        } else {
+            platform_probe::HostOs::Linux
+        });
+        let (mut backend, _, _) = refuse(&snapshot, "no native input backend");
+        let Backend::Dry(dry) = &mut backend else {
+            panic!("unsupported backend must remain dry");
+        };
+        dry.control_dir = None;
+        let empty = backend
+            .release_session()
+            .await
+            .expect("no holds to release");
+        assert_eq!((empty.keys, empty.buttons), (0, 0));
+        let key = HidKey::keyboard(0x04);
+        assert!(backend
+            .release_keys(&[key], &[MouseButton::Left])
+            .await
+            .is_err());
+        for _ in 0..2 {
+            assert!(backend.release_session().await.is_err());
+            let (held, _, _) = backend.dry_input_state().unwrap();
+            assert_eq!(held.keys, std::collections::BTreeSet::from([key]));
+            assert_eq!(
+                held.buttons,
+                std::collections::BTreeSet::from([MouseButton::Left])
+            );
+        }
+        backend
+            .end_capture(false, false)
+            .await
+            .expect("local teardown");
+        assert!(backend.release_session().await.is_err());
+        assert_eq!(backend.dry_input_state().unwrap().0.keys.len(), 1);
+        assert_eq!(backend.dry_input_state().unwrap().0.buttons.len(), 1);
+    }
 
     #[test]
     fn a_wheel_file_caught_empty_mid_write_is_left_for_the_next_poll() {
@@ -2155,10 +2352,13 @@ mod tests {
         invalid.emergency_release.clear();
         assert!(!backend.set_hotkeys(&invalid).await.success);
         write(&marker, "2");
-        assert_eq!(
+        assert!(matches!(
             backend.next_event().await,
-            Some(Event::HotkeyPressed(config::HotkeyAction::SwitchNext))
-        );
+            Some(Event::HotkeyPressed {
+                action: config::HotkeyAction::SwitchNext,
+                ..
+            })
+        ));
         assert!(!marker.exists());
         let Backend::Dry(dry) = &backend else {
             panic!("dry backend")

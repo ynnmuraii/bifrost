@@ -1,6 +1,7 @@
 //! The bottom dock: four cells of pairing — this computer, the pairing window, dialling an
 //! address, and the six-digit confirmation.
 
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use eframe::egui::{
@@ -45,7 +46,7 @@ fn request_height(vm: &ViewModel) -> f32 {
     }
 }
 
-/// The height of the dock for the current state.
+/// Preferred viewport height; rendered content determines the dock's scroll extent.
 pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
     // A prompt names the other computer and wraps in a quarter of the window: it needs room.
     let prompt = if let Some(prompt) = &vm.pairing.prompt {
@@ -72,8 +73,31 @@ pub fn height(ctx: &egui::Context, vm: &ViewModel, narrow: bool) -> f32 {
         * ctx.animate_bool_with_time(egui::Id::new("dock-open"), vm.look.dock_open, 0.18)
 }
 
-/// Draws the dock into `rect`.
 pub fn draw(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    vm: &ViewModel,
+    rect: Rect,
+    narrow: bool,
+    now: Instant,
+    actions: &mut Vec<Action>,
+) {
+    ui.painter().rect_filled(rect, 0.0, pal.card);
+    let desired = height(ui.ctx(), vm, narrow);
+    let mut child = ui.new_child(UiBuilder::new().id_salt("pairing-scroll").max_rect(rect));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    egui::ScrollArea::vertical()
+        .max_height(rect.height())
+        .auto_shrink([false, false])
+        .show(&mut child, |ui| {
+            let content =
+                Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), desired));
+            draw_content(ui, pal, vm, content, narrow, now, actions);
+        });
+}
+
+/// Draws the dock into `rect`.
+fn draw_content(
     ui: &mut egui::Ui,
     pal: &Palette,
     vm: &ViewModel,
@@ -84,7 +108,6 @@ pub fn draw(
 ) {
     let lang = vm.look.language;
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, 0.0, pal.card);
     painter.line_segment([rect.left_top(), rect.right_top()], pal.hairline());
     let handle = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 32.0));
     let response = ui
@@ -130,67 +153,89 @@ pub fn draw(
         actions.push(Action::ToggleDock);
     }
     if rect.height() <= 33.0 {
+        ui.allocate_rect(handle, Sense::hover());
         return;
     }
+    let mut row_top = handle.bottom();
     let request_h = request_height(vm);
     if request_h > 0.0 {
-        request_status(
+        row_top += request_status(
             ui,
             pal,
             vm,
             Rect::from_min_size(
-                Pos2::new(rect.min.x, rect.min.y + 32.0),
+                Pos2::new(rect.min.x, row_top),
                 Vec2::new(rect.width(), request_h),
             ),
             actions,
         );
     }
-    let body_top = rect.min.y + 32.0 + request_h;
-    let discovery = Rect::from_min_max(
-        Pos2::new(rect.min.x, rect.max.y - discovery_height(vm)),
-        rect.max,
-    );
-    let rect = Rect::from_min_max(
-        Pos2::new(rect.min.x, body_top),
-        Pos2::new(rect.max.x, discovery.min.y),
-    );
-    let (cols, rows) = if narrow { (2usize, 2usize) } else { (4, 1) };
+    let cols = if narrow { 2usize } else { 4 };
     let cw = rect.width() / cols as f32;
-    let ch = rect.height() / rows as f32;
-    for n in 0..4usize {
-        let (c, r) = (n % cols, n / cols);
-        let cell = Rect::from_min_size(
-            Pos2::new(rect.min.x + c as f32 * cw, rect.min.y + r as f32 * ch),
-            Vec2::new(cw, ch),
-        );
-        if c > 0 {
-            painter.line_segment([cell.left_top(), cell.left_bottom()], pal.hairline());
+    for row in 0..4 / cols {
+        let mut row_bottom = row_top;
+        for col in 0..cols {
+            let n = row * cols + col;
+            let left = rect.left() + col as f32 * cw;
+            let inner = Rect::from_min_max(
+                Pos2::new(left + 22.0, row_top + 16.0),
+                Pos2::new(left + cw - 22.0, f32::INFINITY),
+            );
+            let mut child = ui.new_child(
+                UiBuilder::new()
+                    .id_salt(("dock", n))
+                    .max_rect(inner)
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            // Only the outer scroll viewport clips vertically; each row owns all its controls.
+            child.set_clip_rect(
+                Rect::from_x_y_ranges(left..=left + cw, ui.clip_rect().y_range())
+                    .intersect(ui.clip_rect()),
+            );
+            child.spacing_mut().item_spacing.y = 10.0;
+            match n {
+                0 => this_computer(&mut child, pal, vm, actions),
+                1 => window(&mut child, pal, vm, now, actions),
+                2 => dial(&mut child, pal, vm, actions),
+                _ => code(&mut child, pal, vm, now, actions),
+            }
+            row_bottom = row_bottom.max(child.min_rect().bottom() + 18.0);
         }
-        if r > 0 {
-            painter.line_segment([cell.left_top(), cell.right_top()], pal.hairline());
+        for col in 1..cols {
+            let x = rect.left() + col as f32 * cw;
+            painter.line_segment(
+                [Pos2::new(x, row_top), Pos2::new(x, row_bottom)],
+                pal.hairline(),
+            );
         }
-        let inner = Rect::from_min_max(
-            Pos2::new(cell.min.x + 22.0, cell.min.y + 16.0),
-            Pos2::new(cell.max.x - 22.0, cell.max.y - 18.0),
-        );
-        let mut child = ui.new_child(
-            UiBuilder::new()
-                .id_salt(("dock", n))
-                .max_rect(inner)
-                .layout(Layout::top_down(Align::Min)),
-        );
-        child.set_clip_rect(cell.intersect(ui.clip_rect()));
-        child.spacing_mut().item_spacing.y = 10.0;
-        match n {
-            0 => this_computer(&mut child, pal, vm),
-            1 => window(&mut child, pal, vm, now, actions),
-            2 => dial(&mut child, pal, vm, actions),
-            _ => code(&mut child, pal, vm, now, actions),
+        if row > 0 {
+            painter.line_segment(
+                [
+                    Pos2::new(rect.left(), row_top),
+                    Pos2::new(rect.right(), row_top),
+                ],
+                pal.hairline(),
+            );
         }
+        row_top = row_bottom;
     }
-    if discovery.height() > 0.0 {
-        discovered(ui, pal, vm, discovery, actions);
+    let discovery_h = discovery_height(vm);
+    if discovery_h > 0.0 {
+        discovered(
+            ui,
+            pal,
+            vm,
+            Rect::from_min_size(
+                Pos2::new(rect.left(), row_top),
+                Vec2::new(rect.width(), discovery_h),
+            ),
+            actions,
+        );
     }
+    ui.allocate_rect(
+        Rect::from_min_max(rect.min, Pos2::new(rect.right(), row_top + discovery_h)),
+        Sense::hover(),
+    );
 }
 
 fn request_status(
@@ -199,15 +244,18 @@ fn request_status(
     vm: &ViewModel,
     rect: Rect,
     actions: &mut Vec<Action>,
-) {
+) -> f32 {
     let lang = vm.look.language;
     let mut child = ui.new_child(
         UiBuilder::new()
             .id_salt("pair-request")
-            .max_rect(rect.shrink2(Vec2::new(22.0, 10.0)))
+            .max_rect(Rect::from_min_max(
+                rect.min + Vec2::new(22.0, 10.0),
+                Pos2::new(rect.right() - 22.0, f32::INFINITY),
+            ))
             .layout(Layout::top_down(Align::Min)),
     );
-    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    child.set_clip_rect(ui.clip_rect());
     if let Some(request) = &vm.incoming_pair_request {
         widgets::text(
             &mut child,
@@ -261,8 +309,15 @@ fn request_status(
             actions.push(Action::CancelPairingRequest);
         }
     }
-    ui.painter()
-        .line_segment([rect.left_bottom(), rect.right_bottom()], pal.hairline());
+    let bottom = child.min_rect().bottom() + 10.0;
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left(), bottom),
+            Pos2::new(rect.right(), bottom),
+        ],
+        pal.hairline(),
+    );
+    bottom - rect.top()
 }
 
 fn discovered(
@@ -444,12 +499,26 @@ fn cell_head(ui: &mut egui::Ui, pal: &Palette, letter: &str, caption: &str) {
 }
 
 /// A: this computer and the address the other one types.
-fn this_computer(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
+fn this_computer(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<Action>) {
     let lang = vm.look.language;
     cell_head(ui, pal, "A", text(lang, Key::ThisComputerTitle));
     widgets::text(ui, &vm.this_name(), 24.0, fam::sans_semibold(), pal.ink);
+    if widgets::small_button(ui, pal, text(lang, Key::RenameComputer), true)
+        .on_hover_text(text(lang, Key::RenameComputerHint))
+        .clicked()
+    {
+        actions.push(Action::OpenConfigFile);
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("rename-computer-guidance"), true));
+    }
+    if ui.ctx().data_mut(|data| {
+        data.get_temp::<bool>(egui::Id::new("rename-computer-guidance"))
+            .unwrap_or(false)
+    }) {
+        widgets::hint(ui, pal, text(lang, Key::RenameComputerHint));
+    }
     let address = vm.config.listen_address.as_str();
-    if address.is_empty() {
+    if !remotely_usable_address(address) {
         widgets::text(
             ui,
             text(lang, Key::NoAddressIsSelected),
@@ -464,12 +533,27 @@ fn this_computer(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
         );
     } else {
         let port = format!(":{}", vm.config.port_input);
-        let galley = widgets::mono_runs(
-            ui,
-            &[Run::plain(address, pal.ink), Run::plain(&port, pal.ink2)],
-            18.0,
-            ui.available_width(),
-        );
+        let width = ui.available_width();
+        let galley = if address.contains(':') && !address.starts_with('[') {
+            widgets::mono_runs(
+                ui,
+                &[
+                    Run::plain("[", pal.ink),
+                    Run::plain(address, pal.ink),
+                    Run::plain("]", pal.ink),
+                    Run::plain(&port, pal.ink2),
+                ],
+                18.0,
+                width,
+            )
+        } else {
+            widgets::mono_runs(
+                ui,
+                &[Run::plain(address, pal.ink), Run::plain(&port, pal.ink2)],
+                18.0,
+                width,
+            )
+        };
         widgets::show_galley(ui, galley);
         widgets::hint(
             ui,
@@ -480,6 +564,34 @@ fn this_computer(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel) {
             ),
         );
     }
+}
+
+/// A bind address is not necessarily an address another computer can use.
+fn remotely_usable_address(address: &str) -> bool {
+    let address = address.trim();
+    if address.is_empty() {
+        return false;
+    }
+    let ip = address
+        .parse::<SocketAddr>()
+        .map(|socket| socket.ip())
+        .or_else(|_| address.trim_matches(['[', ']']).parse::<IpAddr>());
+    if let Ok(ip) = ip {
+        let ip = match ip {
+            IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+            ip => ip,
+        };
+        return !ip.is_unspecified() && !ip.is_loopback();
+    }
+    let host = address
+        .rsplit_once(':')
+        .filter(|(_, port)| port.parse::<u16>().is_ok())
+        .map_or(address, |(host, _)| host)
+        .trim_end_matches('.');
+    !host
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("localhost"))
 }
 
 /// B: the pairing window and its countdown.
@@ -494,7 +606,18 @@ fn window(
     cell_head(ui, pal, "B", text(lang, Key::PairingWindow));
     match (&vm.pairing.window, vm.pairing.window_deadline) {
         (Some(window), Some(deadline)) => {
-            widgets::text(ui, &window.address, 22.0, fam::mono_medium(), pal.ink);
+            let usable_address = remotely_usable_address(&window.address);
+            widgets::text(
+                ui,
+                if usable_address {
+                    &window.address
+                } else {
+                    text(lang, Key::NoAddressIsSelected)
+                },
+                22.0,
+                fam::mono_medium(),
+                pal.ink,
+            );
             let left = deadline.saturating_duration_since(now).as_secs_f32().ceil() as u32;
             let filled = ((left.min(WINDOW_S) as f32 / WINDOW_S as f32) * 24.0).round() as usize;
             let (full, empty) = ("#".repeat(filled), ".".repeat(24 - filled.min(24)));
@@ -516,17 +639,22 @@ fn window(
                 pal,
                 text(
                     lang,
-                    Key::TellThisAddressToTheOtherComputerSOwnerTheWindowClosesByItself,
+                    if usable_address {
+                        Key::TellThisAddressToTheOtherComputerSOwnerTheWindowClosesByItself
+                    } else {
+                        Key::PickAnAddressOnTheLocalNetworkInTheSettings
+                    },
                 ),
             );
-            widgets::button(
+            act(
                 ui,
                 pal,
-                text(lang, Key::CloseTheWindowSoon),
+                text(lang, Key::ClosePairingWindow),
                 Kind::Plain,
-                false,
-            )
-            .on_hover_text(text(lang, Key::ForNowThePairingWindowClosesByItself));
+                vm.connection.is_connected(),
+                actions,
+                || Action::ClosePairingWindow,
+            );
         }
         _ => {
             widgets::wrapped(
@@ -843,6 +971,153 @@ fn code(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, now: Instant, actions:
 mod tests {
     use super::*;
     use crate::view_model::{CoreEndpoint, LocalConfig};
+
+    #[test]
+    fn pairing_destinations_exclude_bind_and_loopback_addresses_but_keep_close() {
+        for (listen, destination, usable) in [
+            ("0.0.0.0", "0.0.0.0:47901", false),
+            ("127.0.0.1", "127.0.0.1:47901", false),
+            ("::", "[::]:47901", false),
+            ("::1", "[::1]:47901", false),
+            ("::ffff:127.0.0.1", "[::ffff:127.0.0.1]:47901", false),
+            ("::ffff:0.0.0.0", "[::ffff:0.0.0.0]:47901", false),
+            ("localhost", "localhost:47901", false),
+            ("LOCALHOST.", "LOCALHOST.:47901", false),
+            ("192.168.1.10", "192.168.1.10:47901", true),
+            ("fd00::10", "[fd00::10]:47901", true),
+            ("workstation.local", "workstation.local:47901", true),
+        ] {
+            let mut vm = ViewModel::new(
+                CoreEndpoint::Ready {
+                    description: String::new(),
+                },
+                LocalConfig::default(),
+            );
+            vm.on_connected("test");
+            vm.config.listen_address = listen.into();
+            vm.pairing.window = Some(protocol::ipc::PairingWindow {
+                open: true,
+                address: destination.into(),
+                seconds_remaining: WINDOW_S,
+                ..Default::default()
+            });
+            let now = Instant::now();
+            vm.pairing.window_deadline = Some(now + std::time::Duration::from_secs(120));
+            let ctx = egui::Context::default();
+            super::super::install_fonts(&ctx);
+            let output = ctx.run_ui(Default::default(), |ui| {
+                let pal = Palette::of(vm.look.theme);
+                this_computer(ui, &pal, &vm, &mut Vec::new());
+                window(ui, &pal, &vm, now, &mut Vec::new());
+            });
+            let labels: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(label) => Some(label.galley.text()),
+                    _ => None,
+                })
+                .collect();
+            assert!(labels.contains(&text(vm.look.language, Key::ClosePairingWindow)));
+            assert_eq!(labels.contains(&destination), usable, "{destination}");
+            assert_eq!(
+                labels.contains(&text(
+                    vm.look.language,
+                    Key::PickAnAddressOnTheLocalNetworkInTheSettings,
+                )),
+                !usable,
+                "{listen}"
+            );
+            if !usable {
+                assert!(!labels.iter().any(|label| label.contains(listen)));
+                assert!(labels.contains(&text(vm.look.language, Key::NoAddressIsSelected)));
+            }
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn ipv6_pairing_destination_can_be_copied_as_a_socket_address() {
+        let mut vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
+        );
+        vm.config.listen_address = "fd00::10".into();
+        vm.config.port_input = 47357;
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let output = ctx.run_ui(Default::default(), |ui| {
+            this_computer(ui, &Palette::of(vm.look.theme), &vm, &mut Vec::new());
+        });
+        let destination = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(label) => label.galley.text().parse::<SocketAddr>().ok(),
+            _ => None,
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            destination,
+            Some(SocketAddr::new("fd00::10".parse().unwrap(), 47357)),
+            "the address shown for the other computer must retain an unambiguous IPv6 port"
+        );
+    }
+
+    #[test]
+    fn rename_click_keeps_config_and_restart_guidance_visible() {
+        let vm = ViewModel::new(
+            CoreEndpoint::Ready {
+                description: String::new(),
+            },
+            LocalConfig::default(),
+        );
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let pal = Palette::of(vm.look.theme);
+        let mut actions = Vec::new();
+        let mut render = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| this_computer(ui, &pal, &vm, &mut actions),
+            )
+        };
+        let output = render(Vec::new());
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label)
+                    if label.galley.text() == text(vm.look.language, Key::RenameComputer) =>
+                {
+                    Some(label.pos + label.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("Rename is visible");
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            render(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ])
+            .drop_without_applying_deltas();
+        }
+        let output = render(Vec::new());
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(label)
+                if label.galley.text() == text(vm.look.language, Key::RenameComputerHint))
+        }));
+        assert!(matches!(actions.as_slice(), [Action::OpenConfigFile]));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn audit_sas_has_one_accessible_text_representation() {

@@ -28,7 +28,7 @@ struct Xf {
 impl Xf {
     fn new(rect: Rect, zoom_percent: u16) -> Self {
         let base = (((rect.width() - 48.0) / STAGE_W as f32)
-            .min((rect.height() - 190.0) / STAGE_H as f32))
+            .min((rect.height() - 110.0) / STAGE_H as f32))
         .clamp(0.05, 1.0);
         let s = base * f32::from(zoom_percent.clamp(ZOOM_MIN, ZOOM_MAX)) / 100.0;
         Self {
@@ -82,7 +82,8 @@ pub fn draw(
 ) -> Option<Duration> {
     let lang = vm.look.language;
     let painter = ui.painter().with_clip_rect(rect);
-    let model = vm.map_model();
+    let mut cache = std::mem::take(&mut st.map_cache);
+    let model = cache.get(vm);
     let pointer = ui
         .input(|i| i.pointer.hover_pos())
         .filter(|p| rect.contains(*p) && vm.modal.is_none() && !vm.appearance_open);
@@ -100,7 +101,7 @@ pub fn draw(
         .as_ref()
         .and_then(|status| single_peer_rtt(status, vm.self_node()));
     st.bridge.set_latency(&painter, lang, rtt);
-    let mut xf = Xf::new(rect, vm.look.zoom_percent).fit(rect, &model);
+    let mut xf = Xf::new(rect, vm.look.zoom_percent).fit(rect, model);
     let saved_pan = Vec2::new(f32::from(vm.look.pan_x), f32::from(vm.look.pan_y));
     let pointer_over_object = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
         model.nodes.iter().any(|node| {
@@ -132,37 +133,30 @@ pub fn draw(
     let s = xf.s;
 
     // Where each computer is drawn now: animated towards the model unless it is being dragged.
-    let shown: Vec<Pos2> = model
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, node)| {
-            let dragging = st.drag.as_ref().is_some_and(|d| d.node_id == node.node_id)
-                || st
-                    .display_resize
-                    .as_ref()
-                    .is_some_and(|d| d.node_id == node.node_id);
-            let time = if dragging { 0.0 } else { 0.45 };
-            let x = ui.ctx().animate_value_with_time(
-                egui::Id::new(("node-x", i)),
-                node.at.x as f32,
-                time,
-            );
-            let y = ui.ctx().animate_value_with_time(
-                egui::Id::new(("node-y", i)),
-                node.at.y as f32,
-                time,
-            );
-            xf.p(f64::from(x), f64::from(y))
-        })
-        .collect();
+    let mut shown = std::mem::take(&mut st.map_shown);
+    shown.clear();
+    shown.extend(model.nodes.iter().enumerate().map(|(i, node)| {
+        let dragging = st.drag.as_ref().is_some_and(|d| d.node_id == node.node_id)
+            || st
+                .display_resize
+                .as_ref()
+                .is_some_and(|d| d.node_id == node.node_id);
+        let time = if dragging { 0.0 } else { 0.45 };
+        let x =
+            ui.ctx()
+                .animate_value_with_time(egui::Id::new(("node-x", i)), node.at.x as f32, time);
+        let y =
+            ui.ctx()
+                .animate_value_with_time(egui::Id::new(("node-y", i)), node.at.y as f32, time);
+        xf.p(f64::from(x), f64::from(y))
+    }));
 
     // Handles and bridge menus arbitrate before raw paddles and card drags.
-    let resize_hovered = display_resize_interaction(ui, vm, st, &model, &shown, xf, rect, actions);
-    let bridge_hovered = bridge_interaction(ui, vm, st, &model, &shown, xf, rect, actions);
+    let resize_hovered = display_resize_interaction(ui, vm, st, model, &shown, xf, rect, actions);
+    let bridge_hovered = bridge_interaction(ui, vm, st, model, &shown, xf, rect, actions);
     let paddle_hovered = !resize_hovered
         && !bridge_hovered
-        && paddle_interaction(ui, vm, st, &model, &shown, xf, rect, t, actions);
+        && paddle_interaction(ui, vm, st, model, &shown, xf, rect, t, actions);
 
     // Hover identity may stay the same while the card glides, zooms or pans.
     // Retarget before painting so the outline uses this frame's displayed geometry.
@@ -194,7 +188,7 @@ pub fn draw(
         draw_link(
             &painter,
             pal,
-            &model,
+            model,
             link,
             &shown,
             xf,
@@ -206,7 +200,7 @@ pub fn draw(
         for link in model.links.iter().filter(|link| {
             !link.disabled && matches!(link.state, LinkState::Active | LinkState::Idle)
         }) {
-            let (a, b) = link_ends(&model, link, &shown, xf);
+            let (a, b) = link_ends(model, link, &shown, xf);
             st.bridge.paint(
                 &painter,
                 a,
@@ -235,28 +229,7 @@ pub fn draw(
     // Node captions must cover both the field and the bridge glyphs.
     let mut hovered: Option<(usize, usize)> = None;
     for (i, node) in model.nodes.iter().enumerate() {
-        let bounds = node_rect(shown[i], node, s);
-        let mut caption_clip = Rect::from_min_max(
-            bounds.left_bottom(),
-            Pos2::new(bounds.right(), rect.bottom()),
-        );
-        for (j, other) in model.nodes.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            for mon in &other.mons {
-                let obstacle = monitor_rect(shown[j], mon.rect, s);
-                if obstacle.right() > bounds.left()
-                    && obstacle.left() < bounds.right()
-                    && obstacle.bottom() > bounds.bottom()
-                {
-                    caption_clip.max.y = caption_clip
-                        .max
-                        .y
-                        .min((obstacle.top() - 4.0).max(bounds.bottom()));
-                }
-            }
-        }
+        let caption_clip = clipped_caption_rect(model, &shown, i, s, rect);
         node_ui(
             ui,
             &painter,
@@ -284,7 +257,7 @@ pub fn draw(
         &painter,
         pal,
         vm,
-        &model,
+        model,
         &shown,
         xf,
         &mut st.phantom_art,
@@ -292,9 +265,9 @@ pub fn draw(
     );
     let phantom_live = env.animate && vm.modal.is_none() && !vm.appearance_open && phantom_visible;
     st.phantom_art.tick(t, phantom_live);
-    let paddle_fading = paint_paddles(&painter, pal, st, &model, &shown, xf, t);
-    paint_bridge_endpoints(&painter, pal, st, &model, &shown, xf);
-    paint_resize_handles(ui, &painter, pal, st, &model, &shown, xf);
+    let paddle_fading = paint_paddles(&painter, pal, st, model, &shown, xf, t);
+    paint_bridge_endpoints(&painter, pal, st, model, &shown, xf);
+    paint_resize_handles(ui, &painter, pal, st, model, &shown, xf);
     if simulate && hovered != st.hover {
         match hovered {
             Some((n, _)) if simulate && st.drag.is_none() => {
@@ -338,9 +311,11 @@ pub fn draw(
         }
     }
     banner(ui, pal, vm, rect, actions);
-    properties(ui, pal, vm, st, &model, rect, actions);
+    properties(ui, pal, vm, st, model, rect, actions);
     // A bridge has its own clock: a static or settled background must not stop its flow.
     // Animated layers freeze without scheduling frames when the map/window is inactive.
+    st.map_shown = shown;
+    st.map_cache = cache;
     (moving || paddle_fading || (simulate && bridge_live) || phantom_live).then_some(FIELD_FRAME)
 }
 
@@ -1188,6 +1163,14 @@ fn properties(
     if vm.modal.is_some() || vm.appearance_open || st.display_resize.is_some() {
         return;
     }
+    if (st.selected_display.is_some() || st.selected_bridge.is_some())
+        && !egui::Popup::is_any_open(ui.ctx())
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        st.selected_display = None;
+        st.selected_bridge = None;
+        return;
+    }
     let lang = vm.look.language;
     let clip = popup_bounds(clip);
     let mut open = true;
@@ -1358,7 +1341,7 @@ fn caption_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
     Rect::from_min_size(
         Pos2::new(at.x, at.y + node.h as f32 * scale),
         Vec2::new(
-            node.w as f32 * scale,
+            (node.w as f32 * scale).max(240.0 * scale.clamp(0.8, 1.0)),
             (88.0
                 + if node.game_guard_badge.is_empty() {
                     0.0
@@ -1368,6 +1351,46 @@ fn caption_rect(at: Pos2, node: &MapNode, scale: f32) -> Rect {
                 * scale.clamp(0.8, 1.0),
         ),
     )
+}
+
+fn clipped_caption_rect(
+    model: &MapModel,
+    shown: &[Pos2],
+    index: usize,
+    scale: f32,
+    viewport: Rect,
+) -> Rect {
+    let node = &model.nodes[index];
+    let card = node_rect(shown[index], node, scale);
+    let mut clip = caption_rect(shown[index], node, scale).intersect(viewport);
+    for (other_index, other) in model.nodes.iter().enumerate() {
+        if index == other_index {
+            continue;
+        }
+        for mon in &other.mons {
+            let obstacle = monitor_rect(shown[other_index], mon.rect, scale);
+            if clip.intersects(obstacle) {
+                if obstacle.left() >= card.right() {
+                    clip.max.x = clip.max.x.min((obstacle.left() - 4.0).max(clip.left()));
+                } else {
+                    clip.max.y = clip.max.y.min((obstacle.top() - 4.0).max(clip.top()));
+                }
+            }
+        }
+        let other_caption = caption_rect(shown[other_index], other, scale);
+        if clip.intersects(other_caption) {
+            // A caption to the left stops at this one's origin, not vice versa.
+            if other_caption.left() > card.left() {
+                clip.max.x = clip
+                    .max
+                    .x
+                    .min((other_caption.left() - 4.0).max(clip.left()));
+            } else if other_caption.left() == card.left() && other_caption.top() > card.bottom() {
+                clip.max.y = clip.max.y.min((other_caption.top() - 4.0).max(clip.top()));
+            }
+        }
+    }
+    clip
 }
 
 fn phantom_caption_rect(card: Rect, scale: f32) -> Rect {
@@ -1638,7 +1661,10 @@ fn node_ui(
                 Sense::hover()
             },
         );
-        response.clone().on_hover_text(node.app_version.clone());
+        response.clone().on_hover_ui(|ui| {
+            ui.label(&node.name);
+            ui.label(&node.app_version);
+        });
         if enabled
             && (response.clicked()
                 || response.secondary_clicked()
@@ -1655,6 +1681,12 @@ fn node_ui(
             });
         }
         if enabled && response.has_focus() {
+            painter.rect_stroke(
+                rect.expand(4.0),
+                4.0,
+                Stroke::new(2.0, pal.accent),
+                StrokeKind::Outside,
+            );
             ui.memory_mut(|mem| {
                 mem.set_focus_lock_filter(
                     id,
@@ -1798,11 +1830,15 @@ fn node_ui(
     );
     painter.multiply_opacity(identifiers);
     let top = at.y + node.h as f32 * s + 10.0 * fs;
-    let name = painter.layout_no_wrap(
+    let mut name_job = egui::text::LayoutJob::simple_singleline(
         node.name.clone(),
         font(13.0 * fs, fam::sans_semibold()),
         fade(pal.ink, k),
     );
+    name_job.wrap.max_width = (painter.clip_rect().width() - 12.0 * fs).max(1.0);
+    name_job.wrap.max_rows = 1;
+    name_job.wrap.break_anywhere = true;
+    let name = painter.layout_job(name_job);
     let mut y = top;
     let h = name.size().y;
     painter.circle_filled(
@@ -2043,6 +2079,139 @@ fn banner(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, rect: Rect, actions:
 #[cfg(test)]
 mod transform_tests {
     use super::*;
+
+    #[test]
+    fn small_monitor_captions_keep_readable_names_and_ellipsize_only_long_names() {
+        for scale in [0.45, 0.65, 1.0] {
+            for long in [false, true] {
+                let mut model = owner_layout();
+                model.nodes.truncate(1);
+                let node = &mut model.nodes[0];
+                node.name = if long {
+                    "WORKSTATION-".repeat(40)
+                } else {
+                    "WORKSTATION-LAPTOP".into()
+                };
+                node.w = 144.0;
+                node.h = 81.0;
+                node.mons.truncate(1);
+                node.mons[0].rect = crate::map::Rect::new(0.0, 0.0, node.w, node.h);
+                let shown = [Pos2::new(80.0, 80.0)];
+                let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 340.0));
+                let caption = clipped_caption_rect(&model, &shown, 0, scale, viewport);
+                let ctx = egui::Context::default();
+                super::super::install_fonts(&ctx);
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let painter = ui.painter().with_clip_rect(viewport);
+                        node_ui(
+                            ui,
+                            &painter,
+                            &Palette::of(crate::gui_settings::Theme::Light),
+                            &mut UiState::new(std::time::Instant::now()),
+                            &model.nodes[0],
+                            0,
+                            shown[0],
+                            Xf {
+                                origin: Pos2::ZERO,
+                                s: scale,
+                            },
+                            caption,
+                            false,
+                            &mut None,
+                            &mut Vec::new(),
+                        );
+                    },
+                );
+                let (shape, label) = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        Shape::Text(label) if label.galley.text() == model.nodes[0].name => {
+                            Some((shape, label))
+                        }
+                        _ => None,
+                    })
+                    .expect("The computer name is drawn");
+                assert_eq!(label.galley.elided, long, "scale={scale}");
+                let glyphs = Rect::from_min_size(label.pos, label.galley.size());
+                assert!(shape.clip_rect.contains_rect(glyphs));
+                assert!(viewport.contains_rect(glyphs));
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_captions_stop_before_neighbors_and_the_viewport_edge() {
+        let mut model = owner_layout();
+        for (i, node) in model.nodes.iter_mut().enumerate() {
+            node.name = format!("{}-{i}", "WORKSTATION-".repeat(20));
+            node.w = 144.0;
+            node.h = 81.0;
+            node.mons.truncate(1);
+            node.mons[0].rect = crate::map::Rect::new(0.0, 0.0, node.w, node.h);
+        }
+        let shown = [Pos2::new(80.0, 80.0), Pos2::new(210.0, 80.0)];
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 340.0));
+        let ctx = egui::Context::default();
+        super::super::install_fonts(&ctx);
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ui| {
+                let painter = ui.painter().with_clip_rect(viewport);
+                for (index, node) in model.nodes.iter().enumerate() {
+                    node_ui(
+                        ui,
+                        &painter,
+                        &Palette::of(crate::gui_settings::Theme::Light),
+                        &mut UiState::new(std::time::Instant::now()),
+                        node,
+                        index,
+                        shown[index],
+                        Xf {
+                            origin: Pos2::ZERO,
+                            s: 0.45,
+                        },
+                        clipped_caption_rect(&model, &shown, index, 0.45, viewport),
+                        false,
+                        &mut None,
+                        &mut Vec::new(),
+                    );
+                }
+            },
+        );
+        let names: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(label)
+                    if model
+                        .nodes
+                        .iter()
+                        .any(|node| node.name == label.galley.text()) =>
+                {
+                    let glyphs = Rect::from_min_size(label.pos, label.galley.size());
+                    assert!(label.galley.elided);
+                    assert!(shape.clip_rect.contains_rect(glyphs));
+                    assert!(viewport.contains_rect(glyphs));
+                    Some(glyphs)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names[0].right() <= shown[1].x - 4.0);
+        assert!(!names[0].intersects(names[1]));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn resize_preview_releases_once_and_focus_loss_cancels() {
@@ -2308,61 +2477,6 @@ mod transform_tests {
         let node = &model.nodes[0];
         assert!(viewport.contains(xf.p(node.at.x, node.at.y)));
         assert!(viewport.contains(xf.p(node.at.x + node.w, node.at.y + node.h)));
-    }
-
-    #[test]
-    fn real_name_caption_clipping_is_independent_of_phantom_placement() {
-        let ctx = egui::Context::default();
-        super::super::install_fonts(&ctx);
-        let mut node = owner_layout().nodes.remove(0);
-        node.name = "WORKSTATION".into();
-        node.w = 144.0;
-        node.h = 81.0;
-        let at = Pos2::new(530.0, 180.0);
-        let scale = 0.45;
-        let card = node_rect(at, &node, scale);
-        let caption = caption_rect(at, &node, scale);
-        let mut st = UiState::new(std::time::Instant::now());
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let painter = ui.painter().clone();
-            node_ui(
-                ui,
-                &painter,
-                &Palette::of(crate::gui_settings::Theme::Dark),
-                &mut st,
-                &node,
-                0,
-                at,
-                Xf {
-                    origin: Pos2::ZERO,
-                    s: scale,
-                },
-                caption,
-                false,
-                &mut None,
-                &mut Vec::new(),
-            );
-        });
-        let clipped_name = output.shapes.iter().find_map(|shape| {
-            if let Shape::Text(label) = &shape.shape {
-                (label.galley.text() == node.name).then(|| {
-                    (
-                        shape.clip_rect,
-                        Rect::from_min_size(label.pos, label.galley.size()),
-                    )
-                })
-            } else {
-                None
-            }
-        });
-        output.drop_without_applying_deltas();
-        let (clip, glyphs) =
-            clipped_name.expect("Real name is drawn without any discovery overlay");
-        assert_eq!(clip.right(), card.right());
-        assert!(
-            glyphs.right() > clip.right(),
-            "Existing real caption clips at its monitor width"
-        );
     }
 
     #[test]

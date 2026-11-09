@@ -195,6 +195,7 @@ unsafe fn enter(loop_: *mut NativeLoop) -> Result<Entered, BackendError> {
 struct Observation {
     name: CString,
     serial: u64,
+    expected_cookie: u32,
     core: Object,
     registry: Object,
     node: Object,
@@ -230,7 +231,7 @@ impl Observation {
         self.changed();
     }
     fn ready(&self) -> bool {
-        !self.node.is_null() && self.cookie.is_some() && self.error.is_none()
+        !self.node.is_null() && self.cookie == Some(self.expected_cookie) && self.error.is_none()
     }
     fn begin_collection(&mut self) {
         self.enum_epoch = self.epoch;
@@ -265,8 +266,12 @@ pub(crate) struct EffectiveMonitor {
 // loop; the stable boxed callback data is never moved. This permits bfa-stop transfer.
 unsafe impl Send for EffectiveMonitor {}
 impl EffectiveMonitor {
-    pub(crate) fn connect(name: &str, serial: u64) -> Result<Self, BackendError> {
-        if serial == 0 {
+    pub(crate) fn connect(
+        name: &str,
+        serial: u64,
+        server_cookie: u32,
+    ) -> Result<Self, BackendError> {
+        if serial == 0 || server_cookie == 0 {
             return Err(BackendError::Unsupported);
         }
         let name = CString::new(name).map_err(|_| BackendError::InvalidArgument)?;
@@ -279,6 +284,7 @@ impl EffectiveMonitor {
             observation: Box::new(Observation {
                 name,
                 serial,
+                expected_cookie: server_cookie,
                 core: ptr::null_mut(),
                 registry: ptr::null_mut(),
                 node: ptr::null_mut(),
@@ -556,7 +562,11 @@ unsafe extern "C" fn core_info(data: Object, info: *const CoreInfo) {
             state.fail(BackendError::ServerUnavailable);
             return;
         };
-        if state.cookie.is_some_and(|cookie| cookie != info.cookie) {
+        // PipeWire's Pulse GetServerInfo returns pw_manager_core_cookie(), not a
+        // socket/name heuristic. Match the catalog's instance before Props admission.
+        if info.cookie != state.expected_cookie
+            || state.cookie.is_some_and(|cookie| cookie != info.cookie)
+        {
             state.fail(BackendError::ServerUnavailable);
         } else {
             state.cookie = Some(info.cookie);
@@ -835,6 +845,7 @@ mod tests {
             name: CString::new("sink").unwrap(),
             serial: 42,
             core: ptr::null_mut(),
+            expected_cookie: 5,
             registry: ptr::null_mut(),
             node: ptr::dangling_mut(),
             node_id: 9,
@@ -863,6 +874,18 @@ mod tests {
         }
         state.collecting = false;
         assert!(state.false_complete());
+        // A second instance may have the same name/serial and actual false.
+        // Its core cookie must still reject the otherwise complete collection.
+        state.expected_cookie = 6;
+        assert!(!state.false_complete());
+        state.expected_cookie = 5;
+        let info = CoreInfo { id: 0, cookie: 6 };
+        unsafe { core_info(data, &info) };
+        assert_eq!(state.error, Some(BackendError::ServerUnavailable));
+        assert!(!state.false_complete());
+        state.error = None;
+        state.enum_epoch = state.epoch;
+        assert!(state.false_complete());
         unsafe {
             node_param(data, 1, PROPS, 0, 1, bytes.as_ptr().cast());
         }
@@ -874,6 +897,7 @@ mod tests {
         let mut state = Observation {
             name: CString::new("sink").unwrap(),
             serial: 42,
+            expected_cookie: 5,
             core: ptr::null_mut(),
             registry: ptr::null_mut(),
             node: ptr::dangling_mut(),

@@ -255,9 +255,22 @@ impl Pairing {
         self.gate.close();
         // A ceremony of the closed window has nobody left to admit: tell each waiting
         // caller instead of leaving it until its own timeout.
-        for ceremony in self.ceremonies.values_mut() {
-            if let Some(answer) = ceremony.answer.take() {
-                let _ = answer.send(false);
+        for ceremony in self
+            .ceremonies
+            .values_mut()
+            .filter(|ceremony| ceremony.window_attempt == Some(window.attempt_id))
+        {
+            ceremony.superseded = true;
+            ceremony.prompt = None;
+            ceremony.answer = None;
+            if let Some(cancel) = ceremony.cancel.take() {
+                let _ = cancel.send(());
+            }
+            if let Some(reply) = ceremony.reply.take() {
+                let _ = reply.send(Err((
+                    "PAIRING_CANCELLED".to_owned(),
+                    "the local pairing window was closed".to_owned(),
+                )));
             }
         }
         Some(window)
@@ -724,6 +737,54 @@ mod tests {
             pairing.gate.window(1).is_some(),
             "the gate window stays open too"
         );
+    }
+
+    #[test]
+    fn close_cancels_owned_opener_before_prompt_and_fences_late_events() {
+        let mut pairing = open_pairing();
+        let attempt = pairing.window().unwrap().attempt_id;
+        let (id, _answer, mut cancelled) = pairing.begin();
+        pairing.accepted(id, attempt);
+        assert!(pairing.close().is_some());
+        assert!(pairing.gate.window(1).is_none());
+        assert_eq!(cancelled.try_recv(), Ok(()));
+        assert!(pairing.pending_prompt(1).is_none());
+        assert!(pairing
+            .on_event(super::expiry_tests::prompt(id), 1)
+            .is_none());
+        assert!(matches!(
+            pairing.on_event(
+                Event::Finished {
+                    ceremony_id: id,
+                    outcome: Outcome::Rejected,
+                },
+                2
+            ),
+            Some(PublishedEvent::Finished {
+                cancelled: true,
+                outcome: Outcome::Rejected,
+                ..
+            })
+        ));
+        assert!(pairing.close().is_none(), "closing twice is safe");
+    }
+
+    #[test]
+    fn closing_local_window_does_not_cancel_an_unrelated_outgoing_dial() {
+        let mut pairing = open_pairing();
+        let (id, _answer, mut cancelled) = pairing.begin();
+        let mut dial = pairing.dial_started(id);
+        pairing.close();
+        assert!(matches!(
+            cancelled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            pairing.on_event(super::expiry_tests::prompt(id), 1),
+            Some(PublishedEvent::Prompt(_))
+        ));
+        assert!(dial.try_recv().unwrap().is_ok());
+        assert!(pairing.answer(&id, true).is_ok());
     }
 }
 

@@ -40,6 +40,50 @@ pub mod repeat;
 
 pub use repeat::RepeatFilter;
 
+/// Physical observation or synthetic holds, with ownership chosen by the caller.
+/// Never share one instance between source admission and recovery bookkeeping.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PressedState {
+    pub keys: std::collections::BTreeSet<HidKey>,
+    pub buttons: std::collections::BTreeSet<MouseButton>,
+}
+
+impl PressedState {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.buttons.is_empty()
+    }
+
+    pub fn apply(&mut self, event: &InputEvent) {
+        match *event {
+            InputEvent::Key {
+                key,
+                state: KeyState::Down,
+            } => {
+                self.keys.insert(key);
+            }
+            InputEvent::Key {
+                key,
+                state: KeyState::Up,
+            } => {
+                self.keys.remove(&key);
+            }
+            InputEvent::Button {
+                button,
+                state: KeyState::Down,
+            } => {
+                self.buttons.insert(button);
+            }
+            InputEvent::Button {
+                button,
+                state: KeyState::Up,
+            } => {
+                self.buttons.remove(&button);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Cumulative discrete input at a diagnostic stage boundary: the key and button edges the
 /// stuck-state guarantees rest on, plus the wheel events that make a silently lost scroll
 /// visible in the same line.

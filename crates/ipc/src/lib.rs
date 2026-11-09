@@ -23,19 +23,12 @@
 //!
 //! # The agent's "no network sockets" invariant
 //!
-//! `docs/03-architecture.md`, rule 1: «Нет сетевых сокетов. В Windows-сборке не
-//! линкуется winsock; на Linux — проверка в CI по списку символов.»
-//!
-//! This crate cannot enforce that by feature selection: tokio's `net` feature is
-//! one switch that turns on TCP, UDP, Unix sockets and named pipes together, and
-//! there is no Unix-socket-only or pipe-only feature. The invariant therefore
-//! stays a **link-level** property of the agent binary, checked the way the
-//! documents say: by scanning the linked symbols in CI (`ws2_32`/`WSAStartup`/
-//! `connect`/`socket` for Windows; `socket`, `connect`, `getaddrinfo`, `sendto`
-//! for the Linux build) rather than by pretending the feature set is enough.
-//! What this crate does guarantee is narrower and checkable: it opens no TCP or
-//! UDP socket, it has no DNS dependency, and every endpoint it can create is
-//! local.
+//! The input agent must own no TCP/UDP sockets. Local Unix sockets and named pipes
+//! are allowed; core owns all network transport. Tokio's `net` feature also enables
+//! local IPC, so feature flags or whole-shipped-binary import scans cannot establish
+//! this process-role property. Agent dependency/source restrictions and runtime
+//! `netguard` enforce it. This crate creates only same-user local endpoints and has
+//! no DNS or network-client dependency.
 //!
 //! # Example shape
 //!

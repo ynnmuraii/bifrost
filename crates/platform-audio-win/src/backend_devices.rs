@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     backend::map_error,
-    devices::{self, CaptureMute, DeviceFlow, DeviceMonitor, DeviceRole, EndpointInfo},
+    devices::{self, CaptureMute, DeviceFlow, DeviceMonitor, DeviceRole, EndpointInfo, MuteWrite},
 };
 use audio_backend::{
     AudioFormat, BackendError, DefaultRole, Defaults, Device, DeviceId, DeviceSelection, Direction,
@@ -390,6 +390,28 @@ impl Ownership {
         Ok(true)
     }
 
+    fn set(
+        &mut self,
+        intact: bool,
+        current: bool,
+        requested: bool,
+        write: impl FnOnce() -> Result<MuteWrite>,
+    ) -> Result<()> {
+        if !self.authorize(intact, current, requested)? {
+            return Ok(());
+        }
+        // Errors and revision loss cannot leave a restoration right behind.
+        self.owned = false;
+        self.revoked = true;
+        match write()? {
+            MuteWrite::Changed => self.owned = true,
+            MuteWrite::Unchanged => {}
+            MuteWrite::RevisionLost => return Err(BackendError::OwnershipLost),
+        }
+        self.revoked = false;
+        Ok(())
+    }
+
     fn restoration(&mut self, intact: bool, current: bool) -> Result<bool> {
         if !std::mem::replace(&mut self.active, false) {
             return Ok(false);
@@ -449,22 +471,10 @@ impl MuteGuard for WindowsMuteGuard {
             && self.revocation != u64::MAX
             && mute.external_revision() == self.revision
             && self.revision != u64::MAX;
-        if self.ownership.authorize(intact, current, muted)? {
-            // An error is ambiguous: never retry restoration after an unproven native write.
-            self.ownership.owned = false;
-            self.ownership.revoked = true;
-            match mute
-                .set_mute_if_revision(muted, self.revision)
-                .map_err(map_error)?
-            {
-                true => {
-                    self.ownership.owned = true;
-                    self.ownership.revoked = false;
-                }
-                false => return Err(BackendError::OwnershipLost),
-            }
-        }
-        Ok(())
+        self.ownership.set(intact, current, muted, || {
+            mute.set_mute_if_revision(muted, self.revision)
+                .map_err(map_error)
+        })
     }
 
     fn restore(&mut self) -> Result<()> {
@@ -490,9 +500,10 @@ impl MuteGuard for WindowsMuteGuard {
             && self.revision != u64::MAX;
         self.ownership.active = true;
         if self.ownership.restoration(intact, current)?
-            && !mute
+            && mute
                 .set_mute_if_revision(self.ownership.original, self.revision)
                 .map_err(map_error)?
+                == MuteWrite::RevisionLost
         {
             return Err(BackendError::OwnershipLost);
         }
@@ -516,6 +527,61 @@ mod tests {
             owned: false,
             active: true,
             revoked: false,
+        }
+    }
+
+    #[test]
+    fn unchanged_native_mute_never_grants_unmute_or_restore_before_delayed_callback() {
+        for callback_delivered in [false, true] {
+            let mut owner = lease(false);
+            let mut writes = Vec::new();
+            // GetMute saw false; an external writer muted before our S_FALSE.
+            owner
+                .set(true, false, true, || {
+                    writes.push(true);
+                    Ok(MuteWrite::Unchanged)
+                })
+                .unwrap();
+            assert!(!owner.owned);
+            assert_eq!(
+                owner.set(!callback_delivered, true, false, || {
+                    writes.push(false);
+                    Ok(MuteWrite::Changed)
+                }),
+                Err(if callback_delivered {
+                    BackendError::OwnershipLost
+                } else {
+                    BackendError::PermissionDenied
+                })
+            );
+            if owner
+                .restoration(!callback_delivered, true)
+                .unwrap_or(false)
+            {
+                writes.push(false);
+            }
+            assert_eq!(writes, [true], "never clear another writer's mute");
+        }
+    }
+
+    #[test]
+    fn changed_native_mute_owns_restore_but_revision_loss_and_errors_do_not() {
+        let mut owner = lease(false);
+        owner
+            .set(true, false, true, || Ok(MuteWrite::Changed))
+            .unwrap();
+        assert!(owner.restoration(true, true).unwrap());
+        for outcome in [
+            Ok(MuteWrite::RevisionLost),
+            Err(BackendError::ServerUnavailable),
+        ] {
+            let mut owner = lease(false);
+            assert!(owner.set(true, false, true, || outcome).is_err());
+            assert!(!owner.owned);
+            assert_eq!(
+                owner.restoration(true, true),
+                Err(BackendError::OwnershipLost)
+            );
         }
     }
 

@@ -91,6 +91,18 @@ impl Actor {
         self.media_candidate_scope(peer)
             .filter(|scope| scope.live())
     }
+    fn media_retained_scope(&self, peer: NodeId) -> Option<Scope> {
+        let mut scope = self.media_candidate_scope(peer)?;
+        if !matches!(
+            scope.view.phase,
+            fsm::Phase::Active | fsm::Phase::Rebuffering
+        ) {
+            return None;
+        }
+        // Playout readiness is not a new metadata identity or a consent withdrawal.
+        scope.view.phase = fsm::Phase::Active;
+        Some(scope)
+    }
     fn media_candidate_scope(&self, peer: NodeId) -> Option<Scope> {
         let record = self.records.get(&peer)?;
         let worker = self.worker.as_ref().filter(|w| w.alive && w.model_ready)?;
@@ -204,6 +216,20 @@ impl Actor {
                 }
             }
         }
+        let retained: [Option<(NodeId, Scope)>; fsm::MAX_PEERS] = {
+            let mut scopes = self
+                .records
+                .keys()
+                .filter_map(|peer| self.media_retained_scope(*peer).map(|scope| (*peer, scope)));
+            std::array::from_fn(|_| scopes.next())
+        };
+        let retained_scope = |peer: &NodeId| {
+            retained
+                .iter()
+                .flatten()
+                .find(|(p, _)| p == peer)
+                .map(|(_, scope)| scope)
+        };
         let scopes: [Option<(NodeId, Scope)>; fsm::MAX_PEERS] = {
             let mut live = self
                 .records
@@ -221,13 +247,15 @@ impl Actor {
         let previous_count = self.media.relays.len();
         self.media
             .relays
-            .retain(|peer, _| find_scope(peer).is_some());
+            .retain(|peer, _| retained_scope(peer).is_some());
         self.dirty |= previous_count != self.media.relays.len();
-        self.media.sent.retain(|peer, _| find_scope(peer).is_some());
+        self.media
+            .sent
+            .retain(|peer, _| retained_scope(peer).is_some());
         self.media
             .permissions
-            .retain(|peer, (view, _)| find_scope(peer).is_some_and(|s| s.view == *view));
-        for (peer, scope) in scopes.iter().flatten() {
+            .retain(|peer, (view, _)| retained_scope(peer).is_some_and(|s| s.view == *view));
+        for (peer, scope) in retained.iter().flatten() {
             let relay = self.media.relays.entry(*peer).or_default();
             self.dirty |= relay.view() != Some(scope.view);
             relay.scope(Some(*scope));
@@ -491,6 +519,13 @@ impl Actor {
                     return;
                 };
                 if info.session_id.as_slice() != scope.view.session || decode_info(info).is_err() {
+                    return;
+                }
+                if scope.view.phase == fsm::Phase::Rebuffering {
+                    if let Some(retained) = self.media_retained_scope(peer) {
+                        self.media.deferred.remove(&peer);
+                        self.media_receive_info(peer, retained, info);
+                    }
                     return;
                 }
                 if !scope.live() {

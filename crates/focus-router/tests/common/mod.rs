@@ -47,6 +47,14 @@ pub fn router(owner: NodeId) -> FocusRouter {
         capabilities(),
     )
     .with_persisted_ownership(1, Some((1, owner)));
+    r.handle(
+        0,
+        Input::Agent(AgentEvent::PressedState {
+            keys: vec![],
+            buttons: vec![],
+            known: true,
+        }),
+    );
     r.handle(0, hello(PEER, owner, 1));
     r.handle(0, hello(OTHER, owner, 1));
     r
@@ -101,11 +109,11 @@ pub fn leave(lease_id: LeaseId, reason: LeaveReason) -> Output {
 pub fn arm(timer: Timer, deadline_ms: u64) -> Output {
     Output::ArmTimer { timer, deadline_ms }
 }
-pub fn begin(kind: CaptureKind, lease_id: LeaseId, self_timeout_ms: u64) -> Output {
+pub fn begin(kind: CaptureKind, lease_id: LeaseId, self_deadline_ms: u64) -> Output {
     Output::Agent(AgentCommand::BeginCapture {
         kind,
         lease_id,
-        self_timeout_ms,
+        self_deadline_ms,
     })
 }
 pub fn notice(n: Notice) -> Output {

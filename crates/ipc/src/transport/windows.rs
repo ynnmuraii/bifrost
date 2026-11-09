@@ -13,6 +13,9 @@
 //! `PIPE_REJECT_REMOTE_CLIENTS` (tokio's `reject_remote_clients`). The first
 //! instance also carries `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a process that
 //! squatted the name first makes `listen` fail instead of being served.
+//! Clients independently verify the connected server process's TokenUser SID
+//! before returning a stream. A predictable name and a server-supplied DACL
+//! cannot authenticate a server owned by another local user.
 //!
 //! # Deviation from the documents, and why
 //!
@@ -30,14 +33,13 @@
 //!
 //! # Unsafe
 //!
-//! Three calls are unavoidable here: `create_with_security_attributes_raw`
-//! (unsafe by API contract), the security-descriptor conversion, and the
-//! current-user SID lookup. Each is confined to a small function with a SAFETY
-//! comment, and the pointer they produce is owned by [`PipeSecurity`], which
-//! frees it in `Drop`.
+//! Raw pipe creation, descriptor/SID conversion and process/token queries are
+//! confined to the helpers below. Security descriptors and opened kernel
+//! handles have owning guards; peer authentication never impersonates a server.
 
 use std::ffi::c_void;
 use std::io;
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::windows::named_pipe::{
@@ -53,7 +55,10 @@ use windows::Win32::Security::{
     GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
     TOKEN_USER,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use crate::error::IpcError;
 use crate::peer::{PeerCheck, PeerCredentials};
@@ -107,11 +112,14 @@ pub fn current_user_sid_string() -> Result<String, IpcError> {
 }
 
 unsafe fn current_user_sid() -> io::Result<String> {
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no close;
-    // `OpenProcessToken` writes a real handle into `token`, closed by the guard.
+    // SAFETY: the current process pseudo-handle stays valid and needs no close.
+    unsafe { process_user_sid(GetCurrentProcess()) }
+}
+
+unsafe fn process_user_sid(process: HANDLE) -> io::Result<String> {
+    // SAFETY: the caller retains the process handle; the token is closed by its guard.
     let mut token = HANDLE::default();
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-        .map_err(io::Error::other)?;
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.map_err(io::Error::other)?;
     let guard = TokenHandle(token);
 
     let mut size = 0u32;
@@ -152,12 +160,45 @@ unsafe fn current_user_sid() -> io::Result<String> {
     Ok(text)
 }
 
-/// Closes the process token handle.
+fn pipe_server_sid(client: &NamedPipeClient) -> io::Result<String> {
+    let mut pid = 0;
+    // SAFETY: this is the live connected client handle, retained through the SID query.
+    unsafe { GetNamedPipeServerProcessId(HANDLE(client.as_raw_handle()), &mut pid) }
+        .map_err(io::Error::other)?;
+    // Query-only access; never impersonate the pipe server or request its full rights.
+    let process = TokenHandle(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+            .map_err(io::Error::other)?,
+    );
+    // SAFETY: the guard pins the opened process for the entire token query.
+    unsafe { process_user_sid(process.0) }
+}
+
+fn authenticate_server(
+    client: NamedPipeClient,
+    expected_sid: &str,
+    server_sid: impl FnOnce(&NamedPipeClient) -> io::Result<String>,
+) -> Result<NamedPipeClient, IpcError> {
+    let actual = server_sid(&client)
+        .map_err(|source| IpcError::io("checking the named-pipe server user", source))?;
+    if actual != expected_sid {
+        return Err(IpcError::io(
+            "checking the named-pipe server user",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "named-pipe server is not the current user",
+            ),
+        ));
+    }
+    Ok(client)
+}
+
+/// Closes an owned process or token handle.
 struct TokenHandle(HANDLE);
 
 impl Drop for TokenHandle {
     fn drop(&mut self) {
-        // SAFETY: the handle came from OpenProcessToken and is closed once.
+        // SAFETY: the owned kernel handle is closed exactly once.
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
@@ -517,11 +558,13 @@ impl Drop for PendingInstance<'_> {
 }
 
 /// Connect to a named pipe endpoint, retrying while the listener has no instance for us.
+/// The server must be verifiably owned by the current user before any application I/O.
 pub async fn connect(endpoint: &Endpoint) -> Result<NamedPipeClient, IpcError> {
+    let expected_sid = current_user_sid_string()?;
     let deadline = std::time::Instant::now() + CONNECT_RETRY_WINDOW;
     loop {
         match ClientOptions::new().open(endpoint.name()) {
-            Ok(client) => return Ok(client),
+            Ok(client) => return authenticate_server(client, &expected_sid, pipe_server_sid),
             Err(error) => {
                 // `ERROR_PIPE_BUSY`: every instance is connected. `ERROR_FILE_NOT_FOUND`: the
                 // listener has none listening at this instant — the instance it was waiting on
@@ -572,7 +615,7 @@ pub async fn agent_pair() -> Result<(NamedPipeServer, NamedPipeClient), IpcError
 #[cfg(test)]
 mod tests {
     use crate::peer::SameUser;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
 
@@ -584,6 +627,56 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[tokio::test]
+    async fn server_identity_mismatch_or_query_failure_closes_before_application_exchange() {
+        for mismatch in [true, false] {
+            let endpoint = test_endpoint();
+            let security = PipeSecurity::for_current_user().unwrap();
+            let mut server = security
+                .create(endpoint.name(), &PipeOptions::gui())
+                .unwrap();
+            let client = ClientOptions::new().open(endpoint.name()).unwrap();
+            server.connect().await.unwrap();
+            let expected = current_user_sid_string().unwrap();
+            let result = authenticate_server(client, &expected, |_| {
+                if mismatch {
+                    Ok(format!("{expected}-different-user"))
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "query denied",
+                    ))
+                }
+            });
+            assert!(result.is_err());
+            let mut byte = [0];
+            match tokio::time::timeout(std::time::Duration::from_secs(1), server.read(&mut byte))
+                .await
+                .expect("rejected client must close")
+            {
+                Ok(0) => {}
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                other => panic!("no application byte may cross rejected connection: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_server_process_sid_matches_current_user_and_query_errors_are_terminal() {
+        let endpoint = test_endpoint();
+        let security = PipeSecurity::for_current_user().unwrap();
+        let server = security
+            .create(endpoint.name(), &PipeOptions::gui())
+            .unwrap();
+        let client = ClientOptions::new().open(endpoint.name()).unwrap();
+        server.connect().await.unwrap();
+        assert_eq!(
+            pipe_server_sid(&client).unwrap(),
+            current_user_sid_string().unwrap()
+        );
+        assert!(authenticate_server(client, "S-1-0-0", pipe_server_sid).is_err());
     }
 
     /// A cancelled `accept` must not lose the client that connected while it waited.

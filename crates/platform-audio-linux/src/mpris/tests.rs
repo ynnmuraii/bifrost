@@ -26,6 +26,7 @@ fn fixture() -> Mpris {
         shared: Arc::new(Shared {
             data: Mutex::new(data),
             stop: AtomicBool::new(false),
+            send_gate: Mutex::new(()),
         }),
         thread: None,
     }
@@ -37,6 +38,136 @@ fn request(id: u64) -> MediaCommandRequest {
         expected_revision: 1,
         command: MediaCommand::Play,
     }
+}
+#[test]
+fn cancel_linearizes_with_every_transport_poll_before_native_send() {
+    let mpris = fixture();
+    mpris.command(request(1)).unwrap();
+    let ticket = lock(&mpris.shared.data).pending[0].ticket;
+    let native_sends = Arc::new(AtomicUsize::new(0));
+    let sends = native_sends.clone();
+    let mut reached_boundary = false;
+    let transport = futures::future::poll_fn(move |_| {
+        if !reached_boundary {
+            reached_boundary = true;
+            return std::task::Poll::Pending;
+        }
+        sends.fetch_add(1, Ordering::AcqRel);
+        std::task::Poll::Ready((ticket, Ok(())))
+    });
+    let mut future = cancellable_command(mpris.shared.clone(), ticket, transport);
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    assert!(future.as_mut().poll(&mut cx).is_pending());
+    mpris.cancel();
+    assert_eq!(
+        future.as_mut().poll(&mut cx),
+        std::task::Poll::Ready((ticket, Err(BackendError::Cancelled)))
+    );
+    assert_eq!(native_sends.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        mpris.poll_completion(),
+        Some(Event::MediaCommandCompleted {
+            request_id: 1,
+            result: Err(BackendError::Cancelled),
+        })
+    ));
+    assert!(mpris.poll_completion().is_none());
+}
+#[test]
+fn selected_paused_metadata_only_track_change_requests_one_fenced_position_refresh() {
+    for state in [PlaybackState::Paused, PlaybackState::Stopped] {
+        let mpris = fixture();
+        let now = Instant::now();
+        let mut data = lock(&mpris.shared.data);
+        data.selected = Some(MediaSessionToken(1));
+        let player = data.players.get_mut("owned").unwrap();
+        player.state = state;
+        let mut metadata = Properties::new();
+        metadata.insert(
+            "mpris:trackid".into(),
+            OwnedValue::from(ObjectPath::try_from("/track/new").unwrap()),
+        );
+        metadata.insert("mpris:length".into(), OwnedValue::from(60_000_000i64));
+        let mut fields = Properties::new();
+        fields.insert("Metadata".into(), metadata.into());
+        fields.insert("CanSeek".into(), true.into());
+        player.seek(1_000_000, now);
+        player.apply(PLAYER, fields, now);
+        assert_eq!(player.info(now).position_ms, None);
+        assert!(!player.commands().seek);
+        let target = position_target(&mut data, now).unwrap();
+        assert_eq!(target.2, MediaSessionToken(1));
+        assert!(position_target(&mut data, now + Duration::from_secs(2)).is_none());
+        position_received(&mut data, &target, 5_000_000, now);
+        let player = data.players.get_mut("owned").unwrap();
+        assert_eq!(player.info(now).position_ms, Some(5000));
+        assert!(player.commands().seek);
+        player.seek(-1, now);
+        data.publish("owned", true, false, now);
+        position_received(&mut data, &target, 8_000_000, now);
+        assert_eq!(data.players["owned"].info(now).position_ms, None);
+    }
+}
+#[test]
+fn artwork_decode_is_off_lock_and_replaced_track_cannot_publish_stale_cover() {
+    let mpris = fixture();
+    fn track(path: &str) -> Properties {
+        let mut metadata = Properties::new();
+        metadata.insert(
+            "mpris:trackid".into(),
+            OwnedValue::from(ObjectPath::try_from(path).unwrap()),
+        );
+        metadata.insert("mpris:artUrl".into(), value("file:///cache/cover.png"));
+        let mut fields = Properties::new();
+        fields.insert("Metadata".into(), metadata.into());
+        fields
+    }
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players
+            .get_mut("owned")
+            .unwrap()
+            .apply(PLAYER, track("/track/one"), Instant::now());
+        data.publish("owned", true, false, Instant::now());
+    }
+    let image = audio_backend::artwork::normalize(
+        &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2,
+            8, 2, 0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 22, 73, 68, 65, 84, 120, 156, 99, 80, 241,
+            152, 224, 49, 65, 133, 97, 130, 138, 135, 202, 4, 15, 0, 27, 122, 3, 241, 244, 33, 109,
+            130, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ],
+        None,
+    )
+    .unwrap();
+    let delayed_image = image.clone();
+    let shared = mpris.shared.clone();
+    let (started, ready) = std::sync::mpsc::channel();
+    let (resume, wait) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        refresh_artwork(&shared, "owned", |_| {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            Some(delayed_image)
+        });
+    });
+    ready.recv_timeout(Duration::from_secs(1)).unwrap();
+    // Both operations need shared.data, and must finish while the decoder is blocked.
+    assert!(mpris.sessions().unwrap()[0].artwork.is_none());
+    mpris.cancel();
+    {
+        let mut data = lock(&mpris.shared.data);
+        data.players
+            .get_mut("owned")
+            .unwrap()
+            .apply(PLAYER, track("/track/two"), Instant::now());
+        data.publish("owned", true, false, Instant::now());
+    }
+    resume.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(mpris.sessions().unwrap()[0].artwork.is_none());
+    refresh_artwork(&mpris.shared, "owned", |_| Some(image));
+    assert!(mpris.sessions().unwrap()[0].artwork.is_some());
 }
 #[test]
 fn reserved_completion_capacity_timeout_cancel_and_no_aba() {

@@ -245,11 +245,12 @@ impl Backend for WindowsBackend {
                 .map(|_| ()),
         );
         let media = availability(self.with_media(|media| media.sessions().map(|_| ())));
-        let probe = HotkeyBinding {
-            virtual_key: 0x87,
-            modifiers: 7,
-        };
-        let ptt = availability(Hotkey::register(probe, &[]).map(drop).map_err(map_error));
+        let ptt = availability(
+            HotkeyBinding::from_hid(0x73, 7)
+                .and_then(|probe| Hotkey::register(probe, &[]))
+                .map(drop)
+                .map_err(map_error),
+        );
         CapabilityProbe {
             os_build: build,
             process_exclude,
@@ -425,61 +426,14 @@ fn map_hresult(code: i32) -> BackendError {
 }
 fn binding(hotkey: PttHotkey) -> Result<HotkeyBinding, BackendError> {
     hotkey.validate()?;
-    let virtual_key = match hotkey.key_code {
-        0x04..=0x1d => 0x41 + hotkey.key_code - 0x04,
-        0x1e..=0x26 => 0x31 + hotkey.key_code - 0x1e,
-        0x27 => 0x30,
-        0x28 | 0x58 => 0x0d,
-        0x29 => 0x1b,
-        0x2a => 0x08,
-        0x2b => 0x09,
-        0x2c => 0x20,
-        0x2d => 0xbd,
-        0x2e => 0xbb,
-        0x2f => 0xdb,
-        0x30 => 0xdd,
-        0x31 => 0xdc,
-        0x33 => 0xba,
-        0x34 => 0xde,
-        0x35 => 0xc0,
-        0x36 => 0xbc,
-        0x37 => 0xbe,
-        0x38 => 0xbf,
-        0x39 => 0x14,
-        0x3a..=0x45 => 0x70 + hotkey.key_code - 0x3a,
-        0x46 => 0x2c,
-        0x47 => 0x91,
-        0x48 => 0x13,
-        0x49 => 0x2d,
-        0x4a => 0x24,
-        0x4b => 0x21,
-        0x4c => 0x2e,
-        0x4d => 0x23,
-        0x4e => 0x22,
-        0x4f => 0x27,
-        0x50 => 0x25,
-        0x51 => 0x28,
-        0x52 => 0x26,
-        0x53 => 0x90,
-        0x54 => 0x6f,
-        0x55 => 0x6a,
-        0x56 => 0x6d,
-        0x57 => 0x6b,
-        0x59..=0x61 => 0x61 + hotkey.key_code - 0x59,
-        0x62 => 0x60,
-        0x63 => 0x6e,
-        0x64 => 0xe2,
-        0x65 => 0x5d,
-        0x68..=0x73 => 0x7c + hotkey.key_code - 0x68,
-        _ => return Err(BackendError::Unsupported),
-    };
-    Ok(HotkeyBinding {
-        virtual_key: virtual_key as u16,
-        modifiers: u32::from(hotkey.alt)
+    HotkeyBinding::from_hid(
+        u16::try_from(hotkey.key_code).map_err(|_| BackendError::InvalidArgument)?,
+        u32::from(hotkey.alt)
             | u32::from(hotkey.control) << 1
             | u32::from(hotkey.shift) << 2
             | u32::from(hotkey.meta) << 3,
-    })
+    )
+    .map_err(map_error)
 }
 #[cfg(test)]
 mod tests {
@@ -580,7 +534,7 @@ mod tests {
         assert_eq!(
             binding(key).unwrap(),
             HotkeyBinding {
-                virtual_key: 0x41,
+                scan_code: 0x1e,
                 modifiers: 2
             }
         );

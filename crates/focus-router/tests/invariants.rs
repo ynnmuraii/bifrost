@@ -271,6 +271,7 @@ fn invariant_4_pressed_inputs_gate_switch_but_never_emergency() {
                             } else {
                                 vec![]
                             },
+                            known: true,
                         }),
                     );
                     let before = r.focus();

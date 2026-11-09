@@ -56,6 +56,7 @@ message AgentFrame {
     HotkeyPressed hotkey_pressed = 57;
     GameGuardSignals game_guard_signals = 58;
     ClipboardApplied clipboard_applied = 59;         // sent after validated text reaches the backend
+    PhysicalPressed physical_pressed = 60; // physical source admission, never the synthetic recovery ledger
   }
 }
 
@@ -129,12 +130,13 @@ enum CaptureKind {
 message BeginCapture {
   CaptureKind kind = 1;
   bytes lease_id = 2;          // 16 bytes for TEMPORARY/REMOTE
-  uint32 self_timeout_ms = 3;  // agent ends capture by itself, max 1000;
-                               // on Wayland bounds how long an activated (diverted) capture is held
+  reserved 3; // old receipt-time self_timeout_ms; never restart a duration after IPC
   bool dev_capture_injected = 4; // core dev-only opt-in; meaningful only on the source owner
+  uint64 issued_at_us = 5; // same-host monotonic issuance; terminal capture fence
+  uint64 self_deadline_us = 6; // TEMPORARY only: absolute same-host monotonic deadline, max 1000 ms ahead
 }
 message EndCapture { bytes lease_id = 1; bool replay_buffered_locally = 2; }
-message PrepareInject { bytes lease_id = 1; }
+message PrepareInject { bytes lease_id = 1; uint64 issued_at_us = 2; } // host monotonic issuance, terminal fence
 
 message HidKey { uint32 usage_page = 1; uint32 usage = 2; bool down = 3; }
 message PointerAbs { string display_id = 1; double x = 2; double y = 3; }
@@ -146,7 +148,7 @@ message LocalEvent {
 }
 
 message Inject { bytes lease_id = 1; uint64 input_batch_seq = 2; repeated LocalEvent events = 3; }
-message ArmDeadline { bytes lease_id = 1; uint32 remaining_ms = 2; } // 1..1000, agent clock
+message ArmDeadline { bytes lease_id = 1; reserved 2; uint64 deadline_us = 3; } // absolute same-host monotonic deadline, never reset on delivery
 message ReleaseSession { bytes lease_id = 1; }
 message ReleaseKeys { repeated HidKey keys = 1; repeated uint32 buttons = 2; } // recovery
 message QueryDisplays {}
@@ -200,6 +202,7 @@ message EdgeCounters {
   uint64 wheel_h = 6;
 }
 message CapturedBatch { repeated LocalEvent events = 1; bool at_edge = 2; PortalActivation activation = 3; EdgeCounters hook_edges = 4; }
+message PhysicalPressed { repeated HidKey keys = 1; repeated uint32 buttons = 2; bool known = 3; }
 message EmergencyFired { bytes lease_id = 1; } // agent has already restored local control
 message InjectResult { bytes lease_id = 1; uint64 input_batch_seq = 2; uint32 applied_count = 3; string os_error = 4; PointerAbs actual = 5; EdgeCounters applied_edges = 6; }
 message DeadlineExpired { bytes lease_id = 1; }
@@ -237,7 +240,7 @@ message PortalPermissionRequired { string portal_interface = 1; string purpose =
 message PortalPermissionRestoring { string portal_interface = 1; string purpose = 2; } // a persisted grant is being restored
 message PortalGrantChanged { PortalGrant grant = 1; bool revoked = 2; }
 // code: PORTAL_DENIED, PORTAL_UNAVAILABLE, PORTAL_SESSION_LOST, PORTAL_FRONTEND_STUCK, QUEUE_OVERFLOW, ...
-message AgentError { string code = 1; string detail = 2; } // never contains key/clipboard payload
+message AgentError { string code = 1; string detail = 2; bytes lease_id = 3; } // never contains key/clipboard payload
 
 // ---------- clipboard over local IPC ----------
 // ADR-008 keeps clipboard content off the input path; between core and the agent it still has to
@@ -346,6 +349,7 @@ message GuiFrame {
     SetSystemAudioSharing set_system_audio_sharing = 72;
     GetAudioArtwork get_audio_artwork = 73;
     AudioArtwork audio_artwork = 74;
+    ClosePairingWindow close_pairing_window = 75;
   }
 }
 // Also replays the current open PairingWindow and unanswered PairingPrompt as events
@@ -356,6 +360,7 @@ message SwitchTo { string peer = 1; } // a node id (hex) or a display name; empt
 message ClaimOwnership {}
 message AbandonOwnership {}
 message StartPairing { uint32 window_s = 1; } // max 120
+message ClosePairingWindow {}
 message PairWith { string address = 1; }
 message PairingAnswer { bytes attempt_id = 1; bool approve = 2; }
 message RequestPairing { string address = 1; string node_id = 2; string display_name = 3; bool supports_requests = 4; }

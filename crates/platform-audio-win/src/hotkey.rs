@@ -1,7 +1,7 @@
 //! Opt-in global push-to-talk observation, without input synthesis or suppression.
 //!
-//! RegisterHotKey observes presses; a narrowly filtered, non-suppressing keyboard
-//! observer confirms non-injected releases of the configured non-modifier key.
+//! RegisterHotKey reserves the chord; a narrowly filtered, non-suppressing
+//! keyboard observer confirms exact physical scan/E0 identity on both edges.
 //! Polling can revoke a lease, but unavailable/zero key state never proves release.
 //! Registration starts unarmed: a physical press/release may be needed to arm it.
 //! Consumers MUST check absolute expiry; receipt never refreshes an initial edge.
@@ -34,18 +34,33 @@ pub const PRESS_LEASE: Duration = Duration::from_millis(250);
 const HOTKEY_ID: i32 = 1;
 const MODIFIER_MASK: u32 = 0x0f;
 
-/// Windows VK plus the MOD_ALT/CONTROL/SHIFT/WIN bit mask (no side-specific keys).
+/// Physical set-1 make code (including E0) plus MOD_ALT/CONTROL/SHIFT/WIN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HotkeyBinding {
-    pub virtual_key: u16,
+    pub scan_code: u16,
     pub modifiers: u32,
 }
 impl HotkeyBinding {
+    pub fn from_hid(usage: u16, modifiers: u32) -> Result<Self, Error> {
+        let scan_code = platform_win::hid::hid_to_scancode(usage).ok_or(Error::Unsupported(
+            "physical hotkey scan identity unavailable",
+        ))?;
+        let binding = Self {
+            scan_code,
+            modifiers,
+        };
+        binding.validate(&[])?;
+        Ok(binding)
+    }
+
     pub fn validate(self, kvm_bindings: &[Self]) -> Result<(), Error> {
-        if !(1..=254).contains(&self.virtual_key) || self.modifiers & !MODIFIER_MASK != 0 {
-            return Err(Error::InvalidArgument("invalid hotkey VK or modifier mask"));
+        let usage = platform_win::hid::scancode_to_hid(self.scan_code).ok_or(
+            Error::Unsupported("physical hotkey scan identity unavailable"),
+        )?;
+        if self.modifiers & !MODIFIER_MASK != 0 {
+            return Err(Error::InvalidArgument("invalid hotkey modifier mask"));
         }
-        if matches!(self.virtual_key, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5) {
+        if matches!(usage, 0xe0..=0xe7) {
             return Err(Error::InvalidArgument("hotkey requires a non-modifier key"));
         }
         if self.conflicts(kvm_bindings) {
@@ -59,23 +74,37 @@ impl HotkeyBinding {
     /// Extra modifiers also conflict: KVM observers may allow modifier supersets.
     pub fn conflicts(self, kvm_bindings: &[Self]) -> bool {
         kvm_bindings.iter().any(|other| {
-            self.virtual_key == other.virtual_key
+            self.scan_code == other.scan_code
                 && ((self.modifiers & other.modifiers) == self.modifiers
                     || (self.modifiers & other.modifiers) == other.modifiers)
         })
     }
 
-    fn physically_down(self) -> bool {
+    fn modifiers_down(self) -> bool {
         let down = |vk: u16| unsafe { GetAsyncKeyState(i32::from(vk)) < 0 };
-        if !down(self.virtual_key) {
-            return false;
-        }
         for (mask, vk) in [(1, VK_MENU.0), (2, VK_CONTROL.0), (4, VK_SHIFT.0)] {
             if self.modifiers & mask != 0 && !down(vk) {
                 return false;
             }
         }
         self.modifiers & 8 == 0 || down(VK_LWIN.0) || down(VK_RWIN.0)
+    }
+
+    fn registration_vk(self) -> Result<u32, Error> {
+        // VK is only a reservation, never evidence of the configured physical edge.
+        let foreground = unsafe { GetForegroundWindow() };
+        let thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+        let layout = unsafe { GetKeyboardLayout(thread) };
+        let vk = unsafe {
+            MapVirtualKeyExW(u32::from(self.scan_code), MAPVK_VSC_TO_VK_EX, Some(layout))
+        };
+        if (1..=254).contains(&vk) {
+            Ok(vk)
+        } else {
+            Err(Error::Unsupported(
+                "physical hotkey has no native registration mapping",
+            ))
+        }
     }
 }
 
@@ -121,7 +150,7 @@ impl Hotkey {
                     return;
                 }
             };
-            let _release_hook = match ReleaseHook::open(binding) {
+            let _physical_hook = match PhysicalHook::open(binding) {
                 Ok(hook) => hook,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -150,29 +179,35 @@ impl Hotkey {
                     let available =
                         unsafe { PeekMessageW(&mut message, Some(window.0), 0, 0, PM_REMOVE) }
                             .as_bool();
-                    if ReleaseHook::take_release() {
-                        press.observe_release(&tx);
+                    if let Some(observation) = PhysicalHook::take_edges() {
+                        if observation.release_pending {
+                            press.observe_release(&tx);
+                        }
+                        if let Some(message_ticks) = observation.pressed_at {
+                            let now = Instant::now();
+                            if let Some(observed) = message_observed_at(
+                                now,
+                                unsafe { GetTickCount() },
+                                message_ticks,
+                                tick_uncertainty,
+                            ) {
+                                press.activate(observed);
+                            }
+                        }
                     }
                     press.flush_release(&tx);
                     if !available {
                         break;
                     }
-                    if message.message == WM_HOTKEY && message.wParam.0 == HOTKEY_ID as usize {
-                        let now = Instant::now();
-                        let ticks = unsafe { GetTickCount() };
-                        if let Some(observed) =
-                            message_observed_at(now, ticks, message.time, tick_uncertainty)
-                        {
-                            press.activate(observed);
-                        }
-                    } else {
+                    // WM_HOTKEY has only a VK, so it can never authorize a physical press.
+                    if message.message != WM_HOTKEY {
                         unsafe {
                             DispatchMessageW(&message);
                         }
                     }
                 }
                 if press.pressed || press.blocked {
-                    press.poll(Instant::now(), binding.physically_down(), &tx);
+                    press.poll(Instant::now(), PhysicalHook::physically_down(), &tx);
                 }
                 thread::sleep(POLL);
             }
@@ -218,6 +253,7 @@ impl Drop for Hotkey {
 struct MessageWindow(HWND);
 impl MessageWindow {
     fn open(binding: HotkeyBinding) -> Result<Self, Error> {
+        let virtual_key = binding.registration_vk()?;
         // The built-in STATIC class avoids global class registration/callback state.
         let window = Self(unsafe {
             CreateWindowExW(
@@ -240,7 +276,7 @@ impl MessageWindow {
                 Some(window.0),
                 HOTKEY_ID,
                 HOT_KEY_MODIFIERS(binding.modifiers) | MOD_NOREPEAT,
-                u32::from(binding.virtual_key),
+                virtual_key,
             )?;
         }
         Ok(window)
@@ -289,76 +325,124 @@ fn tick_uncertainty() -> Result<Duration, Error> {
 }
 
 #[derive(Clone, Copy)]
-struct ReleaseObservation {
+struct PhysicalObservation {
     binding: HotkeyBinding,
-    pending: bool,
-}
-thread_local! {
-    static RELEASE_OBSERVATION: Cell<Option<ReleaseObservation>> = const { Cell::new(None) };
+    down: bool,
+    virtual_key: u32,
+    pressed_at: Option<u32>,
+    release_pending: bool,
 }
 
-struct ReleaseHook(HHOOK);
-impl ReleaseHook {
-    fn open(binding: HotkeyBinding) -> Result<Self, Error> {
-        RELEASE_OBSERVATION.set(Some(ReleaseObservation {
+impl PhysicalObservation {
+    fn new(binding: HotkeyBinding) -> Self {
+        Self {
             binding,
-            pending: false,
-        }));
+            down: false,
+            virtual_key: 0,
+            pressed_at: None,
+            release_pending: false,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        message: u32,
+        scan_code: u32,
+        virtual_key: u32,
+        flags: KBDLLHOOKSTRUCT_FLAGS,
+        time: u32,
+        modifiers_down: bool,
+    ) {
+        if flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) != 0
+            || scan_code > 0xff
+            || platform_win::hid::scancode_from_hook(scan_code, flags.0 & LLKHF_EXTENDED.0 != 0)
+                != self.binding.scan_code
+        {
+            return;
+        }
+        match message {
+            WM_KEYUP | WM_SYSKEYUP => {
+                self.down = false;
+                self.release_pending = true;
+                self.pressed_at = None;
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                if !self.down && modifiers_down {
+                    self.pressed_at = Some(time);
+                }
+                self.down = true;
+                self.virtual_key = virtual_key;
+            }
+            _ => {}
+        }
+    }
+}
+
+thread_local! {
+    static PHYSICAL_OBSERVATION: Cell<Option<PhysicalObservation>> = const { Cell::new(None) };
+}
+
+struct PhysicalHook(HHOOK);
+impl PhysicalHook {
+    fn open(binding: HotkeyBinding) -> Result<Self, Error> {
         let module = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }?;
+        PHYSICAL_OBSERVATION.set(Some(PhysicalObservation::new(binding)));
         match unsafe {
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(release_hook), Some(module.into()), 0)
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(physical_hook), Some(module.into()), 0)
         } {
             Ok(hook) => Ok(Self(hook)),
             Err(_) => {
-                RELEASE_OBSERVATION.set(None);
+                PHYSICAL_OBSERVATION.set(None);
                 Err(Error::Unsupported(
-                    "native physical hotkey release unavailable",
+                    "native physical hotkey observer unavailable",
                 ))
             }
         }
     }
-    fn take_release() -> bool {
-        let Some(mut observation) = RELEASE_OBSERVATION.get() else {
-            return false;
-        };
-        let pending = observation.pending;
-        observation.pending = false;
-        RELEASE_OBSERVATION.set(Some(observation));
-        pending
+
+    fn take_edges() -> Option<PhysicalObservation> {
+        let mut observation = PHYSICAL_OBSERVATION.get()?;
+        let pending = observation;
+        observation.pressed_at = None;
+        observation.release_pending = false;
+        PHYSICAL_OBSERVATION.set(Some(observation));
+        Some(pending)
+    }
+
+    fn physically_down() -> bool {
+        PHYSICAL_OBSERVATION.get().is_some_and(|observation| {
+            // Async VK state can only revoke an already observed exact physical down.
+            observation.down
+                && (1..=254).contains(&observation.virtual_key)
+                && unsafe { GetAsyncKeyState(observation.virtual_key as i32) < 0 }
+                && observation.binding.modifiers_down()
+        })
     }
 }
-impl Drop for ReleaseHook {
+
+impl Drop for PhysicalHook {
     fn drop(&mut self) {
         unsafe {
             let _ = UnhookWindowsHookEx(self.0);
         }
-        RELEASE_OBSERVATION.set(None);
+        PHYSICAL_OBSERVATION.set(None);
     }
 }
 
-fn is_physical_release(
-    binding: HotkeyBinding,
-    message: u32,
-    key: u32,
-    flags: KBDLLHOOKSTRUCT_FLAGS,
-) -> bool {
-    // A side modifier's up does not prove chord-up: its other side may still be
-    // held (or unobservable). Only the configured non-modifier key is sufficient.
-    key == u32::from(binding.virtual_key)
-        && matches!(message, WM_KEYUP | WM_SYSKEYUP)
-        && flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) == 0
-}
-
-unsafe extern "system" fn release_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP) {
-        // Windows owns this structure for the duration of the callback. Only
-        // the configured non-modifier PTT key can set our coalesced release flag.
+unsafe extern "system" fn physical_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        // Windows owns the record until this callback returns; no VK alias admits an edge.
         let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        if let Some(mut observation) = RELEASE_OBSERVATION.get() {
-            if is_physical_release(observation.binding, wparam.0 as u32, key.vkCode, key.flags) {
-                observation.pending = true;
-                RELEASE_OBSERVATION.set(Some(observation));
-            }
+        if let Some(mut observation) = PHYSICAL_OBSERVATION.get() {
+            observation.observe(
+                wparam.0 as u32,
+                key.scanCode,
+                key.vkCode,
+                key.flags,
+                key.time,
+                observation.binding.modifiers_down(),
+            );
+            PHYSICAL_OBSERVATION.set(Some(observation));
         }
     }
     // Never suppress or modify input; no allocation, logging, locks or I/O above.
@@ -525,7 +609,7 @@ mod tests {
     #[test]
     fn refuses_kvm_conflicts_and_invalid_bindings() {
         let kvm = HotkeyBinding {
-            virtual_key: 0x70,
+            scan_code: 0x3b,
             modifiers: 3,
         };
         assert!(kvm.validate(&[kvm]).is_err());
@@ -536,13 +620,13 @@ mod tests {
         .validate(&[kvm])
         .is_err());
         assert!(HotkeyBinding {
-            virtual_key: 0x71,
+            scan_code: 0x3c,
             ..kvm
         }
         .validate(&[kvm])
         .is_ok());
         assert!(HotkeyBinding {
-            virtual_key: 0,
+            scan_code: 0,
             ..kvm
         }
         .validate(&[])
@@ -554,7 +638,7 @@ mod tests {
         .validate(&[])
         .is_err());
         assert!(HotkeyBinding {
-            virtual_key: VK_SHIFT.0,
+            scan_code: 0x2a,
             ..kvm
         }
         .validate(&[])
@@ -675,39 +759,94 @@ mod tests {
         assert!(message_observed_at(now, 1_000, 767, uncertainty).is_none());
     }
     #[test]
-    fn only_non_injected_configured_chord_key_up_is_positive_release() {
-        let binding = HotkeyBinding {
-            virtual_key: 0x87,
-            modifiers: 7,
-        };
-        let key = u32::from(binding.virtual_key);
-        for message in [WM_KEYUP, WM_SYSKEYUP] {
-            assert!(is_physical_release(binding, message, key, LLKHF_UP));
-        }
-        for message in [WM_KEYDOWN, WM_SYSKEYDOWN] {
-            assert!(!is_physical_release(binding, message, key, LLKHF_UP));
-        }
-        for injected in [LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED] {
-            assert!(!is_physical_release(binding, WM_KEYUP, key, injected));
-        }
-        for unrelated in [0x41, 0x70, 0x5b, 0x5c] {
-            assert!(!is_physical_release(binding, WM_KEYUP, unrelated, LLKHF_UP));
+    fn only_exact_non_injected_scan_identity_can_press_release_or_rearm() {
+        let now = Instant::now();
+        for (usage, matching_flags, other_flags) in [
+            (0x28, LLKHF_UP, LLKHF_UP | LLKHF_EXTENDED),
+            (0x58, LLKHF_UP | LLKHF_EXTENDED, LLKHF_UP),
+        ] {
+            let binding = HotkeyBinding::from_hid(usage, 0).unwrap();
+            let mut observation = PhysicalObservation::new(binding);
+            let (tx, rx) = mpsc::sync_channel(8);
+            let mut press = PressState {
+                blocked: true,
+                ..PressState::default()
+            };
+            // Enter and keypad Enter have identical VK_RETURN, but only one can arm.
+            observation.observe(WM_KEYUP, 0x1c, 0x0d, other_flags, 10, true);
+            assert!(!observation.release_pending);
+            observation.observe(WM_KEYDOWN, 0x1c, 0x0d, other_flags, 11, true);
+            assert!(observation.pressed_at.is_none() && !observation.down);
+            for injected in [LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED] {
+                observation.observe(WM_KEYUP, 0x1c, 0x0d, matching_flags | injected, 12, true);
+                assert!(!observation.release_pending);
+                let down_flags = KBDLLHOOKSTRUCT_FLAGS(matching_flags.0 & !LLKHF_UP.0);
+                observation.observe(WM_KEYDOWN, 0x1c, 0x0d, down_flags | injected, 12, true);
+                assert!(observation.pressed_at.is_none() && !observation.down);
+            }
+            observation.observe(WM_KEYUP, 0x1c, 0x0d, matching_flags, 13, true);
+            assert!(observation.release_pending);
+            press.observe_release(&tx);
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                HotkeyEvent::Released {
+                    reason: PttReleaseReason::PhysicalKeyUp,
+                }
+            ));
+            let down_flags = KBDLLHOOKSTRUCT_FLAGS(matching_flags.0 & !LLKHF_UP.0);
+            observation.observe(WM_KEYDOWN, 0x1c, 0x0d, down_flags, 14, true);
+            assert_eq!(observation.pressed_at, Some(14));
+            press.activate(now);
+            press.poll(now, observation.down, &tx);
+            assert!(rx.try_recv().unwrap().is_live(now));
+            observation.release_pending = false;
+            observation.observe(WM_KEYUP, 0x1c, 0x0d, other_flags, 15, true);
+            assert!(!observation.release_pending && observation.down);
+            observation.observe(WM_KEYUP, 0x1c, 0x0d, matching_flags, 16, true);
+            press.observe_release(&tx);
+            assert!(!observation.down);
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                HotkeyEvent::Released {
+                    reason: PttReleaseReason::PhysicalKeyUp,
+                }
+            ));
         }
     }
+
     #[test]
-    fn modifier_release_cannot_prove_chord_up_when_the_other_side_is_held_or_unknown() {
-        let binding = HotkeyBinding {
-            virtual_key: 0x87,
-            modifiers: 15,
-        };
-        for key in [
-            0x12, 0xa4, 0xa5, 0x11, 0xa2, 0xa3, 0x10, 0xa0, 0xa1, 0x5b, 0x5c,
+    fn layout_vks_and_modifier_releases_never_replace_physical_hid_identity() {
+        // Same physical HID positions on US/AZERTY/QWERTZ can report different VKs.
+        for (usage, scan, layout_vks) in [
+            (0x04, 0x1e, [0x41, 0x51, 0x41]),
+            (0x1c, 0x15, [0x59, 0x59, 0x5a]),
+            (0x1d, 0x2c, [0x5a, 0x57, 0x59]),
         ] {
-            assert!(
-                !is_physical_release(binding, WM_KEYUP, key, LLKHF_UP),
-                "one modifier side being up does not prove its other side is up"
-            );
+            let binding = HotkeyBinding::from_hid(usage, 3).unwrap();
+            let reserved = HotkeyBinding {
+                modifiers: 7,
+                ..binding
+            };
+            assert!(binding.conflicts(&[reserved]));
+            for vk in layout_vks {
+                let mut observed = PhysicalObservation::new(binding);
+                observed.observe(WM_KEYDOWN, scan, vk, KBDLLHOOKSTRUCT_FLAGS(0), 1, true);
+                assert_eq!(observed.pressed_at, Some(1));
+                for modifier_scan in [0x1d, 0x2a, 0x36, 0x38, 0x5b, 0x5c] {
+                    observed.observe(WM_KEYUP, modifier_scan, 0x10, LLKHF_UP, 2, true);
+                    assert!(!observed.release_pending);
+                }
+                observed.observe(WM_KEYUP, scan, vk, LLKHF_UP, 3, true);
+                assert!(observed.release_pending && !observed.down);
+            }
         }
+        let enter = HotkeyBinding::from_hid(0x28, 3).unwrap();
+        let keypad_enter = HotkeyBinding::from_hid(0x58, 3).unwrap();
+        assert!(!enter.conflicts(&[keypad_enter]));
+        assert!(
+            HotkeyBinding::from_hid(0x48, 0).is_err(),
+            "E1 Pause is not representable"
+        );
     }
     #[test]
     fn positive_release_coalesces_under_full_queue_without_rearming_a_held_press() {

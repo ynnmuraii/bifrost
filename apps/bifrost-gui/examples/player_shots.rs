@@ -47,6 +47,7 @@ fn card(id: &str, source: &str, title: &str, artist: &str, playing: bool) -> Aud
         can_next: true,
         muted: false,
         gain_percent: 62,
+        desired_gain_percent: None,
         state: StreamState::Ready,
         path: None,
         background: false,

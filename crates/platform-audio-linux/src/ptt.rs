@@ -572,7 +572,7 @@ fn validate_binding(
         .map(|hotkey| {
             hotkey.validate()?;
             if reserved.contains(&hotkey) {
-                return Err(BackendError::InvalidArgument);
+                return Err(BackendError::Conflict);
             }
             preferred_chord(hotkey).ok_or(BackendError::Unsupported)
         })
@@ -653,7 +653,7 @@ mod tests {
         assert!(preferred_chord(key(0x2d)).is_none());
         assert_eq!(
             validate_binding(Some(key(0x45)), &[key(0x45)]),
-            Err(BackendError::InvalidArgument)
+            Err(BackendError::Conflict)
         );
         assert_eq!(
             validate_binding(None, &[key(4), key(4)]),
@@ -1107,6 +1107,31 @@ mod tests {
             done,
         };
         state.lock().unwrap().edge(0, true, 1, 1);
+        let before = {
+            let state = state.lock().unwrap();
+            (
+                state.generation,
+                state.live_generation,
+                state.held_until,
+                state.logical_down,
+            )
+        };
+        assert_eq!(
+            ptt.configure(Some(key(0x45)), &[key(0x45)]),
+            Err(BackendError::Conflict)
+        );
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(
+                (
+                    state.generation,
+                    state.live_generation,
+                    state.held_until,
+                    state.logical_down
+                ),
+                before
+            );
+        }
         ptt.configure(None, &[]).unwrap();
         assert_eq!(
             state.lock().unwrap().pop_event(),

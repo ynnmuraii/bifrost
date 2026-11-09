@@ -21,6 +21,9 @@ use transport::{
     BackoffBounds, LinkDownReason, LinkEvent, LinkLiveness, LinkManager, ManagerConfig,
 };
 
+#[path = "mesh/membership_admission.rs"]
+mod membership_admission;
+
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Generous bounds: the tests wait for events, never for a fixed sleep.

@@ -80,8 +80,9 @@ fn recovery_accepts_only_release_keys_and_shutdown() {
             agent_frame::Msg::BeginCapture(BeginCapture {
                 kind: CaptureKind::Remote as i32,
                 lease_id: vec![0u8; 16],
-                self_timeout_ms: 0,
+                self_deadline_us: 0,
                 dev_capture_injected: false,
+                issued_at_us: 0,
             }),
             agent_frame::Msg::EndCapture(EndCapture::default()),
             agent_frame::Msg::PrepareInject(PrepareInject::default()),

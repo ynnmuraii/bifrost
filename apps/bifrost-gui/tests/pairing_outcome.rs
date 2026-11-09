@@ -220,3 +220,108 @@ fn cancellation_results_and_pair_request_failures_use_the_localized_status() {
         }
     }
 }
+
+#[test]
+fn closing_local_window_preserves_concurrent_outgoing_sas_confirmation() {
+    use bifrost_gui::view_model::Action;
+    use protocol::ipc::{OpResult, PairingOutcome, PairingResult, PairingWindow};
+    let mut vm = view();
+    let window_id = vec![0x11; 16];
+    vm.apply(event(Msg::PairingWindow(PairingWindow {
+        open: true,
+        address: "192.168.1.10:47901".into(),
+        seconds_remaining: 120,
+        attempt_id: window_id.clone(),
+    })));
+    vm.local(&Action::PairWith("192.168.1.20:47901".into()));
+    let dial_id = vm.begin_request(Request::PairWith, Instant::now());
+    let prompt = pairing_prompt();
+    vm.apply(event(Msg::PairingPrompt(prompt.clone())));
+    vm.apply(answer(
+        dial_id,
+        Msg::OpResult(OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    let close_id = vm.begin_request(Request::ClosePairingWindow, Instant::now());
+    vm.apply(event(Msg::PairingWindow(PairingWindow {
+        open: false,
+        attempt_id: window_id,
+        ..Default::default()
+    })));
+    vm.apply(answer(
+        close_id,
+        Msg::OpResult(OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    assert!(vm.pairing.window.is_none());
+    assert!(vm.pairing.window_deadline.is_none());
+    assert_eq!(vm.pairing.prompt.as_ref(), Some(&prompt));
+    assert_eq!(vm.pairing.attempt_id(), Some(prompt.attempt_id.clone()));
+    assert!(
+        vm.pairing.code().is_some(),
+        "the surviving outgoing SAS remains visible and answerable"
+    );
+    let answer_id = vm.begin_request(Request::PairingAnswer, Instant::now());
+    vm.apply(answer(
+        answer_id,
+        Msg::OpResult(OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    vm.apply(event(Msg::PairingResult(PairingResult {
+        outcome: PairingOutcome::Paired as i32,
+        ceremony_id: prompt.attempt_id,
+        peer_name: prompt.peer_name,
+        error_code: String::new(),
+    })));
+    assert!(vm.pairing.prompt.is_none());
+    assert_eq!(vm.pairing.paired.as_deref(), Some("linux-box"));
+}
+
+#[test]
+fn owned_opener_prompt_retires_on_its_matching_cancellation_not_the_window_flag() {
+    use protocol::ipc::{OpResult, PairingOutcome, PairingResult, PairingWindow};
+    let mut vm = view();
+    let window_id = vec![0x11; 16];
+    vm.apply(event(Msg::PairingWindow(PairingWindow {
+        open: true,
+        address: "192.168.1.10:47901".into(),
+        seconds_remaining: 120,
+        attempt_id: window_id.clone(),
+    })));
+    let prompt = pairing_prompt();
+    vm.apply(event(Msg::PairingPrompt(prompt.clone())));
+    let close_id = vm.begin_request(Request::ClosePairingWindow, Instant::now());
+    vm.apply(event(Msg::PairingWindow(PairingWindow {
+        open: false,
+        attempt_id: window_id,
+        ..Default::default()
+    })));
+    vm.apply(answer(
+        close_id,
+        Msg::OpResult(OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    assert_eq!(
+        vm.pairing.prompt.as_ref(),
+        Some(&prompt),
+        "window identity is not ceremony identity"
+    );
+    vm.apply(event(Msg::PairingResult(PairingResult {
+        outcome: PairingOutcome::Rejected as i32,
+        ceremony_id: prompt.attempt_id,
+        error_code: "PAIRING_CANCELLED".into(),
+        ..Default::default()
+    })));
+    assert!(vm.pairing.window.is_none());
+    assert!(vm.pairing.prompt.is_none());
+    assert!(!vm.pairing.dialing);
+    assert!(vm.pairing.paired.is_none());
+}

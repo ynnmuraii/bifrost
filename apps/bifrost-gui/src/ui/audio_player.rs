@@ -1099,7 +1099,7 @@ fn draw_card(
     // One real volume row: the functional mute, the slider, the tabular percentage. There is
     // no second decorative speaker icon anywhere on the surface.
     let v = &l.volume;
-    let gain = c.gain_percent.min(100);
+    let gain = c.desired_gain_percent.unwrap_or(c.gain_percent).min(100);
     let mut new_gain = gain;
     ui.scope_builder(egui::UiBuilder::new().max_rect(v.slider), |ui| {
         ui.spacing_mut().slider_width = v.slider.width();
@@ -1115,7 +1115,15 @@ fn draw_card(
         response.widget_info(|| {
             egui::WidgetInfo::slider(true, f64::from(gain), text(lang, Key::AudioGain))
         });
-        response.on_hover_text(text(lang, Key::AudioGain));
+        if let Some(desired) = c.desired_gain_percent {
+            response.on_hover_text(ui_text::fill_named(
+                lang,
+                Key::AudioGainPending,
+                &[("desired", &desired), ("confirmed", &c.gain_percent)],
+            ));
+        } else {
+            response.on_hover_text(text(lang, Key::AudioGain));
+        }
     });
     if new_gain != gain {
         out.push(Action::SetGain {
@@ -1126,7 +1134,14 @@ fn draw_card(
     label_right(
         ui,
         v.percent,
-        &format!("{gain}%"),
+        &format!(
+            "{gain}%{}",
+            if c.desired_gain_percent.is_some() {
+                "*"
+            } else {
+                ""
+            }
+        ),
         11.0,
         fam::mono(),
         pal.ink2,
@@ -1760,6 +1775,7 @@ pub fn viewport(
     lang: Lang,
     mode: PlayerMode,
 ) -> Vec<Action> {
+    prune_art_textures(ctx, &model.cards);
     let initialised_id = egui::Id::new("audio-player-initialised");
     let pending_id = egui::Id::new("audio-player-pending-size");
     if !model.open {

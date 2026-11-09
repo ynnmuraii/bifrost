@@ -579,7 +579,7 @@ fn grants_are_one_use_expiring_and_parent_scoped() {
         Err(ClipboardViolation::BadId),
         "an expired grant is refused"
     );
-    assert_eq!(grants.open(), 1, "a refused bind leaves the grant open");
+    assert_eq!(grants.open(), 0, "an expired bind prunes the unused grant");
     grants.close_parent(&parent);
     assert_eq!(grants.open(), 0);
 
@@ -636,6 +636,34 @@ fn a_leaked_grant_cannot_bind_another_peer_or_consume_the_rightful_peers_grant()
         Err(ClipboardViolation::BadId),
         "the rightful peer still gets only one bind"
     );
+}
+
+#[test]
+fn unused_grants_are_deduplicated_parent_local_and_globally_bounded() {
+    let mut grants = Grants::default();
+    let peer = [0x21; 32].into();
+    let first = grants.issue(peer, [1; 16], (1, 0), 0);
+    for now in 1..100 {
+        assert_eq!(grants.issue(peer, [1; 16], (1, 0), now), first);
+        assert_eq!(grants.open(), 1);
+    }
+    let replacement = grants.issue(peer, [2; 16], (1, 0), 100);
+    assert_eq!(grants.open(), 1);
+    assert!(grants
+        .accept(peer, &[1; 16], &first.0, &first.1, 100)
+        .is_err());
+    assert_eq!(
+        grants.accept(peer, &[2; 16], &replacement.0, &replacement.1, 100),
+        Ok((1, 0))
+    );
+    for index in 0..200u16 {
+        let mut id = [0; 32];
+        id[..2].copy_from_slice(&index.to_be_bytes());
+        grants.issue(id.into(), [1; 16], (1, 0), 200);
+        assert!(grants.open() <= transport::clipboard::MAX_OPEN_GRANTS);
+    }
+    grants.prune(200 + clipboard::CHANNEL_TTL_MS + 1);
+    assert_eq!(grants.open(), 0);
 }
 
 /// 4. A connection whose first frame is not a `Bind` is dropped; `accept()` keeps waiting.

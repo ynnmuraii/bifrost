@@ -26,15 +26,7 @@ use protocol::ipc::{self as ipc, gui_frame::Msg};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{ctl, pairing, Handled, LayoutSource, Session, LAYOUT_VERDICT_TIMEOUT};
-use crate::gui::Outgoing;
-
-/// How long the loop waits for one GUI connection to take a frame.
-///
-/// The connection's queue holds [`crate::gui::OUTBOUND_QUEUE`] frames, so this only triggers
-/// for a GUI that is not reading at all. Core must not be stalled by its own GUI («GUI не
-/// участвует в горячем пути»), so the frame is dropped with a warning instead of being
-/// written into a void.
-const ANSWER_TIMEOUT: Duration = Duration::from_millis(500);
+use crate::gui::Replies;
 
 impl Session {
     /// Applies a retained item locally without offering it to another computer.
@@ -627,23 +619,7 @@ impl Session {
         if let Some(audio) = &self.audio {
             audio.gui_activity(request.connection_id);
         }
-        #[cfg(feature = "audio")]
-        let audio_request = super::audio::is_request(&request.message);
-        #[cfg(not(feature = "audio"))]
-        let audio_request = matches!(
-            &request.message,
-            Msg::GetAudioStatus(_)
-                | Msg::SetAudio(_)
-                | Msg::SetSystemAudioSharing(_)
-                | Msg::StartAudio(_)
-                | Msg::StopAudio(_)
-                | Msg::SetMicrophoneMute(_)
-                | Msg::SetPtt(_)
-                | Msg::ListAudioDevices(_)
-                | Msg::SetAudioPeerGain(_)
-                | Msg::SendMediaCommand(_)
-                | Msg::GetAudioArtwork(_)
-        );
+        let audio_request = ::ipc::audio::is_request(&request.message);
         if audio_request {
             #[cfg(feature = "audio")]
             let (request_id, out) = if let Some(audio) = &self.audio {
@@ -924,17 +900,21 @@ impl Session {
                         }
                         let count = ranges.len() as u32;
                         for (index, range) in ranges.into_iter().enumerate() {
-                            answer(
-                                &out,
-                                request_id,
-                                Msg::ClipboardHistoryItem(ipc::ClipboardHistoryItem {
-                                    id: get.id,
-                                    text: text[range].to_owned(),
-                                    chunk_index: index as u32,
-                                    chunk_count: count,
-                                }),
-                            )
-                            .await;
+                            if out
+                                .send_wait((
+                                    request_id,
+                                    Msg::ClipboardHistoryItem(ipc::ClipboardHistoryItem {
+                                        id: get.id,
+                                        text: text[range].to_owned(),
+                                        chunk_index: index as u32,
+                                        chunk_count: count,
+                                    }),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     });
                 }
@@ -1040,6 +1020,17 @@ impl Session {
                     },
                 };
                 answer(&out, request_id, Msg::OpResult(result)).await;
+            }
+            Msg::ClosePairingWindow(_) => {
+                if let Some(window) = self.pairing.close() {
+                    self.publish(Msg::PairingWindow(ipc::PairingWindow {
+                        open: false,
+                        address: String::new(),
+                        seconds_remaining: 0,
+                        attempt_id: window.attempt_id.to_vec(),
+                    }));
+                }
+                answer(&out, request_id, Msg::OpResult(ok())).await;
             }
             Msg::MutePairingRequester(request) => {
                 let result = self.mute_pair_requester(&request.node_id);
@@ -1397,7 +1388,7 @@ impl Session {
         }) {
             return;
         }
-        let (ceremony_id, answer, cancelled) = self.pairing.begin();
+        let (ceremony_id, answer, mut cancelled) = self.pairing.begin();
         self.pairing
             .accepted(ceremony_id, *connection.window.attempt_id());
         let identity = Arc::clone(&self.identity);
@@ -1409,19 +1400,24 @@ impl Session {
         let address = connection.address.to_string();
         let hello_timeout = opener_hello_timeout(&window, self.now_ms());
         tokio::spawn(async move {
-            match within(
-                hello_timeout,
-                identity::accept_stream(
-                    connection.stream,
-                    &identity,
-                    &window,
-                    Some(address),
-                    listen_port,
-                    &display_name,
-                ),
-            )
-            .await
-            {
+            let accepted = tokio::select! {
+                biased;
+                _ = &mut cancelled => {
+                    let _ = events.send(pairing::Event::Finished {
+                        ceremony_id,
+                        outcome: pairing::Outcome::Rejected,
+                    }).await;
+                    return;
+                }
+                result = within(
+                    hello_timeout,
+                    identity::accept_stream(
+                        connection.stream, &identity, &window, Some(address),
+                        listen_port, &display_name,
+                    ),
+                ) => result,
+            };
+            match accepted {
                 Ok(driver) => {
                     pairing::run(
                         driver,
@@ -1840,12 +1836,7 @@ impl Session {
     }
 
     /// Sends an answer now, or hands it to a task that waits for a verdict.
-    async fn reply_handled(
-        &mut self,
-        request_id: u64,
-        out: mpsc::Sender<Outgoing>,
-        handled: Handled,
-    ) {
+    async fn reply_handled(&mut self, request_id: u64, out: Replies, handled: Handled) {
         match handled {
             Handled::Reply(response) => {
                 answer(&out, request_id, Msg::OpResult(op_result(&response))).await;
@@ -1870,11 +1861,7 @@ impl Session {
 }
 
 /// Answers a request whose reply arrives when the coordinator (or the other user) does.
-async fn spawn_op_result(
-    request_id: u64,
-    out: mpsc::Sender<Outgoing>,
-    wait: oneshot::Receiver<pairing::Verdict>,
-) {
+async fn spawn_op_result(request_id: u64, out: Replies, wait: oneshot::Receiver<pairing::Verdict>) {
     tokio::spawn(async move {
         let result = match wait.await {
             Ok(Ok(())) => ok(),
@@ -1892,11 +1879,16 @@ async fn spawn_op_result(
 }
 
 /// Sends one frame, bounded so a wedged GUI cannot stall the loop.
-async fn answer(out: &mpsc::Sender<Outgoing>, request_id: u64, message: Msg) {
-    match tokio::time::timeout(ANSWER_TIMEOUT, out.send((request_id, message))).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => tracing::debug!("a GUI connection went away before its answer"),
-        Err(_) => tracing::warn!("a GUI did not take its answer; dropping it"),
+async fn answer(out: &Replies, request_id: u64, message: Msg) {
+    match out.try_send((request_id, message)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!("a GUI connection went away before its answer")
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // The connection-owned sender explicitly cancels its writer on saturation.
+            tracing::warn!("GUI reply queue full; connection must resynchronize");
+        }
     }
 }
 

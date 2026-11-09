@@ -26,6 +26,7 @@ fn card(id: &str) -> AudioPlayerCard {
         can_next: true,
         muted: false,
         gain_percent: 75,
+        desired_gain_percent: None,
         state: StreamState::Ready,
         path: None,
         background: false,

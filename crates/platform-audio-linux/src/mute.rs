@@ -19,6 +19,8 @@ struct Ownership {
     owned: bool,
     serial: u64,
     last_write: Option<(bool, Instant)>,
+    successful_write: bool,
+    render_dirty: bool,
     checking: bool,
     echo_seen: bool,
 }
@@ -29,6 +31,8 @@ impl Ownership {
             owned: true,
             serial: 0,
             last_write: None,
+            successful_write: false,
+            render_dirty: true,
             echo_seen: false,
             checking: false,
         }
@@ -45,6 +49,28 @@ impl Ownership {
         } else {
             self.echo_seen = true;
         }
+    }
+    fn observe_render(&mut self, event: p::SubscriptionEventType) {
+        if event != p::SubscriptionEventType::Changed {
+            self.owned = false;
+        }
+        self.render_dirty = true;
+    }
+    fn take_render_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.render_dirty)
+    }
+    fn restoration(&self, render: bool, original: bool, muted: bool) -> Result<bool, BackendError> {
+        if render && !self.successful_write {
+            return Ok(false);
+        }
+        if !self.owned || self.checking || (!render && self.last_write.is_some() && !self.echo_seen)
+        {
+            return Err(BackendError::OwnershipLost);
+        }
+        if !render && self.last_write.is_some_and(|(written, _)| written != muted) {
+            return Err(BackendError::OwnershipLost);
+        }
+        Ok((render || self.last_write.is_some()) && muted != original)
     }
 }
 
@@ -103,6 +129,13 @@ impl MuteWatches {
             return None;
         };
         let watch = lock(&self.0).get(&index).and_then(Weak::upgrade);
+        if render {
+            if let Some(watch) = &watch {
+                lock(watch).observe_render(event.event_type);
+            }
+            // One observer query consumes any number of queued render notifications.
+            return None;
+        }
         let at = Instant::now();
         let pending = watch.as_ref().map(|watch| {
             let mut ownership = lock(watch);
@@ -186,7 +219,16 @@ impl LinuxMuteGuard {
         render: bool,
     ) -> Result<Self, BackendError> {
         let connection = config.client()?;
-        let raw = config.raw()?;
+        let mut raw = config.raw()?;
+        if render
+            && (raw
+                .request::<p::ServerInfo>(p::Command::GetServerInfo)?
+                .cookie
+                != entry.server_cookie
+                || raw::wait(connection.client.server_info())?.cookie != entry.server_cookie)
+        {
+            return Err(BackendError::DeviceGone);
+        }
         let ownership = if render {
             state
                 .render_mutes
@@ -364,6 +406,7 @@ impl LinuxMuteGuard {
             lock(&watch).owned = false;
             return Err(error);
         }
+        lock(&watch).successful_write = true;
         if !self.owned() {
             return Err(BackendError::OwnershipLost);
         }
@@ -373,29 +416,19 @@ impl LinuxMuteGuard {
         let Some(watch) = self.ownership.take() else {
             return Ok(());
         };
+        // Preparing an echo timestamp does not prove a successful native write.
+        if self.render && !lock(&watch).successful_write {
+            return Ok(());
+        }
         // Keep the reservation alive throughout restoration, but release it on every return path.
         let snapshot = self.read();
         let restore = {
             let mut ownership = lock(&watch);
-            let valid = ownership.owned
-                && !ownership.checking
-                && (self.render || ownership.last_write.is_none() || ownership.echo_seen);
+            let restore = snapshot.and_then(|snapshot| {
+                ownership.restoration(self.render, self.original, snapshot.muted)
+            });
             ownership.owned = false;
-            if !valid {
-                return Err(BackendError::OwnershipLost);
-            }
-            let snapshot = snapshot?;
-            if self.render {
-                snapshot.muted != self.original
-            } else {
-                match ownership.last_write {
-                    Some((written, _)) if written == snapshot.muted => {
-                        snapshot.muted != self.original
-                    }
-                    Some(_) => return Err(BackendError::OwnershipLost),
-                    None => false,
-                }
-            }
+            restore?
         };
         if restore {
             self.restore_write_attempted = true;
@@ -424,7 +457,8 @@ impl LinuxRenderGuard {
         admitted: &dyn Fn() -> bool,
     ) -> Result<Self, BackendError> {
         let serial = entry.serial.ok_or(BackendError::Unsupported)?;
-        let mut effective = EffectiveMonitor::connect(entry.device.id.as_str(), serial)?;
+        let mut effective =
+            EffectiveMonitor::connect(entry.device.id.as_str(), serial, entry.server_cookie)?;
         let generation = entry.generation;
         let mut mute = LinuxMuteGuard::acquire_endpoint(config, state, key, entry, true)?;
         mute.set_admitted(generation, true, admitted, Some(&mut effective))?;
@@ -440,8 +474,17 @@ impl LinuxRenderGuard {
             Err(BackendError::DeviceGone)
         } else {
             self.effective.check(running)?;
-            self.mute
-                .set_admitted(self.mute.entry.generation, true, running, None)
+            let dirty = self
+                .mute
+                .ownership
+                .as_ref()
+                .is_some_and(|watch| lock(watch).take_render_dirty());
+            if dirty {
+                self.mute
+                    .set_admitted(self.mute.entry.generation, true, running, None)
+            } else {
+                Ok(())
+            }
         }
     }
     pub(crate) fn restore(&mut self) {
@@ -568,6 +611,44 @@ mod tests {
         assert!(!ownership.owned);
         let mut ownership = Ownership::new(7);
         ownership.observe(7, false, now);
+        assert!(!ownership.owned);
+    }
+    #[test]
+    fn render_restores_only_a_successful_own_write_not_prepared_or_failed_admission() {
+        let now = Instant::now();
+        for original in [false, true] {
+            let mut ownership = Ownership::new(7);
+            assert_eq!(ownership.restoration(true, original, !original), Ok(false));
+            ownership.last_write = Some((!original, now));
+            // Final admission can fail after preparation; external mute must survive.
+            assert_eq!(ownership.restoration(true, original, !original), Ok(false));
+            ownership.successful_write = true;
+            assert_eq!(ownership.restoration(true, original, !original), Ok(true));
+            assert_eq!(ownership.restoration(true, original, original), Ok(false));
+            ownership.owned = false;
+            assert_eq!(
+                ownership.restoration(true, original, !original),
+                Err(BackendError::OwnershipLost)
+            );
+        }
+    }
+    #[test]
+    fn render_notifications_coalesce_but_next_external_change_still_reasserts() {
+        let mut ownership = Ownership::new(7);
+        assert!(ownership.take_render_dirty());
+        assert!(!ownership.take_render_dirty());
+        for _ in 0..4 {
+            ownership.observe_render(p::SubscriptionEventType::Changed);
+        }
+        assert!(ownership.take_render_dirty());
+        assert!(ownership.owned);
+        assert!(!ownership.take_render_dirty());
+        ownership.observe_render(p::SubscriptionEventType::Changed);
+        assert!(
+            ownership.take_render_dirty(),
+            "later unmute must still be queried/reasserted"
+        );
+        ownership.observe_render(p::SubscriptionEventType::Removed);
         assert!(!ownership.owned);
     }
     #[test]

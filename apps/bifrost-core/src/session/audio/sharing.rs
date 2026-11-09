@@ -23,7 +23,7 @@ pub(super) struct Start {
 pub(super) fn submit(
     intents: &watch::Sender<Intent>,
     request: Request,
-) -> Result<(), (u64, mpsc::Sender<Outgoing>)> {
+) -> Result<(), (u64, Replies)> {
     if intents.is_closed() {
         return Err((request.request_id, request.out));
     }
@@ -54,6 +54,7 @@ pub(super) fn submit(
 
 impl Actor {
     pub(super) async fn reconcile_system(&mut self) {
+        self.service_worker_reconfigure().await;
         self.service_system_start().await;
         self.drain().await;
         if !self.worker_needed() && self.worker.is_some() {
@@ -394,7 +395,8 @@ impl Actor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    pub(in crate::session::audio) mod lifecycle;
     use super::*;
 
     #[tokio::test]
@@ -496,6 +498,11 @@ mod tests {
         print!("{}", String::from_utf8_lossy(&stdout));
     }
 
+    #[tokio::test]
+    async fn advanced_scope_change_preserves_native_retirement_until_matching_stopped() {
+        controlled_system_off(false, NativeStart::AdvancedScope).await;
+    }
+
     enum NativeStart {
         Fenced,
         Issued,
@@ -504,26 +511,28 @@ mod tests {
         ControlPending,
         MicContention,
         Deadline,
+        AdvancedScope,
     }
 
     #[tokio::test]
     async fn malformed_optional_artwork_cannot_stop_an_established_audio_actor() {
         controlled_system_off(false, NativeStart::Started).await;
     }
-    async fn controlled_system_off(worker_lost: bool, native: NativeStart) {
-        let native_issued = !matches!(native, NativeStart::Fenced);
+    async fn controlled_system_off(worker_lost: bool, start_mode: NativeStart) {
+        let native_issued = !matches!(start_mode, NativeStart::Fenced);
         let native_started = matches!(
-            native,
+            start_mode,
             NativeStart::Started
                 | NativeStart::RevokePending
                 | NativeStart::ControlPending
                 | NativeStart::MicContention
                 | NativeStart::Deadline
+                | NativeStart::AdvancedScope
         );
-        let revoke_pending = matches!(native, NativeStart::RevokePending);
-        let control_pending = matches!(native, NativeStart::ControlPending);
-        let past_deadline = matches!(native, NativeStart::Deadline);
-        let mic_contention = matches!(native, NativeStart::MicContention);
+        let revoke_pending = matches!(start_mode, NativeStart::RevokePending);
+        let control_pending = matches!(start_mode, NativeStart::ControlPending);
+        let past_deadline = matches!(start_mode, NativeStart::Deadline);
+        let mic_contention = matches!(start_mode, NativeStart::MicContention);
         let root = if mic_contention {
             std::path::PathBuf::from(std::env::var_os("BIFROST_MIC_PARENT_TEST_ROOT").unwrap())
         } else {
@@ -814,7 +823,7 @@ mod tests {
                     .expect("actual Coordinator completed its first parent update");
                 (running, writer)
             });
-            let (out, mut replies) = mpsc::channel(4);
+            let (out, mut replies) = Replies::channel(4);
             coordinator
                 .submit(Request {
                     request_id: 91,
@@ -954,7 +963,90 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
             return;
         }
-        let (out, mut replies) = mpsc::channel(4);
+        if matches!(start_mode, NativeStart::AdvancedScope) {
+            let mut next = actor.config.clone();
+            next.profile = config::AudioProfile::Wifi;
+            actor
+                .set_config(&gui::SetAudio {
+                    expected_revision: actor.revision,
+                    config: Some(
+                        wire::encode_config(&next, model::AudioProfile::Ethernet).unwrap(),
+                    ),
+                })
+                .await
+                .unwrap();
+            assert_eq!(stops.recv().await, Some(view.session));
+            assert!(actor.worker_reconfigure);
+            assert!(actor.native_stops_pending());
+            assert_eq!(actor.records[&peer].view.session, view.session);
+            assert!(actor.records[&peer].start_request_id.is_some());
+            assert!(
+                !*shutdown.borrow(),
+                "scope editing must await native restoration"
+            );
+            let status = actor.snapshot().unwrap();
+            assert!(status.sessions.iter().any(|session| {
+                session.session_id == view.session
+                    && session.state == gui::AudioSessionState::Stopping as i32
+            }));
+            let stopped_at = actor.now();
+            for advance in [250, 500, 750, 1000, 1250, 1500] {
+                actor.epoch = Instant::now()
+                    .checked_sub(Duration::from_millis(stopped_at + advance))
+                    .unwrap();
+                actor
+                    .feed(fsm::Input::WorkerHeartbeat {
+                        generation: view.worker_generation,
+                    })
+                    .unwrap();
+                actor.feed(fsm::Input::Tick).unwrap();
+            }
+            assert_eq!(actor.records[&peer].view.phase, fsm::Phase::Stopped);
+            assert!(actor.native_stops_pending());
+            assert!(
+                !actor.start_ready(peer),
+                "logical expiry cannot admit replacement"
+            );
+            for (gen, id) in [(0, view.session), (1, [12; 16])] {
+                actor
+                    .on_worker(AudioSupervisorEvent::SessionEvent {
+                        generation: gen,
+                        event: worker::SessionEvent {
+                            session_id: id.to_vec(),
+                            kind: worker::EventKind::Stopped as i32,
+                            ..Default::default()
+                        },
+                    })
+                    .await;
+                assert!(actor.native_stops_pending());
+            }
+            actor
+                .on_worker(AudioSupervisorEvent::SessionEvent {
+                    generation: 1,
+                    event: worker::SessionEvent {
+                        session_id: view.session.to_vec(),
+                        kind: worker::EventKind::Stopped as i32,
+                        ..Default::default()
+                    },
+                })
+                .await;
+            assert!(!actor.native_stops_pending());
+            assert_eq!(actor.records[&peer].start_request_id, None);
+            assert_eq!(actor.records[&peer].capture_active, Some(false));
+            // Retire the controlled process without starting a real replacement worker.
+            actor.system_requested = false;
+            actor.config.system_sharing = Some(false);
+            actor.reconcile_system().await;
+            assert!(*shutdown.borrow());
+            assert!(!actor.worker_reconfigure);
+            assert!(actor.worker.is_none());
+            native.await.unwrap();
+            drop(actor);
+            drop(coordinator);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let (out, mut replies) = Replies::channel(4);
         coordinator
             .submit(Request {
                 request_id: 91,
@@ -1239,7 +1331,7 @@ mod tests {
         let snapshot = snapshot.expect("actual published pending state");
         assert_eq!(snapshot.system_sharing_requested, Some(true));
         assert!(snapshot.sessions.is_empty());
-        let (out, mut replies) = mpsc::channel(4);
+        let (out, mut replies) = Replies::channel(4);
         coordinator
             .submit(Request {
                 request_id: 41,
@@ -1593,7 +1685,7 @@ mod tests {
         source_actor.drain().await;
         let mut source_status = source_actor.events.subscribe();
         let source_runner = tokio::spawn(source_actor.run());
-        let (out, mut replies) = mpsc::channel(4);
+        let (out, mut replies) = Replies::channel(4);
         source_coordinator
             .submit(Request {
                 request_id: 1,
@@ -2116,7 +2208,7 @@ mod tests {
                 },
             );
             actor.drain().await;
-            let (out, mut replies) = mpsc::channel(4);
+            let (out, mut replies) = Replies::channel(4);
             let runner = tokio::spawn(run_published_actor(actor, coordinator.caps.clone()));
             coordinator
                 .submit(Request {
@@ -2397,7 +2489,7 @@ mod tests {
             // this lib-test executable is not an audio-role executable. No native
             // Ready/Started/health facts or successful child ACK are fabricated.
             actor.publish("before_attempt");
-            let (out, mut replies) = mpsc::channel(4);
+            let (out, mut replies) = Replies::channel(4);
             coordinator
                 .submit(Request {
                     request_id: 57,

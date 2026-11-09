@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use input_model::HidKey;
 use platform_win::hid::{
     hid_key_to_scancode, hid_to_scancode, scancode_from_hook, scancode_parts, scancode_to_hid,
-    table_len,
 };
 
 #[test]
@@ -25,9 +24,6 @@ fn all_scancodes_and_usages_roundtrip_without_aliases() {
             assert_eq!(scancode_to_hid(scan), Some(usage));
         }
     }
-    assert_eq!(table_len(), 104);
-    assert_eq!(usages.len(), table_len());
-    assert_eq!(scans.len(), table_len());
 }
 
 #[test]

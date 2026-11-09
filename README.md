@@ -4,7 +4,7 @@
 
 Keep your computers separate. Move between their screens over your LAN without changing the keyboard under your hands.
 
-**[Download Bifrost 0.5.0](https://github.com/ynnmuraii/bifrost/releases/latest)** · [Get started](#get-started) · [Platform support](#platform-support) · [Русская инструкция](packaging/README_RU.txt)
+**[Download Bifrost 0.5.1](https://github.com/ynnmuraii/bifrost/releases/latest)** · [Get started](#get-started) · [Platform support](#platform-support) · [Русская инструкция](packaging/README_RU.txt)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/main-dark.png">
@@ -49,12 +49,14 @@ flowchart TD
 
 If discovery is empty, enter the address manually; this cannot bypass firewall or network isolation. Keep a local keyboard available, especially while setting up Wayland permissions.
 
+Outgoing capture is refused while physical keys/buttons are held or their state is unknown. Release the switching chord before switching; a pending Switch Next intent expires after 400 ms. After agent failure, routing stays blocked until synthetic-input recovery receives an exact successful release acknowledgement. Native release errors are not reported as successful cleanup.
+
 ## Download & install
 
-**[Get the 0.5.0 release](https://github.com/ynnmuraii/bifrost/releases/latest)** for both computers. Choose the same version on each.
+**[Get the 0.5.1 release](https://github.com/ynnmuraii/bifrost/releases/latest)** for both computers. Choose the same version on each.
 
-- **Windows 11 · x86_64:** download `bifrost-0.5.0-windows-x86_64.exe`, keep it in a permanent folder, and run it. No administrator account or installer is needed. The executable is not Authenticode-signed; check the download before bypassing SmartScreen.
-- **Linux · x86_64:** extract `bifrost-0.5.0-linux-x86_64.tar.gz`, run `./install.sh` without `sudo`, then open Bifrost from the applications menu. The release requires glibc 2.35 or newer.
+- **Windows 11 · x86_64:** download `bifrost-0.5.1-windows-x86_64.exe`, keep it in a permanent folder, and run it. No administrator account or installer is needed. The executable is not Authenticode-signed; check the download before bypassing SmartScreen.
+- **Linux · x86_64:** extract `bifrost-0.5.1-linux-x86_64.tar.gz`, run `./install.sh` without `sudo`, then open Bifrost from the applications menu. The release requires glibc 2.35 or newer.
 
 On a firewall prompt, allow **private networks only**. Bifrost does not add firewall rules. [Installation, firewall and upgrade details](#technical-details) include ports, signed-checksum verification and older-version migration.
 
@@ -98,8 +100,8 @@ Closing the window does not stop the core or an active session. Use the app's ex
 | --- | --- | --- |
 | Windows 11 | Capture and receive input | WASAPI system audio; process-tree exclusion and native media/mic/PTT controls where available |
 | Linux X11 | Capture and receive input | Pulse-compatible monitor audio/MPRIS; focused GUI PTT, not native global X11 PTT |
-| KDE Plasma ≥6.1 · Wayland | Through desktop portals; permissions required | Pulse-compatible audio/MPRIS; current zero portal timestamps cannot prove native PTT freshness; GUI hold-to-talk remains available |
-| GNOME ≥45 · Wayland | Portal capabilities vary; GNOME 46 can receive but cannot capture input for another computer | Pulse-compatible audio/MPRIS; native PTT requires a present portal with verifiable fresh timestamps, not GNOME 46 |
+| KDE Plasma ≥6.1 · Wayland | Portal receiving; outgoing switching unavailable while physical state is unknown | Pulse-compatible audio/MPRIS; current zero portal timestamps cannot prove native PTT freshness; GUI hold-to-talk remains available |
+| GNOME ≥45 · Wayland | Receive where RemoteDesktop is available; outgoing switching unavailable while physical state is unknown | Pulse-compatible audio/MPRIS; native PTT requires a present portal with verifiable fresh timestamps, not GNOME 46 |
 | wlroots-based Wayland desktops | Not supported | Not a supported Bifrost desktop |
 | macOS | Not supported | Not supported |
 
@@ -119,7 +121,7 @@ Closing the window does not stop the core or an active session. Use the app's ex
 
 - Early software: keep access to a local keyboard and test emergency release before relying on remote input.
 - The Windows executable has no Authenticode signature and may trigger SmartScreen; release checksums have a separate Ed25519 signature. Linux desktops may need explicit portal approval.
-- Wayland shows a desktop-portal permission dialog on first use. Support depends on your compositor and portal backend.
+- Wayland shows a desktop-portal permission dialog on first use. Receiving depends on your compositor and portal backend; outgoing keyboard/mouse switching fails closed while physical held state cannot be established. Receiving and independent audio remain available where supported.
 - The emergency hotkey on Wayland depends on the **GlobalShortcuts portal**. On KDE, launch Bifrost from its desktop entry or an `app-bifrost@….service` unit so the portal can identify it. GNOME 46 has no GlobalShortcuts portal. Check the emergency-hotkey status in **Keys**; do not assume the shortcut works just because the app is running.
 - Clipboard sharing is off by default; PNG images require a second opt-in. Windows, X11 and KDE Wayland (data-control) support images; GNOME Wayland does not.
 - Shared audio is off by default and requires explicit permissions on both computers; pairing does not grant audio consent. A Source selects one Listener.
@@ -136,7 +138,7 @@ Closing the window does not stop the core or an active session. Use the app's ex
 
 ## Download & install
 
-Get **0.5.0** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
+Get **0.5.1** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
 
 Versions from **0.1.4** can update from **Settings** or the startup update notice. The app checks for newer stable releases shortly after startup; turn this off in **Settings → Check on startup**, or check manually next to the version. Updates keep a binary backup and ask before restarting all roles; your configuration and pairing are preserved. System-wide, non-writable installations must be updated manually.
 
@@ -146,7 +148,7 @@ Versions from **0.1.4** can update from **Settings** or the startup update notic
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.5.0-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.5.1-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902 + UDP 47902 (discovery)** (multicast `239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
@@ -156,10 +158,10 @@ Settings are created automatically in `%APPDATA%\bifrost`; logs go to `%LOCALAPP
 
 ### Linux · x86_64
 
-Download **`bifrost-0.5.0-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.5.1-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.5.0-linux-x86_64.tar.gz
+tar -xzf bifrost-0.5.1-linux-x86_64.tar.gz
 ./install.sh
 ```
 
@@ -181,6 +183,10 @@ Runtime: X11 works too; Wayland input sharing needs `xdg-desktop-portal` with Re
 <summary>Pairing, clipboard destinations, image limits and discovery privacy</summary>
 
 Pairing requests and synchronized unpairing require **0.3.1 on both computers**. Unpairing removes trust on the other computer immediately if online, or on its next connection within 30 days. Older versions keep manual pairing windows and may show a manual **Remove** suggestion instead of synchronized removal.
+
+**Close** or Escape closes the local pairing window and cancels ceremonies admitted through it, preserving unrelated outgoing attempts. In compact windows, scroll the pairing panel to reach all controls. A bind/loopback address is not a destination for another computer: select a LAN address in Settings; IPv6 destinations include brackets. **Rename** requests the existing settings editor and shows `[node].display_name` / service-restart instructions in the panel. Dialog navigation skips the backdrop, reveals focused controls and returns visible focus to the invoking navigation control.
+
+Unadmitted runtime links are closed rather than left waiting. Clipboard dials and unused grants are bounded, deduplicated and invalidated with their authenticated parent connection. History shares immutable text storage without changing content or destination policy. Ownership persistence uses a coalescing background writer rather than blocking input decisions; orderly shutdown drains it, but crash persistence is best-effort.
 
 New peers use commitment/reveal SAS; a visible GUI/CLI warning identifies the less-protected legacy pairing ceremony. Always compare the codes on both screens. Clipboard restart detection requires capability 14 on both peers; legacy peers retain same-process reconnect replay protection, but cannot detect a peer process restart.
 
@@ -208,6 +214,7 @@ Discovery uses private IPv4 UDP multicast, not mDNS/Avahi/Bonjour. It is limited
 One headset on a single **Listener**, system sound from up to three authorized **Sources**. **Mix All** plays them together; **Follow Focus** makes the focused computer primary and quietens the others. Audio is off by default.
 The independent, always-on-top mini-player shows now-playing information where the Source's player supports it, plus local per-source volume/mute. It opens automatically after an observed running stream; an empty player has no playback controls. Each Source separately permits its Listener's media commands; sharing system audio does not enable them.
 The volume slider and percentage stay visible inside each card. Drag a card's header to move the player. The **− Hide player** action hides only the window; open it again from the tray's **Audio player** entry. A card's **× Stop audio stream** is separate and stops that stream. **Expand/Collapse** switches between compact and expanded layouts; drag a corner to resize, with each layout's size remembered separately.
+Rapid volume changes retain the latest desired value while one request is pending; requested and confirmed levels remain distinct until reconciliation. Player actions preserve dirty **Advanced** edits. Closing Advanced retains the draft; **Discard** restores authoritative settings.
 The player header has one receiver-wide mixing-mode button: the cursor icon means **Follow Focus** (the computer you control is louder and background Sources are quieter); the merging-lines icon means **Mix All** (no focus-based attenuation). Hover it for the current mode and the next action. It changes only the connected Listener's current mixing policy, without applying unsaved Advanced edits or restarting streams; while a request is pending or settings are unavailable it cannot change the mode. The icon changes after the core publishes the new setting.
 In compact windows the cover and metadata share the upper row, while the timeline, playback and volume controls use the full visible width. Wide and tall windows keep their existing artwork layouts.
 Click the track timeline to seek when the Source reports a seekable media session and valid time range; with the timeline focused, Left/Right seeks by five seconds. Unsupported sessions remain read-only, and live system audio is not a rewind buffer. **Pause** controls the Source's player without stopping the shared stream; **Play** remains available while the Source reports that same live media session. Removed or unavailable sessions are not kept as cached controls.
@@ -226,7 +233,7 @@ Turning sharing or receiving **off** cancels a pending start and withdraws syste
 
 **Connecting** or an accepted setting is not proof that sound is flowing. Status distinguishes the request from an observed running stream and shows startup failures with guidance in the audio panel. With **Resume system audio after reconnect** off (`audio.resume_system_audio = false`), restarting a Source leaves sharing stopped even if its saved consent is still on; choose **Share** and turn audio on again to start it. Enabling sharing does not silently change the resume preference.
 
-**Local silence on Linux Sources:** on PipeWire, an authorized active Source mutes only the selected render output whose monitor it captures; opening settings, probing devices or waiting to connect does not mute it. Capture continues while that output is muted. This requires the selected node's actual native `monitor.channel-volumes=false` policy; missing, conflicting or unsupported policy refuses the Source start rather than claiming silence. A PulseAudio-only Source cannot use this path.
+**Local silence on Linux Sources:** on PipeWire, an authorized active Source mutes only the selected render output whose monitor it captures; opening settings, probing devices or waiting to connect does not mute it. Capture continues while that output is muted. Admission requires actual native `monitor.channel-volumes=false` policy and proof that the Pulse endpoint and PipeWire policy belong to the same server instance. Missing, conflicting or unsupported evidence refuses Source start. A PulseAudio-only Source cannot use this path. Restoration requires a successfully acknowledged Bifrost mute write and retained ownership; controlled tests do not qualify arbitrary hardware or PipeWire versions.
 
 **Local silence on Windows Sources:** Bifrost pins all render outputs active when sharing starts, including virtual outputs. It mutes other apps on those outputs without changing volume. Parallel Source streams share the hold: stopping one cannot unmute another admitted stream. A new, disconnected or replaced output stops sharing rather than automatically retargeting it. Stop, Return here and Emergency restore only the original mute state still owned by Bifrost, best-effort; already-muted outputs stay muted, and crash restoration is not guaranteed. Physical-device qualification of this Windows path is still pending.
 
@@ -236,7 +243,11 @@ Normal stop restores the previous output mute state **best-effort**: an already-
 **Privacy:** pairing alone grants no audio permission. Bilateral consent gates capture and playback; ChaCha20-Poly1305 session keys come from the pinned mutual-TLS link. Now-playing metadata is shared only within active consented sessions; metadata, audio payloads and session keys are never logged or persisted.
 **Long-running sessions:** capable peers renew media keys over the pinned control connection before the hard 30-minute/per-key packet limit. Capture, playback, Source-local silence/volume and the media-session token stay in place; no new pairing, consent prompt or sharing toggle is needed. OFF, revoked trust and worker/connection failure still stop the session. A failed renewal reports a key-renewal error, not a guessed UDP/firewall failure. Peers without rekey support stop safely at the old key deadline rather than extending it.
 
-**Track/video covers:** where the Source exposes one, the mini-player can show a real Windows SMTC thumbnail or a regular local PNG/JPEG in the Linux Source's user cache advertised by MPRIS. Unsupported, absent and remote HTTP(S) artwork locations produce no cover; the Listener never fetches a peer-supplied URL. Images are decoded off the audio/UI real-time paths, reduced to at most 192×192 pixels/48 KiB encoded JPEG, transferred once per image identity and kept only in memory for the active consented session. Changing the track/session or withdrawing consent discards stale artwork. Audio and metadata framing limits are unchanged.
+Logical stop is not native retirement: replacement starts and Advanced backend cutovers wait for matching cleanup or actual worker loss. Session-local native errors remain visible without crashing an unrelated microphone owner. Linux stop waits for callback storage to retire even on native deletion error; a stuck native reactor can delay teardown.
+
+**Track/video covers:** where the Source exposes one, the mini-player can show a real Windows SMTC thumbnail or a regular local PNG/JPEG in the Linux Source's user cache advertised by MPRIS. Unsupported, absent and remote HTTP(S) locations produce no cover; the Listener never fetches a peer-supplied URL. Images are decoded off the audio/UI real-time paths, reduced to at most 192×192 pixels/48 KiB JPEG and kept only in memory for the active consented session. A valid repeat request can resend a completed image without restarting a partial transfer. Changing the track/session or withdrawing consent discards stale artwork; framing limits are unchanged.
+
+Linux artwork opens relative to held directory descriptors without following symlinks; unsafe paths and stale track generations are rejected. Windows metadata changes invalidate cached covers. Windows local IPC rejects pipe servers whose process user differs or cannot be verified before exchanging application data.
 
 **Compatibility:** audio needs capable builds on both computers; 0.4.0 peers still share input and clipboard. Rekey and artwork are separately capability-gated without changing protocol 1/0. Older binaries reject `[audio]`: restore the earlier `.pre-audio` backup where created, or remove audio tables before downgrading.
 
@@ -269,7 +280,7 @@ Bounded diagnostics report p50/p95/p99, durations and counters for capture-recei
 
 Input still shares one reliable TLS/TCP stream: packet loss can cause retransmission and head-of-line stalls. The controlled [two-core Docker benchmark](apps/bifrost/tests/bench_b/README.md) checks delivery, ordering and release safety; its variable loss tails are **not a claim of reduced Wi-Fi p99**.
 
-**Game mode** (Settings) blocks only edge switching: `auto` detects fullscreen apps on Windows/X11 and cursor confinement on Windows; `always` requires an explicit switch, and `off` disables the guard. Per-app allow/block lists match executable basenames or X11 WM_CLASS, case-insensitively; allow takes precedence in auto. **Ctrl+Alt+Shift+G** toggles auto/always (configurable under hotkeys), and the tray offers the same toggle. Explicit switches and emergency release always work, including while input is already remote. Wayland cannot expose foreground apps: use manual mode there. `[game_guard]` defaults to `mode = "auto"`, `block_apps = []`, `allow_apps = []`.
+**Game mode** (Settings) blocks only edge switching: `auto` detects fullscreen apps on Windows/X11 and cursor confinement on Windows; `always` requires an explicit switch, and `off` disables the guard. Per-app allow/block lists match executable basenames or X11 WM_CLASS, case-insensitively; allow takes precedence in auto. **Ctrl+Alt+Shift+G** toggles auto/always (configurable under hotkeys), and the tray offers the same toggle. Explicit switches bypass the game guard, not capture-safety checks; Emergency release remains local. Wayland cannot expose foreground apps: use manual mode there. `[game_guard]` defaults to `mode = "auto"`, `block_apps = []`, `allow_apps = []`.
 
 </details>
 

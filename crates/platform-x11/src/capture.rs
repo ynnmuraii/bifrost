@@ -38,6 +38,7 @@
 //! coordinates; the threshold + warp approach was chosen because it keeps the
 //! cursor usable (and visible) for a human sitting at the source.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use input_model::{CaptureKind, InputEvent, KeyState, Position};
@@ -76,7 +77,169 @@ pub enum CapturedEvent {
     /// notifications / the control channel), not by the raw event stream, so they
     /// are not variants here.
     Emergency,
-    HotkeyPressed(u8),
+    HotkeyPressed(u8, Instant),
+}
+
+/// Full x11rb request sequences identify the server-side grab, not dequeue time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GrabEpoch {
+    pointer: u64,
+    keyboard: u64,
+}
+
+impl GrabEpoch {
+    fn suppresses(self, sequence: u64, keyboard: bool) -> bool {
+        sequence
+            >= if keyboard {
+                self.keyboard
+            } else {
+                self.pointer
+            }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawEdge {
+    keyboard: bool,
+    detail: u32,
+    down: bool,
+    deviceid: u16,
+    sourceid: u16,
+}
+
+fn raw_edge(event: &Event) -> Option<RawEdge> {
+    let (keyboard, detail, down, deviceid, sourceid) = match event {
+        Event::XinputRawKeyPress(raw) => (true, raw.detail, true, raw.deviceid, raw.sourceid),
+        Event::XinputRawKeyRelease(raw) => (true, raw.detail, false, raw.deviceid, raw.sourceid),
+        Event::XinputRawButtonPress(raw) => (false, raw.detail, true, raw.deviceid, raw.sourceid),
+        Event::XinputRawButtonRelease(raw) => {
+            (false, raw.detail, false, raw.deviceid, raw.sourceid)
+        }
+        _ => return None,
+    };
+    Some(RawEdge {
+        keyboard,
+        detail,
+        down,
+        deviceid,
+        sourceid,
+    })
+}
+
+fn suppressed_between(start: GrabEpoch, end: GrabEpoch, sequence: u64, keyboard: bool) -> bool {
+    start.suppresses(sequence, keyboard) && !end.suppresses(sequence, keyboard)
+}
+
+/// Tracks only events after known-empty snapshots and before each device's grab.
+struct AdmissionCrossing {
+    snapshot: GrabEpoch,
+    grab: GrabEpoch,
+    keys: [bool; 256],
+    buttons: [bool; 256],
+}
+
+impl AdmissionCrossing {
+    fn new(snapshot: GrabEpoch, grab: GrabEpoch) -> Self {
+        Self {
+            snapshot,
+            grab,
+            keys: [false; 256],
+            buttons: [false; 256],
+        }
+    }
+
+    fn note(&mut self, sequence: u64, edge: RawEdge) {
+        if self.snapshot.suppresses(sequence, edge.keyboard)
+            && !self.grab.suppresses(sequence, edge.keyboard)
+        {
+            let states = if edge.keyboard {
+                &mut self.keys
+            } else {
+                &mut self.buttons
+            };
+            if let Some(state) = states.get_mut(edge.detail as usize) {
+                *state = edge.down;
+            }
+        }
+    }
+
+    fn crossed(&self) -> bool {
+        self.keys.iter().chain(&self.buttons).any(|down| *down)
+    }
+}
+
+fn discrete_event(
+    epoch: Option<GrabEpoch>,
+    sequence: u64,
+    input: InputEvent,
+) -> Option<CapturedEvent> {
+    if epoch
+        .is_some_and(|epoch| !epoch.suppresses(sequence, matches!(input, InputEvent::Key { .. })))
+    {
+        return None;
+    }
+    Some(CapturedEvent::Input(input))
+}
+
+#[derive(Clone, Copy)]
+struct ServerClock {
+    sequence: u64,
+    time: u32,
+    sent_at: Instant,
+}
+
+impl ServerClock {
+    fn issued_at(self, sequence: u64, time: u32, now: Instant) -> Option<Instant> {
+        // Do not calibrate from input receipts. An old/unknown clock sample fails closed.
+        if sequence < self.sequence
+            || now.checked_duration_since(self.sent_at)? > Duration::from_secs(60)
+        {
+            return None;
+        }
+        let elapsed_ms = time.wrapping_sub(self.time);
+        if elapsed_ms > i32::MAX as u32 {
+            return None;
+        }
+        // Server timestamps are millisecond ticks; subtract a tick for a lower bound.
+        let delta = i64::from(elapsed_ms) - 1;
+        let issued = if delta >= 0 {
+            self.sent_at
+                .checked_add(Duration::from_millis(delta as u64))?
+        } else {
+            self.sent_at
+                .checked_sub(Duration::from_millis(delta.unsigned_abs()))?
+        };
+        (now.checked_duration_since(issued)? < Duration::from_millis(400)).then_some(issued)
+    }
+}
+
+fn hotkey_edge(
+    state: &mut crate::hotkeys::HotkeyState,
+    fence: u64,
+    sequence: u64,
+    keycode: u8,
+    down: bool,
+) -> (bool, Option<u8>) {
+    if sequence < fence {
+        return (false, None);
+    }
+    state.edge(keycode, down)
+}
+
+fn timed_hotkey(
+    action: u8,
+    clock: Option<ServerClock>,
+    sequence: u64,
+    time: u32,
+    now: Instant,
+) -> Option<CapturedEvent> {
+    let issued_at = if action == 1 {
+        clock?.issued_at(sequence, time, now)?
+    } else {
+        // Return-local and the other immediate actions do not arm a release latch.
+        now
+    };
+    Some(CapturedEvent::HotkeyPressed(action, issued_at))
 }
 
 /// XI2 raw capture, optionally holding the pointer+keyboard grab.
@@ -99,6 +262,13 @@ pub struct X11Capture {
     ledger: PressedLedger,
     hotkeys: crate::hotkeys::HotkeyState,
     shortcut_grabs: Vec<(u8, u16)>,
+    grab_epoch: Option<GrabEpoch>,
+    hotkey_fence: u64,
+    clock_window: Window,
+    clock_atom: xproto::Atom,
+    clock: Option<ServerClock>,
+    clock_pending: Option<(u64, Instant)>,
+    pending: VecDeque<(Event, u64)>,
 }
 
 impl X11Capture {
@@ -123,23 +293,46 @@ impl X11Capture {
             )));
         }
         let xtest_device_ids = enumerate_xtest_devices(&conn)?;
+        let clock_window = conn.generate_id().map_err(|error| {
+            X11Error::Internal(format!("the server has no window id to give: {error}"))
+        })?;
+        conn.create_window(
+            0,
+            clock_window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            xproto::WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new().event_mask(xproto::EventMask::PROPERTY_CHANGE),
+        )?
+        .check()?;
+        let clock_atom = conn
+            .intern_atom(false, b"_BIFROST_CAPTURE_CLOCK")?
+            .reply()?
+            .atom;
+        // XISelectEvents takes mask words, not one word per event bit.
         let mask = vec![
-            xinput::XIEventMask::RAW_MOTION,
-            xinput::XIEventMask::RAW_KEY_PRESS,
-            xinput::XIEventMask::RAW_KEY_RELEASE,
-            xinput::XIEventMask::RAW_BUTTON_PRESS,
-            xinput::XIEventMask::RAW_BUTTON_RELEASE,
+            xinput::XIEventMask::RAW_MOTION
+                | xinput::XIEventMask::RAW_KEY_PRESS
+                | xinput::XIEventMask::RAW_KEY_RELEASE
+                | xinput::XIEventMask::RAW_BUTTON_PRESS
+                | xinput::XIEventMask::RAW_BUTTON_RELEASE,
         ];
-        conn.xinput_xi_select_events(
+        let subscription = conn.xinput_xi_select_events(
             root,
             &[xinput::EventMask {
                 deviceid: XI_ALL_DEVICES,
                 mask,
             }],
         )?;
-        conn.flush()?;
         let start = query_pointer(&conn, root)?;
-        Ok(Self {
+        // The pointer reply also serves as the subscription's error barrier.
+        subscription.check()?;
+        let mut capture = Self {
             conn,
             root,
             root_width,
@@ -158,7 +351,16 @@ impl X11Capture {
             ledger: PressedLedger::new(),
             hotkeys: crate::hotkeys::HotkeyState::default(),
             shortcut_grabs: Vec::new(),
-        })
+            grab_epoch: None,
+            hotkey_fence: 0,
+            clock_window,
+            clock_atom,
+            clock: None,
+            clock_pending: None,
+            pending: VecDeque::new(),
+        };
+        capture.refresh_clock()?;
+        Ok(capture)
     }
 
     /// Resolves a keysym against the current server keyboard map.
@@ -186,7 +388,7 @@ impl X11Capture {
         &mut self,
         bindings: [Option<crate::hotkeys::Hotkey>; 5],
     ) -> Result<(), X11Error> {
-        let physical = self.conn.query_keymap()?.reply()?.keys;
+        // Seed and fence only after the replacement is installed on the server.
         let mut wanted = Vec::new();
         for binding in
             bindings
@@ -229,6 +431,10 @@ impl X11Capture {
         );
         self.conn.flush()?;
         installed?;
+        let snapshot = self.conn.query_keymap()?;
+        let fence = snapshot.sequence_number();
+        let physical = snapshot.reply()?.keys;
+        self.hotkey_fence = fence;
         self.hotkeys.seed(&physical);
         self.hotkeys.bindings = bindings;
         self.shortcut_grabs = wanted;
@@ -315,6 +521,58 @@ impl X11Capture {
         &self.ledger
     }
 
+    /// Server snapshot also includes holds predating this capture connection.
+    pub fn physical_pressed(&self) -> Result<input_model::PressedState, X11Error> {
+        self.physical_snapshot().map(|(pressed, _)| pressed)
+    }
+
+    fn physical_snapshot(&self) -> Result<(input_model::PressedState, GrabEpoch), X11Error> {
+        let snapshot = self.conn.query_keymap()?;
+        let keyboard_sequence = snapshot.sequence_number();
+        let keys = snapshot.reply()?.keys;
+        let mut pressed = input_model::PressedState::default();
+        for code in 8u16..=255 {
+            if keys[usize::from(code / 8)] & (1 << (code % 8)) != 0 {
+                let key = x11_keycode_to_hid_key(code as u8).ok_or_else(|| {
+                    X11Error::Unsupported("held keyboard identity is not mapped".to_owned())
+                })?;
+                pressed.keys.insert(key);
+            }
+        }
+        // XI2 device state covers side buttons, which core QueryPointer cannot represent.
+        let client_pointer = self
+            .conn
+            .xinput_xi_get_client_pointer(x11rb::NONE)?
+            .reply()?;
+        let snapshot = self
+            .conn
+            .xinput_xi_query_pointer(self.root, client_pointer.deviceid)?;
+        let pointer_sequence = snapshot.sequence_number();
+        let devices = snapshot.reply()?;
+        for (number, button) in [
+            (1usize, input_model::MouseButton::Left),
+            (2, input_model::MouseButton::Middle),
+            (3, input_model::MouseButton::Right),
+            (8, input_model::MouseButton::Back),
+            (9, input_model::MouseButton::Forward),
+        ] {
+            if devices
+                .buttons
+                .get(number / 32)
+                .is_some_and(|bits| bits & (1 << (number % 32)) != 0)
+            {
+                pressed.buttons.insert(button);
+            }
+        }
+        Ok((
+            pressed,
+            GrabEpoch {
+                pointer: pointer_sequence,
+                keyboard: keyboard_sequence,
+            },
+        ))
+    }
+
     /// Reads the real pointer position back from the server.
     pub fn pointer_position(&self) -> Result<Position, X11Error> {
         query_pointer(&self.conn, self.root)
@@ -322,17 +580,51 @@ impl X11Capture {
 
     /// Takes the pointer and keyboard grab with `owner_events = false`.
     ///
-    /// On *any* failure both grabs are released again and the error is returned, so
-    /// the caller can cancel the transfer knowing the pointer is not half-grabbed.
+    /// Any failure attempts checked release of both grabs and local replay.
+    /// Failed rollback/restoration is returned without erasing surviving grab evidence.
     pub fn grab(&mut self) -> Result<(), X11Error> {
         if self.grab_active {
             return Ok(());
         }
-        if let Err(err) = self.take_grabs() {
-            self.drop_grabs();
-            return Err(err);
+        let (pressed, snapshot) = self.physical_snapshot()?;
+        if !pressed.is_empty() {
+            return Err(X11Error::Internal(
+                "physical input is held; capture commit refused".to_owned(),
+            ));
         }
-        self.grab_active = true;
+        let admission = (|| {
+            let epoch = self.take_grabs()?;
+            self.grab_epoch = Some(epoch);
+            self.grab_active = true;
+            let final_pressed = self.physical_pressed()?;
+            self.collect_until_barrier()?;
+            let mut crossing = AdmissionCrossing::new(snapshot, epoch);
+            for (event, sequence) in &self.pending {
+                if let Some(edge) = raw_edge(event) {
+                    if !self.is_own_injection(edge.deviceid, edge.sourceid) {
+                        crossing.note(*sequence, edge);
+                    }
+                }
+            }
+            if !final_pressed.is_empty() || crossing.crossed() {
+                return Err(X11Error::Internal(
+                    "physical input crossed capture admission; commit refused".to_owned(),
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = admission {
+            if let Err(rollback) = self.rollback_admission() {
+                let cleanup = self.ungrab();
+                return Err(X11Error::Internal(match cleanup {
+                    Ok(()) => format!("{error}; local input rollback failed: {rollback}"),
+                    Err(cleanup) => format!(
+                        "{error}; local input rollback failed: {rollback}; ungrab failed: {cleanup}"
+                    ),
+                }));
+            }
+            return Err(error);
+        }
         let position = self
             .pointer_position()
             .unwrap_or_else(|_| screen_centre(self.root_width, self.root_height));
@@ -341,9 +633,9 @@ impl X11Capture {
         Ok(())
     }
 
-    /// Releases both grabs if they are held. Safe to call more than once.
-    pub fn ungrab(&mut self) {
-        self.drop_grabs();
+    /// Checks both native releases. Failed cleanup retains grab evidence for retry.
+    pub fn ungrab(&mut self) -> Result<(), X11Error> {
+        self.drop_grabs().map(|_| ())
     }
 
     /// Waits for the next captured event.
@@ -356,9 +648,14 @@ impl X11Capture {
         timeout: Option<Duration>,
     ) -> Result<Option<CapturedEvent>, X11Error> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        self.refresh_clock()?;
         loop {
-            if let Some(event) = self.conn.poll_for_event()? {
-                if let Some(captured) = self.translate(event) {
+            let next = match self.pending.pop_front() {
+                Some(event) => Some(event),
+                None => self.conn.poll_for_event_with_sequence()?,
+            };
+            if let Some((event, sequence)) = next {
+                if let Some(captured) = self.translate(event, sequence) {
                     return Ok(Some(captured));
                 }
                 continue;
@@ -377,52 +674,158 @@ impl X11Capture {
         }
     }
 
-    fn take_grabs(&self) -> Result<(), X11Error> {
-        let pointer = self
-            .conn
-            .grab_pointer(
-                false,
-                self.root,
-                xproto::EventMask::NO_EVENT,
-                xproto::GrabMode::ASYNC,
-                xproto::GrabMode::ASYNC,
-                x11rb::NONE,
-                x11rb::NONE,
-                x11rb::CURRENT_TIME,
-            )?
-            .reply()?;
+    fn take_grabs(&mut self) -> Result<GrabEpoch, X11Error> {
+        let pointer_cookie = self.conn.grab_pointer(
+            false,
+            self.root,
+            xproto::EventMask::NO_EVENT,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )?;
+        let pointer_sequence = pointer_cookie.sequence_number();
+        let pointer = pointer_cookie.reply()?;
         if pointer.status != xproto::GrabStatus::SUCCESS {
             return Err(X11Error::Internal(format!(
                 "XGrabPointer was refused (status {})",
                 u8::from(pointer.status)
             )));
         }
-        let keyboard = self
-            .conn
-            .grab_keyboard(
-                false,
-                self.root,
-                x11rb::CURRENT_TIME,
-                xproto::GrabMode::ASYNC,
-                xproto::GrabMode::ASYNC,
-            )?
-            .reply()?;
+        self.grab_epoch = Some(GrabEpoch {
+            pointer: pointer_sequence,
+            keyboard: u64::MAX,
+        });
+        let keyboard_cookie = self.conn.grab_keyboard(
+            false,
+            self.root,
+            x11rb::CURRENT_TIME,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+        )?;
+        let keyboard_sequence = keyboard_cookie.sequence_number();
+        let keyboard = keyboard_cookie.reply()?;
         if keyboard.status != xproto::GrabStatus::SUCCESS {
             return Err(X11Error::Internal(format!(
                 "XGrabKeyboard was refused (status {})",
                 u8::from(keyboard.status)
             )));
         }
+        self.grab_epoch = Some(GrabEpoch {
+            pointer: pointer_sequence,
+            keyboard: keyboard_sequence,
+        });
         self.conn.flush()?;
-        Ok(())
+        Ok(GrabEpoch {
+            pointer: pointer_sequence,
+            keyboard: keyboard_sequence,
+        })
     }
 
-    /// Best-effort release of both grabs. Never fails.
-    fn drop_grabs(&mut self) {
-        let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
-        let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
-        let _ = self.conn.flush();
+    fn collect_until_barrier(&mut self) -> Result<(), X11Error> {
+        let cookie = self.conn.change_property(
+            xproto::PropMode::APPEND,
+            self.clock_window,
+            self.clock_atom,
+            xproto::AtomEnum::STRING,
+            8,
+            0,
+            &[],
+        )?;
+        let barrier = cookie.sequence_number();
+        self.conn.flush()?;
+        loop {
+            let (event, sequence) = self.conn.wait_for_event_with_sequence()?;
+            if matches!(&event, Event::PropertyNotify(property)
+                if property.window == self.clock_window && property.atom == self.clock_atom)
+                && sequence == barrier
+            {
+                return Ok(());
+            }
+            self.pending.push_back((event, sequence));
+        }
+    }
+
+    fn rollback_admission(&mut self) -> Result<(), X11Error> {
+        let Some(start) = self.grab_epoch else {
+            return self.ungrab();
+        };
+        let end = self.drop_grabs()?;
+        self.collect_until_barrier()?;
+        let mut hotkeys = self.hotkeys.clone();
+        let mut error = None;
+        for (event, sequence) in &self.pending {
+            let edge =
+                raw_edge(event).filter(|edge| !self.is_own_injection(edge.deviceid, edge.sourceid));
+            let swallowed = edge.is_some_and(|edge| {
+                edge.keyboard
+                    && hotkey_edge(
+                        &mut hotkeys,
+                        self.hotkey_fence,
+                        *sequence,
+                        edge.detail as u8,
+                        edge.down,
+                    )
+                    .0
+            });
+            let replay = edge.filter(|edge| {
+                !swallowed && suppressed_between(start, end, *sequence, edge.keyboard)
+            });
+            if let Some(edge) = replay {
+                let type_ = match (edge.keyboard, edge.down) {
+                    (true, true) => xproto::KEY_PRESS_EVENT,
+                    (true, false) => xproto::KEY_RELEASE_EVENT,
+                    (false, true) => xproto::BUTTON_PRESS_EVENT,
+                    (false, false) => xproto::BUTTON_RELEASE_EVENT,
+                };
+                let result = (|| -> Result<(), X11Error> {
+                    let detail = u8::try_from(edge.detail).map_err(|_| {
+                        X11Error::Unsupported(
+                            "suppressed input identity cannot be replayed locally".to_owned(),
+                        )
+                    })?;
+                    self.conn
+                        .xtest_fake_input(type_, detail, x11rb::CURRENT_TIME, x11rb::NONE, 0, 0, 0)?
+                        .check()?;
+                    Ok(())
+                })();
+                if let Err(replay_error) = result {
+                    if error.is_none() {
+                        error = Some(replay_error);
+                    }
+                }
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+
+    fn drop_grabs(&mut self) -> Result<GrabEpoch, X11Error> {
+        // Attempt both requests before checking either result.
+        let pointer = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+        let keyboard = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+        let synchronized = (|| -> Result<(), X11Error> {
+            self.conn.get_input_focus()?.reply()?;
+            Ok(())
+        })();
+        synchronized?;
+        let pointer = pointer.map_err(X11Error::from).and_then(|cookie| {
+            let sequence = cookie.sequence_number();
+            cookie.check()?;
+            Ok(sequence)
+        });
+        let keyboard = keyboard.map_err(X11Error::from).and_then(|cookie| {
+            let sequence = cookie.sequence_number();
+            cookie.check()?;
+            Ok(sequence)
+        });
+        let epoch = GrabEpoch {
+            pointer: pointer?,
+            keyboard: keyboard?,
+        };
         self.grab_active = false;
+        self.grab_epoch = None;
+        Ok(epoch)
     }
 
     /// Blocks until the X connection is readable or `timeout` elapses.
@@ -441,13 +844,51 @@ impl X11Capture {
         Ok(())
     }
 
-    fn translate(&mut self, event: Event) -> Option<CapturedEvent> {
+    fn refresh_clock(&mut self) -> Result<(), X11Error> {
+        if self.clock_pending.is_some()
+            || self
+                .clock
+                .is_some_and(|clock| clock.sent_at.elapsed() < Duration::from_secs(30))
+        {
+            return Ok(());
+        }
+        let sent_at = Instant::now();
+        let cookie = self.conn.change_property(
+            xproto::PropMode::APPEND,
+            self.clock_window,
+            self.clock_atom,
+            xproto::AtomEnum::STRING,
+            8,
+            0,
+            &[],
+        )?;
+        self.clock_pending = Some((cookie.sequence_number(), sent_at));
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn translate(&mut self, event: Event, sequence: u64) -> Option<CapturedEvent> {
         match event {
+            Event::PropertyNotify(property)
+                if property.window == self.clock_window && property.atom == self.clock_atom =>
+            {
+                if let Some((request, sent_at)) = self.clock_pending {
+                    if sequence == request {
+                        self.clock = Some(ServerClock {
+                            sequence,
+                            time: property.time,
+                            sent_at,
+                        });
+                        self.clock_pending = None;
+                    }
+                }
+                None
+            }
             Event::XinputRawMotion(raw) => self.capture_motion(&raw),
-            Event::XinputRawKeyPress(raw) => self.capture_key(&raw, KeyState::Down),
-            Event::XinputRawKeyRelease(raw) => self.capture_key(&raw, KeyState::Up),
-            Event::XinputRawButtonPress(raw) => self.capture_button(&raw, KeyState::Down),
-            Event::XinputRawButtonRelease(raw) => self.capture_button(&raw, KeyState::Up),
+            Event::XinputRawKeyPress(raw) => self.capture_key(&raw, KeyState::Down, sequence),
+            Event::XinputRawKeyRelease(raw) => self.capture_key(&raw, KeyState::Up, sequence),
+            Event::XinputRawButtonPress(raw) => self.capture_button(&raw, KeyState::Down, sequence),
+            Event::XinputRawButtonRelease(raw) => self.capture_button(&raw, KeyState::Up, sequence),
             _ => None,
         }
     }
@@ -479,6 +920,7 @@ impl X11Capture {
         &mut self,
         raw: &xinput::RawKeyPressEvent,
         state: KeyState,
+        sequence: u64,
     ) -> Option<CapturedEvent> {
         self.last_event_deviceid = raw.deviceid;
         if self.is_own_injection(raw.deviceid, raw.sourceid) {
@@ -486,27 +928,35 @@ impl X11Capture {
             return None;
         }
         let keycode = u8::try_from(raw.detail).ok()?;
-        let (swallow, action) = self.hotkeys.edge(keycode, state.is_down());
+        let (swallow, action) = hotkey_edge(
+            &mut self.hotkeys,
+            self.hotkey_fence,
+            sequence,
+            keycode,
+            state.is_down(),
+        );
         if let Some(action) = action {
             if action == 0 {
                 self.emergencies += 1;
                 self.fire_emergency();
                 return Some(CapturedEvent::Emergency);
             }
-            return Some(CapturedEvent::HotkeyPressed(action));
+            return timed_hotkey(action, self.clock, sequence, raw.time, Instant::now());
         }
         if swallow {
             return None;
         }
-        self.ledger.note_key(keycode, state);
         let key = x11_keycode_to_hid_key(keycode)?;
-        Some(CapturedEvent::Input(InputEvent::Key { key, state }))
+        let event = discrete_event(self.grab_epoch, sequence, InputEvent::Key { key, state })?;
+        self.ledger.note_key(keycode, state);
+        Some(event)
     }
 
     fn capture_button(
         &mut self,
         raw: &xinput::RawButtonPressEvent,
         state: KeyState,
+        sequence: u64,
     ) -> Option<CapturedEvent> {
         self.last_event_deviceid = raw.deviceid;
         if self.is_own_injection(raw.deviceid, raw.sourceid) {
@@ -518,14 +968,19 @@ impl X11Capture {
             if !state.is_down() {
                 return None;
             }
-            return Some(CapturedEvent::Input(InputEvent::Scroll { h120, v120 }));
+            return discrete_event(self.grab_epoch, sequence, InputEvent::Scroll { h120, v120 });
         }
         let kind = x11_button_to_mouse_button(button)?;
+        let event = discrete_event(
+            self.grab_epoch,
+            sequence,
+            InputEvent::Button {
+                button: kind,
+                state,
+            },
+        )?;
         self.ledger.note_button(button, state);
-        Some(CapturedEvent::Input(InputEvent::Button {
-            button: kind,
-            state,
-        }))
+        Some(event)
     }
 
     /// Warps the cursor back to the screen centre when it drifted too far.
@@ -557,7 +1012,8 @@ impl X11Capture {
     /// stuck after we stop forwarding.
     fn fire_emergency(&mut self) {
         self.release_ledger();
-        self.ungrab();
+        // The emitted emergency drives checked terminal cleanup and retries any failure.
+        let _ = self.ungrab();
     }
 
     /// Pushes a release for every held key and button, best effort, then forgets
@@ -606,7 +1062,10 @@ impl Drop for X11Capture {
     /// grab held by a client when its connection closes, so a crash cannot leave
     /// the pointer frozen.
     fn drop(&mut self) {
-        self.ungrab();
+        // Closing this client is best effort, not a positive restoration receipt.
+        let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+        let _ = self.conn.flush();
     }
 }
 
@@ -720,5 +1179,348 @@ fn to_timespec(timeout: Duration) -> rustix::event::Timespec {
     rustix::event::Timespec {
         tv_sec: timeout.as_secs() as rustix::event::Secs,
         tv_nsec: u64::from(timeout.subsec_nanos()) as rustix::event::Nsecs,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn isolated_native_test() -> Option<std::sync::MutexGuard<'static, ()>> {
+    if std::env::var("BIFROST_X11_TEST_ISOLATED").as_deref() != Ok("1") {
+        eprintln!("requires BIFROST_X11_TEST_ISOLATED=1 under isolated Xvfb");
+        return None;
+    }
+    static OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    Some(OWNER.lock().unwrap_or_else(|error| error.into_inner()))
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use input_model::{HidKey, MouseButton};
+
+    #[test]
+    fn raw_keyboard_and_pointer_edges_reach_native_filter_without_forwarding() {
+        let Some(_native) = isolated_native_test() else {
+            return;
+        };
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xtest::ConnectionExt as _;
+        struct ResetSynthetic(x11rb::rust_connection::RustConnection);
+        impl Drop for ResetSynthetic {
+            fn drop(&mut self) {
+                let _ = self
+                    .0
+                    .xtest_fake_input(xproto::KEY_RELEASE_EVENT, 38, 0, 0, 0, 0, 0);
+                let _ = self
+                    .0
+                    .xtest_fake_input(xproto::BUTTON_RELEASE_EVENT, 1, 0, 0, 0, 0, 0);
+                let _ = self.0.flush();
+            }
+        }
+        let mut capture = X11Capture::new(CaptureKind::Remote).unwrap();
+        let (injector, _) = x11rb::connect(None).unwrap();
+        let injector = ResetSynthetic(injector);
+        capture.grab().unwrap();
+        for (press, release, detail) in [
+            (xproto::KEY_PRESS_EVENT, xproto::KEY_RELEASE_EVENT, 38),
+            (xproto::BUTTON_PRESS_EVENT, xproto::BUTTON_RELEASE_EVENT, 1),
+        ] {
+            let before = capture.injected_events_filtered();
+            for kind in [press, release] {
+                injector
+                    .0
+                    .xtest_fake_input(kind, detail, 0, 0, 0, 0, 0)
+                    .unwrap()
+                    .check()
+                    .unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while capture.injected_events_filtered() - before < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "native raw edge subscription did not deliver"
+                );
+                assert!(
+                    capture.next_event(Some(Duration::ZERO)).unwrap().is_none(),
+                    "synthetic input must never be forwarded"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn checked_ungrab_preserves_failed_native_grab_evidence() {
+        let Some(_native) = isolated_native_test() else {
+            return;
+        };
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+        let mut capture = X11Capture::new(CaptureKind::Remote).unwrap();
+        let window = capture.conn.generate_id().unwrap();
+        capture
+            .conn
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                capture.root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        capture.grab().unwrap();
+        capture.ungrab().unwrap();
+        assert!(!capture.grab_active());
+        assert!(capture.grab_epoch.is_none());
+        capture.grab().unwrap();
+        let epoch = capture.grab_epoch;
+        let (killer, _) = x11rb::connect(None).unwrap();
+        killer.kill_client(window).unwrap().check().unwrap();
+        assert!(capture.ungrab().is_err());
+        assert!(capture.grab_active());
+        assert_eq!(capture.grab_epoch, epoch);
+        assert!(capture.ungrab().is_err());
+        assert!(capture.grab_active());
+    }
+
+    #[test]
+    fn complete_local_click_and_key_tap_before_grabs_never_replay_remotely() {
+        // The pointer grab is processed first; keys stay local until the keyboard grab.
+        let epoch = Some(GrabEpoch {
+            pointer: 65_535,
+            keyboard: 65_537,
+        });
+        let key = HidKey::keyboard(0x04);
+        let local = [
+            (
+                65_534,
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: KeyState::Down,
+                },
+            ),
+            (
+                65_534,
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: KeyState::Up,
+                },
+            ),
+            (
+                65_536,
+                InputEvent::Key {
+                    key,
+                    state: KeyState::Down,
+                },
+            ),
+            (
+                65_536,
+                InputEvent::Key {
+                    key,
+                    state: KeyState::Up,
+                },
+            ),
+            (65_534, InputEvent::Scroll { h120: 0, v120: 120 }),
+        ];
+        for (sequence, event) in local {
+            assert_eq!(discrete_event(epoch, sequence, event), None);
+        }
+        for (sequence, input) in [
+            (
+                65_535,
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: KeyState::Down,
+                },
+            ),
+            (
+                65_535,
+                InputEvent::Button {
+                    button: MouseButton::Left,
+                    state: KeyState::Up,
+                },
+            ),
+            (
+                65_537,
+                InputEvent::Key {
+                    key,
+                    state: KeyState::Down,
+                },
+            ),
+            (
+                65_537,
+                InputEvent::Key {
+                    key,
+                    state: KeyState::Up,
+                },
+            ),
+        ] {
+            assert_eq!(
+                discrete_event(epoch, sequence, input),
+                Some(CapturedEvent::Input(input))
+            );
+            let later = Some(GrabEpoch {
+                pointer: 65_540,
+                keyboard: 65_541,
+            });
+            assert_eq!(discrete_event(later, sequence, input), None);
+        }
+    }
+
+    #[test]
+    fn crossing_local_down_and_suppressed_up_requires_rollback_even_if_finally_empty() {
+        let snapshot = GrabEpoch {
+            pointer: 10,
+            keyboard: 11,
+        };
+        let grab = GrabEpoch {
+            pointer: 20,
+            keyboard: 21,
+        };
+        let end = GrabEpoch {
+            pointer: 30,
+            keyboard: 31,
+        };
+        for keyboard in [false, true] {
+            let mut crossing = AdmissionCrossing::new(snapshot, grab);
+            let mut edge = RawEdge {
+                keyboard,
+                detail: 1,
+                down: true,
+                deviceid: 2,
+                sourceid: 3,
+            };
+            crossing.note(15, edge);
+            edge.down = false;
+            crossing.note(25, edge);
+            assert!(
+                crossing.crossed(),
+                "a suppressed up cannot undo a previously local down"
+            );
+            assert!(
+                suppressed_between(grab, end, 25, keyboard),
+                "rollback must replay this up locally"
+            );
+            assert!(
+                !suppressed_between(grab, end, 15, keyboard),
+                "never replay the local down"
+            );
+            assert!(
+                !suppressed_between(grab, end, 31, keyboard),
+                "post-ungrab events are already local"
+            );
+            let mut completed = AdmissionCrossing::new(snapshot, grab);
+            edge.down = true;
+            completed.note(15, edge);
+            edge.down = false;
+            completed.note(16, edge);
+            assert!(
+                !completed.crossed(),
+                "a complete local tap before grab is not a crossing"
+            );
+            let mut fresh = AdmissionCrossing::new(snapshot, grab);
+            edge.down = true;
+            fresh.note(25, edge);
+            assert!(
+                !fresh.crossed(),
+                "fresh suppressed input must stay deliverable"
+            );
+        }
+        let partial = GrabEpoch {
+            pointer: 20,
+            keyboard: u64::MAX,
+        };
+        assert!(suppressed_between(partial, end, 25, false));
+        assert!(
+            !suppressed_between(partial, end, 25, true),
+            "refused keyboard grab never suppressed keys"
+        );
+    }
+
+    #[test]
+    fn switch_uses_original_native_issuance_through_wrap_and_delayed_receipt() {
+        let start = Instant::now();
+        let clock = ServerClock {
+            sequence: 100,
+            time: u32::MAX - 50,
+            sent_at: start,
+        };
+        let expected = start + Duration::from_millis(99);
+        for delay in [101, 200, 498] {
+            assert_eq!(
+                timed_hotkey(
+                    1,
+                    Some(clock),
+                    101,
+                    49,
+                    start + Duration::from_millis(delay)
+                ),
+                Some(CapturedEvent::HotkeyPressed(1, expected))
+            );
+        }
+        assert_eq!(
+            timed_hotkey(1, Some(clock), 101, 49, start + Duration::from_millis(499)),
+            None
+        );
+        assert_eq!(
+            timed_hotkey(1, None, 101, 49, start + Duration::from_millis(101)),
+            None
+        );
+        assert_eq!(
+            clock.issued_at(99, 49, start + Duration::from_millis(101)),
+            None
+        );
+        assert_eq!(
+            clock.issued_at(101, 49, start + Duration::from_secs(61)),
+            None
+        );
+        assert_eq!(
+            clock.issued_at(101, 49, start + Duration::from_millis(98)),
+            None
+        );
+        assert_eq!(
+            clock.issued_at(101, u32::MAX - 51, start + Duration::from_millis(101)),
+            None
+        );
+    }
+
+    #[test]
+    fn native_issuance_precedes_cancellation_and_old_config_edges_cannot_rearm() {
+        let start = Instant::now();
+        let clock = ServerClock {
+            sequence: 10,
+            time: 1000,
+            sent_at: start,
+        };
+        let cancelled_at = start + Duration::from_millis(100);
+        let Some(CapturedEvent::HotkeyPressed(1, issued_at)) =
+            timed_hotkey(1, Some(clock), 11, 1050, start + Duration::from_millis(200))
+        else {
+            panic!("fresh native timestamp must be preserved")
+        };
+        assert!(
+            issued_at < cancelled_at,
+            "queued receipt must not cross the cancellation watermark"
+        );
+        let mut hotkeys = crate::hotkeys::HotkeyState::default();
+        hotkeys.bindings[1] = Some(crate::hotkeys::Hotkey {
+            keycode: 38,
+            modifiers: 0,
+        });
+        assert_eq!(hotkey_edge(&mut hotkeys, 20, 19, 38, true), (false, None));
+        assert_eq!(hotkey_edge(&mut hotkeys, 20, 19, 38, false), (false, None));
+        assert_eq!(hotkey_edge(&mut hotkeys, 20, 20, 38, true), (true, Some(1)));
+        assert_eq!(hotkey_edge(&mut hotkeys, 20, 20, 38, false), (true, None));
+        assert!(matches!(
+            timed_hotkey(2, None, 21, 0, start),
+            Some(CapturedEvent::HotkeyPressed(2, _))
+        ));
     }
 }

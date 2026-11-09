@@ -257,6 +257,12 @@ fn player_actions_target_the_exact_session_and_never_change_local_playback() {
     });
     assert!(vm.audio.pending);
     vm.apply(event(Msg::AudioStatus(snapshot(6))));
+    assert!(
+        vm.audio.pending,
+        "running telemetry is not a media-command observation"
+    );
+    let (read_id, _) = vm.take_outgoing().pop().unwrap();
+    vm.apply(support::answer(read_id, Msg::AudioStatus(snapshot(6))));
     assert!(!vm.audio.pending);
     let gain = audio::player_request(
         vm.audio.status.as_ref().unwrap(),
@@ -381,14 +387,23 @@ fn normal_permission_and_gain_edits_preserve_group_policy_through_apply_and_stat
         vm.audio_action(&AudioAction::EditConfig(Box::new(draft.clone())), now);
         assert_eq!(vm.audio.draft.group_id_override, group_id_override);
         vm.audio_action(&AudioAction::ApplyConfig, now);
-        let (_, message) = vm.take_outgoing().pop().unwrap();
+        let (id, message) = vm.take_outgoing().pop().unwrap();
         let Msg::SetAudio(request) = message else {
             panic!("expected SetAudio");
         };
         assert_eq!(request.config, Some(draft.clone()));
         status.revision += 1;
         status.config = request.config;
-        vm.apply(event(Msg::AudioStatus(status)));
+        vm.audio_result(
+            id,
+            audio::AudioRequest::Mutation,
+            ipc::OpResult {
+                ok: true,
+                ..Default::default()
+            },
+        );
+        let (read_id, _) = vm.take_outgoing().pop().unwrap();
+        vm.apply(support::answer(read_id, Msg::AudioStatus(status)));
         assert_eq!(vm.audio.draft, draft);
         assert!(!vm.audio.dirty);
         assert!(!vm.audio.pending);
@@ -426,7 +441,7 @@ fn manual_source_group_draft_survives_a_different_automatic_listener_group_statu
 }
 
 #[test]
-fn unsupported_and_timeout_rollback_pending_without_claiming_success() {
+fn unsupported_and_timeout_release_pending_without_losing_unsaved_draft() {
     let mut vm = view();
     vm.apply(event(Msg::AudioStatus(snapshot(5))));
     let now = Instant::now();
@@ -455,7 +470,7 @@ fn unsupported_and_timeout_rollback_pending_without_claiming_success() {
         ..Default::default()
     });
     assert!(!vm.audio.available && !vm.audio.pending);
-    assert!(!vm.audio.draft.background_mute);
+    assert!(vm.audio.draft.background_mute && vm.audio.dirty);
     assert!(vm.audio.error.is_some());
     vm.apply(event(Msg::AudioStatus(snapshot(6))));
     vm.audio_action(&AudioAction::StopSystemAudio, now);
@@ -1777,4 +1792,249 @@ fn mode_meaning_tooltip_wraps_inside_the_actual_player_client() {
             output.drop_without_applying_deltas();
         }
     }
+}
+
+#[test]
+fn player_ack_and_observation_are_separate_and_never_erase_advanced_drafts() {
+    for operation in ["gain", "mute", "seek", "play"] {
+        for ok in [false, true] {
+            let mut vm = view();
+            vm.apply(event(Msg::AudioStatus(seekable_snapshot(5))));
+            let mut draft = vm.audio.draft.clone();
+            draft.output_device = "unsaved-output".into();
+            vm.audio_action(
+                &AudioAction::EditConfig(Box::new(draft.clone())),
+                Instant::now(),
+            );
+            let stream_id = "01".repeat(16);
+            let action = match operation {
+                "gain" => AudioPlayerAction::SetGain {
+                    stream_id,
+                    percent: 20,
+                },
+                "mute" => AudioPlayerAction::SetMuted {
+                    stream_id,
+                    muted: false,
+                },
+                "seek" => AudioPlayerAction::Seek {
+                    stream_id,
+                    target: vm.audio_player.cards[0].seek.unwrap(),
+                    position_ms: 4_000,
+                },
+                _ => AudioPlayerAction::PlayPause(stream_id),
+            };
+            vm.audio_action(&AudioAction::Player(action), Instant::now());
+            let (id, _) = vm.take_outgoing().pop().unwrap();
+            vm.apply(event(Msg::AudioStatus(seekable_snapshot(6))));
+            assert!(vm.audio.pending, "telemetry must not ACK {operation}");
+            assert_eq!(vm.audio.draft, draft);
+            vm.apply(support::answer(
+                id,
+                Msg::OpResult(ipc::OpResult {
+                    ok,
+                    error_code: if ok {
+                        String::new()
+                    } else {
+                        "AUDIO_STALE_MEDIA".into()
+                    },
+                }),
+            ));
+            if ok {
+                let (read_id, _) = vm.take_outgoing().pop().unwrap();
+                let mut observed = seekable_snapshot(6);
+                if operation == "gain" {
+                    observed.sessions[0].gain_percent = 20;
+                }
+                vm.apply(support::answer(read_id, Msg::AudioStatus(observed)));
+            } else {
+                assert!(
+                    vm.audio.error.is_some(),
+                    "correlated rejection remains visible"
+                );
+            }
+            assert!(!vm.audio.pending);
+            assert!(vm.audio.dirty);
+            assert_eq!(vm.audio.draft, draft, "{operation}, ok={ok}");
+        }
+    }
+}
+
+#[test]
+fn gain_keeps_one_request_and_the_latest_desired_value_until_reconciliation() {
+    let mut vm = view();
+    vm.apply(event(Msg::AudioStatus(snapshot(5))));
+    let gain = |percent| {
+        AudioAction::Player(AudioPlayerAction::SetGain {
+            stream_id: "01".repeat(16),
+            percent,
+        })
+    };
+    vm.audio_action(&gain(60), Instant::now());
+    let (first_id, first) = vm.take_outgoing().pop().unwrap();
+    assert!(matches!(first, Msg::SetAudioPeerGain(value) if value.gain_percent == 60));
+    for percent in [50, 40, 20] {
+        vm.audio_action(&gain(percent), Instant::now());
+    }
+    assert!(vm.take_outgoing().is_empty());
+    assert_eq!(vm.audio_player.cards[0].gain_percent, 65);
+    assert_eq!(vm.audio_player.cards[0].desired_gain_percent, Some(20));
+    vm.audio_action(
+        &AudioAction::Player(AudioPlayerAction::SetMuted {
+            stream_id: "01".repeat(16),
+            muted: true,
+        }),
+        Instant::now(),
+    );
+    let (mute_id, _) = vm.take_outgoing().pop().unwrap();
+    vm.apply(support::answer(
+        mute_id,
+        Msg::OpResult(ipc::OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    vm.take_outgoing();
+    assert!(vm.audio.pending, "urgent mute must not steal gain's ACK");
+    vm.apply(support::answer(
+        first_id,
+        Msg::OpResult(ipc::OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    let (read_id, _) = vm.take_outgoing().pop().unwrap();
+    let mut observed = snapshot(6);
+    observed.sessions[0].gain_percent = 60;
+    vm.apply(support::answer(read_id, Msg::AudioStatus(observed)));
+    let outgoing = vm.take_outgoing();
+    assert_eq!(outgoing.len(), 1);
+    assert!(matches!(&outgoing[0].1, Msg::SetAudioPeerGain(value)
+        if value.gain_percent == 20 && value.expected_revision == 6 && value.muted));
+    let second_id = outgoing[0].0;
+    vm.apply(support::answer(
+        second_id,
+        Msg::OpResult(ipc::OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    let (read_id, _) = vm.take_outgoing().pop().unwrap();
+    let mut observed = snapshot(7);
+    observed.sessions[0].gain_percent = 20;
+    vm.apply(support::answer(read_id, Msg::AudioStatus(observed)));
+    assert!(!vm.audio.pending);
+    assert_eq!(vm.audio_player.cards[0].gain_percent, 20);
+    assert_eq!(vm.audio_player.cards[0].desired_gain_percent, None);
+    assert!(vm.take_outgoing().is_empty());
+}
+
+#[test]
+fn receiving_failure_retains_the_selected_task_and_explicit_discard_restores_config() {
+    let mut vm = view();
+    vm.apply(event(Msg::AudioStatus(sharing_snapshot(
+        5,
+        ipc::AudioRole::Source,
+        false,
+    ))));
+    let original = vm.audio.draft.clone();
+    let mut draft = original.clone();
+    draft.role = ipc::AudioRole::Listener as i32;
+    draft.udp_port = 47904;
+    vm.audio_action(
+        &AudioAction::EditConfig(Box::new(draft.clone())),
+        Instant::now(),
+    );
+    vm.audio_action(&AudioAction::Receive(true), Instant::now());
+    let (id, _) = vm.take_outgoing().pop().unwrap();
+    vm.apply(support::answer(
+        id,
+        Msg::OpResult(ipc::OpResult {
+            ok: false,
+            error_code: "AUDIO_DEVICE_UNAVAILABLE".into(),
+        }),
+    ));
+    assert_eq!(vm.audio.draft, draft);
+    assert!(!vm.audio.sharing_requested(ipc::AudioRole::Listener));
+    assert!(!vm.audio.sharing_requested(ipc::AudioRole::Source));
+    vm.audio_action(&AudioAction::DiscardConfig, Instant::now());
+    assert_eq!(vm.audio.draft, original);
+    assert!(!vm.audio.dirty);
+}
+
+#[test]
+fn delayed_post_ack_read_reconciles_without_rolling_back_newer_push_state() {
+    let mut vm = view();
+    vm.apply(event(Msg::AudioStatus(snapshot(5))));
+    vm.audio_action(
+        &AudioAction::Player(AudioPlayerAction::PlayPause("01".repeat(16))),
+        Instant::now(),
+    );
+    let (id, _) = vm.take_outgoing().pop().unwrap();
+    vm.apply(support::answer(
+        id,
+        Msg::OpResult(ipc::OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    let (read_id, _) = vm.take_outgoing().pop().unwrap();
+    vm.apply(event(Msg::AudioStatus(snapshot(7))));
+    assert!(vm.audio.pending);
+    vm.apply(support::answer(read_id, Msg::AudioStatus(snapshot(6))));
+    assert!(!vm.audio.pending);
+    assert_eq!(vm.audio.status.as_ref().unwrap().revision, 7);
+}
+
+#[test]
+fn gain_return_to_confirmed_value_survives_telemetry_before_the_pending_mutation() {
+    let mut vm = view();
+    vm.apply(event(Msg::AudioStatus(snapshot(5))));
+    let gain = |percent| {
+        AudioAction::Player(AudioPlayerAction::SetGain {
+            stream_id: "01".repeat(16),
+            percent,
+        })
+    };
+    vm.audio_action(&gain(60), Instant::now());
+    let (first_id, _) = vm.take_outgoing().pop().unwrap();
+    vm.audio_action(&gain(65), Instant::now());
+    assert!(vm.take_outgoing().is_empty());
+    vm.apply(event(Msg::AudioStatus(snapshot(6))));
+    assert!(vm.audio.pending);
+    assert_eq!(vm.audio_player.cards[0].gain_percent, 65);
+    assert_eq!(vm.audio_player.cards[0].desired_gain_percent, Some(65));
+    vm.apply(support::answer(
+        first_id,
+        Msg::OpResult(ipc::OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    let (read_id, _) = vm.take_outgoing().pop().unwrap();
+    let mut observed = snapshot(7);
+    observed.sessions[0].gain_percent = 60;
+    vm.apply(support::answer(read_id, Msg::AudioStatus(observed)));
+    let outgoing = vm.take_outgoing();
+    assert_eq!(
+        outgoing.len(),
+        1,
+        "returning to the original value still needs a final mutation"
+    );
+    assert!(matches!(&outgoing[0].1, Msg::SetAudioPeerGain(value)
+        if value.gain_percent == 65 && value.expected_revision == 7));
+    assert_eq!(vm.audio_player.cards[0].gain_percent, 60);
+    assert_eq!(vm.audio_player.cards[0].desired_gain_percent, Some(65));
+    vm.apply(support::answer(
+        outgoing[0].0,
+        Msg::OpResult(ipc::OpResult {
+            ok: true,
+            ..Default::default()
+        }),
+    ));
+    let (read_id, _) = vm.take_outgoing().pop().unwrap();
+    vm.apply(support::answer(read_id, Msg::AudioStatus(snapshot(8))));
+    assert!(!vm.audio.pending);
+    assert_eq!(vm.audio_player.cards[0].gain_percent, 65);
+    assert_eq!(vm.audio_player.cards[0].desired_gain_percent, None);
+    assert!(vm.take_outgoing().is_empty());
 }

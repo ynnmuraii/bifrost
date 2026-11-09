@@ -28,6 +28,38 @@ fn contents(ui: &mut egui::Ui, pal: &Palette, vm: &ViewModel, actions: &mut Vec<
     }
     let lang = vm.look.language;
     let audio = &vm.audio;
+    let local_dirty = ui.ctx().data(|data| {
+        [Key::AudioUdpPort, Key::AudioDebounce, Key::AudioRamp]
+            .iter()
+            .any(|key| {
+                data.get_temp::<NumericDraft>(egui::Id::new(("audio-number", key)))
+                    .is_some_and(|draft| draft.text.parse::<u32>().ok() != Some(draft.value))
+            })
+            || data
+                .get_temp::<String>(egui::Id::new("audio-group-input"))
+                .is_some_and(|group| parse_hex(&group, 16).as_ref() != Some(&audio.draft.group_id))
+    });
+    if audio.dirty || local_dirty {
+        widgets::wrapped(
+            ui,
+            text(lang, Key::AudioUnsaved),
+            12.0,
+            super::theme::fam::sans_medium(),
+            pal.accent_ink,
+        );
+    }
+    if (audio.dirty || local_dirty)
+        && widgets::small_button(ui, pal, text(lang, Key::AudioDiscard), !audio.pending).clicked()
+    {
+        ui.ctx().data_mut(|data| {
+            for key in [Key::AudioUdpPort, Key::AudioDebounce, Key::AudioRamp] {
+                data.remove::<NumericDraft>(egui::Id::new(("audio-number", key)));
+            }
+            data.remove::<String>(egui::Id::new("audio-group-input"));
+        });
+        actions.push(Action::Audio(AudioAction::DiscardConfig));
+        return;
+    }
     let editable = audio.available && audio.status.is_some() && !audio.pending;
     let mut config = audio.draft.clone();
     let mut apply = false;
@@ -582,6 +614,62 @@ fn edit_group(config: &mut ipc::AudioConfig, bytes: Vec<u8>) {
     config.group_id = bytes;
 }
 
+#[derive(Clone)]
+struct NumericDraft {
+    text: String,
+    value: u32,
+}
+
+/// Invalid text stays editable on blur, never grows the row, and never changes the draft.
+fn number_field(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    lang: Lang,
+    key: Key,
+    value: &mut u32,
+    min: u32,
+    max: u32,
+) -> bool {
+    let id = egui::Id::new(("audio-number", key));
+    let mut draft = ui
+        .data(|data| data.get_temp::<NumericDraft>(id))
+        .filter(|draft| draft.value == *value)
+        .unwrap_or_else(|| NumericDraft {
+            text: value.to_string(),
+            value: *value,
+        });
+    let response = ui.add_sized(
+        [112.0_f32.min(ui.available_width()), 26.0],
+        egui::TextEdit::singleline(&mut draft.text)
+            .id(id)
+            .char_limit(64)
+            .clip_text(true),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), text(lang, key))
+    });
+    let parsed = draft
+        .text
+        .parse::<u32>()
+        .ok()
+        .filter(|number| (min..=max).contains(number));
+    if let Some(number) = parsed {
+        *value = number;
+        draft.value = number;
+    } else {
+        ui.colored_label(
+            pal.accent_ink,
+            ui_text::fill_named(
+                lang,
+                Key::AudioInvalidNumber,
+                &[("min", &min), ("max", &max)],
+            ),
+        );
+    }
+    ui.data_mut(|data| data.insert_temp(id, draft));
+    parsed.is_some()
+}
+
 fn advanced(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -591,7 +679,7 @@ fn advanced(
     let lang = vm.look.language;
     let mut valid_group = true;
     setting(ui, pal, text(lang, Key::AudioGroup), |ui| {
-        let id = ui.id().with("audio-group-input");
+        let id = egui::Id::new("audio-group-input");
         let mut group = ui
             .data_mut(|data| data.get_temp::<String>(id))
             .unwrap_or_else(|| hex(&config.group_id));
@@ -611,34 +699,37 @@ fn advanced(
         }
     });
     setting(ui, pal, text(lang, Key::AudioUdpPort), |ui| {
-        ui.add(egui::DragValue::new(&mut config.udp_port).range(1..=65535))
-            .widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::DragValue,
-                    ui.is_enabled(),
-                    text(lang, Key::AudioUdpPort),
-                )
-            });
+        valid_group &= number_field(
+            ui,
+            pal,
+            lang,
+            Key::AudioUdpPort,
+            &mut config.udp_port,
+            1,
+            65535,
+        );
     });
     setting(ui, pal, text(lang, Key::AudioDebounce), |ui| {
-        ui.add(egui::DragValue::new(&mut config.focus_debounce_ms).range(100..=2000))
-            .widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::DragValue,
-                    ui.is_enabled(),
-                    text(lang, Key::AudioDebounce),
-                )
-            });
+        valid_group &= number_field(
+            ui,
+            pal,
+            lang,
+            Key::AudioDebounce,
+            &mut config.focus_debounce_ms,
+            100,
+            2000,
+        );
     });
     setting(ui, pal, text(lang, Key::AudioRamp), |ui| {
-        ui.add(egui::DragValue::new(&mut config.focus_ramp_ms).range(20..=1000))
-            .widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::DragValue,
-                    ui.is_enabled(),
-                    text(lang, Key::AudioRamp),
-                )
-            });
+        valid_group &= number_field(
+            ui,
+            pal,
+            lang,
+            Key::AudioRamp,
+            &mut config.focus_ramp_ms,
+            20,
+            1000,
+        );
     });
     setting(ui, pal, text(lang, Key::AudioBackgroundGain), |ui| {
         let response = slider(
@@ -1081,5 +1172,89 @@ mod tests {
         assert_eq!(parse_hex("zz112233445566778899aabbccddeeff", 16), None);
         assert_eq!(parse_hex("я".repeat(16).as_str(), 16), None);
         assert_eq!(hex(&[0, 15, 128, 255]), "000f80ff");
+    }
+}
+
+#[cfg(test)]
+mod number_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_text_is_bounded_invalid_on_blur_and_tracks_external_config() {
+        for lang in [Lang::Ru, Lang::En] {
+            let ctx = egui::Context::default();
+            crate::ui::install_fonts(&ctx);
+            let pal = Palette::of(crate::gui_settings::Theme::Light);
+            let id = egui::Id::new(("audio-number", Key::AudioUdpPort));
+            let mut value = 47903;
+            let mut valid = true;
+            let frame = |value: &mut u32, valid: &mut bool, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 150.0),
+                        )),
+                        focused: true,
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        *valid = number_field(ui, &pal, lang, Key::AudioUdpPort, value, 1, 65535);
+                    },
+                )
+            };
+            frame(&mut value, &mut valid, Vec::new()).drop_without_applying_deltas();
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            let select_all = egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            };
+            frame(
+                &mut value,
+                &mut valid,
+                vec![
+                    select_all,
+                    egui::Event::Text(format!("not-a-port-{}", "9".repeat(70))),
+                ],
+            )
+            .drop_without_applying_deltas();
+            assert!(!valid);
+            assert_eq!(value, 47903);
+            let response = ctx.read_response(id).unwrap();
+            assert!(response.rect.width() <= 112.5);
+            ctx.memory_mut(|memory| memory.surrender_focus(id));
+            let output = frame(&mut value, &mut valid, Vec::new());
+            assert!(!valid, "blur must not silently restore a valid number");
+            assert!(ctx
+                .data(|data| data.get_temp::<NumericDraft>(id))
+                .unwrap()
+                .text
+                .starts_with("not-a-port"));
+            let error = ui_text::fill_named(
+                lang,
+                Key::AudioInvalidNumber,
+                &[("min", &1), ("max", &65535)],
+            );
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == error)));
+            output.drop_without_applying_deltas();
+            value = 47905;
+            frame(&mut value, &mut valid, Vec::new()).drop_without_applying_deltas();
+            assert!(valid);
+            assert_eq!(
+                ctx.data(|data| data.get_temp::<NumericDraft>(id))
+                    .unwrap()
+                    .text,
+                "47905"
+            );
+        }
     }
 }

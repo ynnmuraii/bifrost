@@ -368,6 +368,10 @@ impl Win {
         self.last_clipboard_write_sequence = Some(sequence);
     }
 
+    pub fn physical_pressed(&self) -> Option<input_model::PressedState> {
+        self.capture.as_ref()?.physical_pressed()
+    }
+
     pub fn begin_capture(
         &mut self,
         kind: CaptureKind,
@@ -387,8 +391,13 @@ impl Win {
         }
         match &self.capture {
             Some(capture) => {
+                if capture.mode() != kind {
+                    self.repeats.clear();
+                }
                 capture.set_capture_injected(capture_injected);
-                capture.set_mode(kind);
+                if !capture.try_set_mode(kind) {
+                    return Err("physical input is held/unavailable or an emergency is pending; capture commit refused".to_owned());
+                }
                 // Idempotent re-arm (audit F11): the FSM asks for the `Remote` capture right
                 // after the `Temporary` one, without a trip through `end_capture`, so this is
                 // the branch a live transition takes. Skipping the seed here left `next_event`
@@ -404,13 +413,16 @@ impl Win {
             }
             None => {
                 let config = CaptureConfig {
-                    mode: kind,
+                    mode: CaptureKind::Observe,
                     emergency: self.emergency,
                     capture_injected,
                     ..CaptureConfig::default()
                 };
                 let capture = Capture::start(config).map_err(|error| capture_error(&error))?;
                 self.seed_source_motion()?;
+                if !capture.try_set_mode(kind) {
+                    return Err("physical input is held/unavailable or an emergency is pending; capture commit refused".to_owned());
+                }
                 self.capture = Some(capture);
             }
         }
@@ -436,13 +448,14 @@ impl Win {
         Ok(())
     }
 
-    pub fn end_capture(&mut self) -> Result<Released, String> {
+    pub fn end_capture(&mut self, release_injected: bool) -> Result<Released, String> {
         self.report_capture_stats(true);
         self.cursor_veil.release();
         // Keep the observe hook alive for global actions outside a lease.
-        if let Some(capture) = &self.capture {
-            capture.set_mode(CaptureKind::Observe);
-        }
+        let capture_restored = self
+            .capture
+            .as_ref()
+            .is_none_or(|capture| capture.set_mode(CaptureKind::Observe));
         self.source_motion = None;
         self.source_monitors.clear();
         self.pending_source_seed = false;
@@ -451,8 +464,23 @@ impl Win {
         // The keys held now are released locally; their ups never reach this filter, and a
         // stale pressed set would eat the next real press.
         self.repeats.clear();
-        self.disarm_detector();
-        Ok(self.release_session())
+        // Attempt synthetic release even if restoring local capture failed.
+        let released = if release_injected {
+            self.release_session()
+        } else {
+            Ok(Released::default())
+        };
+        if !capture_restored {
+            return Err(match released {
+                Ok(_) => "cannot restore local Windows capture".to_owned(),
+                Err(error) => format!("cannot restore local Windows capture; {error}"),
+            });
+        }
+        let released = released?;
+        if let Some(capture) = &self.capture {
+            capture.acknowledge_terminal();
+        }
+        Ok(released)
     }
 
     /// Stops watching for physical input: the lease that made it meaningful is over.
@@ -528,26 +556,28 @@ impl Win {
             .map(|capture| capture.stats().edges.since(self.remote_hook_baseline))
     }
 
-    pub fn release_session(&mut self) -> Released {
+    pub fn release_session(&mut self) -> Result<Released, String> {
         self.cursor_veil.release();
         // `ReleaseSession` ends the receiver side of a lease as surely as `EndCapture`.
         self.disarm_detector();
         let keys_before = self.injector.ledger().key_count();
         let buttons_before = self.injector.ledger().button_count();
         let status = self.injector.release_all();
-        if !status.is_complete() {
-            tracing::warn!(%status, "some synthetic state stayed pressed");
-        }
-        // What the ledger kept afterwards is what a later attempt has to retry.
-        let keys_after = self.injector.ledger().key_count();
-        let buttons_after = self.injector.ledger().button_count();
-        Released {
-            keys: keys_before.saturating_sub(keys_after) as u32,
-            buttons: buttons_before.saturating_sub(buttons_after) as u32,
-        }
+        // The native ledger retains every unapplied release for a later attempt.
+        complete_release(
+            status,
+            keys_before,
+            buttons_before,
+            self.injector.ledger().key_count(),
+            self.injector.ledger().button_count(),
+        )
     }
 
-    pub fn release_keys(&mut self, keys: &[HidKey], buttons: &[MouseButton]) -> Released {
+    pub fn release_keys(
+        &mut self,
+        keys: &[HidKey],
+        buttons: &[MouseButton],
+    ) -> Result<Released, String> {
         let mut events = Vec::with_capacity(keys.len() + buttons.len());
         events.extend(keys.iter().map(|key| InputEvent::Key {
             key: *key,
@@ -558,13 +588,13 @@ impl Win {
             state: input_model::KeyState::Up,
         }));
         let status = self.injector.inject(&events);
-        if !status.is_complete() {
-            tracing::warn!(%status, "recovery release was not fully applied");
+        if !status.is_complete() || status.error.is_some() || status.applied != events.len() {
+            return Err("native recovery release was not fully applied".to_owned());
         }
-        Released {
+        Ok(Released {
             keys: keys.len() as u32,
             buttons: buttons.len() as u32,
-        }
+        })
     }
 
     /// Win32 monitors in logical (DIP) coordinates (KVM-040).
@@ -667,7 +697,9 @@ impl Win {
                 // The emergency combination works on a receiver too (rule 4): this capture
                 // is the only place it can be seen while the source capture is not running.
                 Some(CaptureEvent::Emergency) => return Some(Event::Emergency),
-                Some(CaptureEvent::HotkeyPressed(action)) => return Some(hotkey_event(action)),
+                Some(CaptureEvent::HotkeyPressed(action, issued_at)) => {
+                    return Some(hotkey_event(action, issued_at))
+                }
                 Some(CaptureEvent::QueueOverflow) => return Some(Event::QueueOverflow),
                 None => {}
             }
@@ -779,20 +811,25 @@ fn drain_capture(
                 return Some(Event::Input(event));
             }
             CaptureEvent::Emergency => return Some(Event::Emergency),
-            CaptureEvent::HotkeyPressed(action) => return Some(hotkey_event(action)),
+            CaptureEvent::HotkeyPressed(action, issued_at) => {
+                return Some(hotkey_event(action, issued_at))
+            }
             CaptureEvent::QueueOverflow => return Some(Event::QueueOverflow),
         }
     }
 }
 
-fn hotkey_event(action: u8) -> Event {
-    Event::HotkeyPressed(match action {
-        1 => config::HotkeyAction::SwitchNext,
-        2 => config::HotkeyAction::ReturnLocal,
-        3 => config::HotkeyAction::ClaimOwnership,
-        4 => config::HotkeyAction::GameGuardToggle,
-        _ => config::HotkeyAction::EmergencyRelease,
-    })
+fn hotkey_event(action: u8, issued_at: Instant) -> Event {
+    Event::HotkeyPressed {
+        issued_at,
+        action: match action {
+            1 => config::HotkeyAction::SwitchNext,
+            2 => config::HotkeyAction::ReturnLocal,
+            3 => config::HotkeyAction::ClaimOwnership,
+            4 => config::HotkeyAction::GameGuardToggle,
+            _ => config::HotkeyAction::EmergencyRelease,
+        },
+    }
 }
 
 /// The source-motion state and monitors a capture needs, from the current cursor.
@@ -1054,9 +1091,75 @@ fn clipboard_snapshot_change(
     })
 }
 
+fn complete_release(
+    status: platform_win::inject::InjectStatus,
+    keys_before: usize,
+    buttons_before: usize,
+    keys_after: usize,
+    buttons_after: usize,
+) -> Result<Released, String> {
+    let requested = keys_before + buttons_before;
+    if !status.is_complete()
+        || status.error.is_some()
+        || status.requested != requested
+        || status.applied != requested
+        || status.accepted_records != status.total_records
+        || keys_after != 0
+        || buttons_after != 0
+    {
+        return Err(format!(
+            "native Windows session release incomplete: {status}"
+        ));
+    }
+    Ok(Released {
+        keys: keys_before as u32,
+        buttons: buttons_before as u32,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_release_requires_native_completion_and_empty_ledger() {
+        use platform_win::inject::{InjectError, InjectErrorKind, InjectStatus};
+        let complete = InjectStatus {
+            requested: 2,
+            applied: 2,
+            not_injected: Vec::new(),
+            accepted_records: 2,
+            total_records: 2,
+            error: None,
+        };
+        let released = complete_release(complete.clone(), 1, 1, 0, 0).unwrap();
+        assert_eq!((released.keys, released.buttons), (1, 1));
+        assert!(complete_release(complete.clone(), 1, 1, 1, 0).is_err());
+        assert!(complete_release(complete.clone(), 1, 1, 0, 1).is_err());
+        let mutations: [fn(&mut InjectStatus); 5] = [
+            |status: &mut InjectStatus| status.applied = 1,
+            |status: &mut InjectStatus| status.requested = 1,
+            |status: &mut InjectStatus| status.accepted_records = 1,
+            |status: &mut InjectStatus| {
+                status.not_injected.push(InputEvent::Key {
+                    key: HidKey::keyboard(0x04),
+                    state: input_model::KeyState::Up,
+                });
+            },
+            |status: &mut InjectStatus| {
+                status.error = Some(InjectError {
+                    kind: InjectErrorKind::AccessDenied,
+                    win32: 5,
+                    detail: "release refused".to_owned(),
+                });
+            },
+        ];
+        for mutate in mutations {
+            let mut status = complete.clone();
+            mutate(&mut status);
+            assert!(complete_release(status, 1, 1, 0, 0).is_err());
+        }
+    }
 
     fn snapshot(
         sequence: u32,
@@ -1282,11 +1385,11 @@ mod tests {
             CaptureEvent::Input(InputEvent::PointerAbsolute(input_model::Position::new(
                 1.0, 2.0,
             ))),
-            CaptureEvent::HotkeyPressed(1),
+            CaptureEvent::HotkeyPressed(1, Instant::now()),
         ]);
         assert!(matches!(
             next_source_capture(CaptureKind::Observe, false, || queue.pop_front()),
-            Some(CaptureEvent::HotkeyPressed(1))
+            Some(CaptureEvent::HotkeyPressed(1, _))
         ));
         assert!(queue.is_empty());
     }
@@ -1524,7 +1627,7 @@ mod tests {
             .expect("observe");
         win.begin_capture(CaptureKind::Temporary, true)
             .expect("prepare");
-        win.end_capture().expect("abort");
+        win.end_capture(true).expect("abort");
         win.begin_capture(CaptureKind::Temporary, true)
             .expect("rearm");
         win.begin_capture(CaptureKind::Remote, true)
@@ -1581,7 +1684,7 @@ mod tests {
                 _ => {}
             }
         }
-        win.end_capture().expect("cleanup");
+        win.end_capture(true).expect("cleanup");
         assert!(motion && down && up, "motion={motion} down={down} up={up}");
     }
 
@@ -1646,7 +1749,7 @@ mod tests {
         }
 
         let seen = win.injected_seen();
-        win.end_capture().expect("disarming the detector");
+        win.end_capture(true).expect("disarming the detector");
         assert!(
             seen > 0,
             "the hook saw no injected event at all: the test proves nothing"

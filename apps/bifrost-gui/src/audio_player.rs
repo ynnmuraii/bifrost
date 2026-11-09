@@ -92,6 +92,8 @@ pub struct AudioPlayerCard {
     pub can_next: bool,
     pub muted: bool,
     pub gain_percent: u8,
+    /// Latest local slider intent; never a claim about confirmed output.
+    pub desired_gain_percent: Option<u8>,
     pub state: StreamState,
     pub path: Option<crate::audio_path::AudioPathObservation>,
     /// Follow Focus background streams remain visible, with reduced emphasis.

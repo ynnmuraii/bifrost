@@ -176,6 +176,72 @@ pub struct MapModel {
     pub dirty: bool,
 }
 
+/// Stable presentation, invalidated by the complete editable geometry and live map inputs,
+/// not just topology revision. Animation/drag interaction remains in `UiState`.
+#[derive(Default)]
+pub struct MapCache {
+    entry: Option<MapCacheEntry>,
+}
+
+struct MapCacheEntry {
+    editor: super::LayoutEditor,
+    language: ui_text::Lang,
+    own_node: Option<String>,
+    target: Option<usize>,
+    status_present: bool,
+    backend: String,
+    guard: String,
+    versions: std::collections::BTreeMap<String, String>,
+    release: Option<String>,
+    model: MapModel,
+}
+
+impl MapCache {
+    pub fn get(&mut self, vm: &ViewModel) -> &MapModel {
+        let own_node = vm.self_node();
+        let target = vm.route_target();
+        let backend = vm
+            .status
+            .as_ref()
+            .map_or("", |status| status.backend.as_str());
+        let guard = vm
+            .status
+            .as_ref()
+            .map_or("", |status| status.game_guard_reason.as_str());
+        let release = match (&vm.checked_release, &vm.update) {
+            (Some(release), _) | (None, crate::updater::State::Available(release)) => {
+                Some(release.tag_name.as_str())
+            }
+            _ => None,
+        };
+        if self.entry.as_ref().is_none_or(|entry| {
+            entry.editor != vm.editor
+                || entry.language != vm.look.language
+                || entry.own_node.as_deref() != own_node
+                || entry.target != target
+                || entry.status_present != vm.status.is_some()
+                || entry.backend != backend
+                || entry.guard != guard
+                || entry.versions != vm.app_versions
+                || entry.release.as_deref() != release
+        }) {
+            self.entry = Some(MapCacheEntry {
+                editor: vm.editor.clone(),
+                language: vm.look.language,
+                own_node: own_node.map(str::to_owned),
+                target,
+                status_present: vm.status.is_some(),
+                backend: backend.to_owned(),
+                guard: guard.to_owned(),
+                versions: vm.app_versions.clone(),
+                release: release.map(str::to_owned),
+                model: vm.map_model(),
+            });
+        }
+        &self.entry.as_ref().expect("map cache initialised").model
+    }
+}
+
 /// One computer in the list of pairs and in the top bar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRow {

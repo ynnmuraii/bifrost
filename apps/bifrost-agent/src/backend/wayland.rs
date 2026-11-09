@@ -53,7 +53,7 @@ type HotkeyCandidate = (config::HotkeyBindings, Result<EmergencyShortcuts, Strin
 
 /// Owns an independently pumped portal session, never blocked on core IPC.
 struct ShortcutTask {
-    events: tokio::sync::mpsc::UnboundedReceiver<config::HotkeyAction>,
+    events: tokio::sync::mpsc::UnboundedReceiver<(config::HotkeyAction, std::time::Instant)>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -77,6 +77,7 @@ impl ShortcutTask {
                 let Some(action) = shortcut_action(&id) else {
                     continue;
                 };
+                let issued_at = std::time::Instant::now();
                 if action == config::HotkeyAction::EmergencyRelease {
                     if let Some(emergency) = &emergency {
                         if let Err(error) = emergency.release().await {
@@ -84,7 +85,7 @@ impl ShortcutTask {
                         }
                     }
                 }
-                if send.send(action).is_err() {
+                if send.send((action, issued_at)).is_err() {
                     break;
                 }
             }
@@ -436,6 +437,10 @@ impl Wayland {
             }
         };
 
+        refusals.push(Refusal {
+            code: "PHYSICAL_STATE_UNAVAILABLE",
+            detail: "Outgoing input switching is disabled: Wayland InputCapture cannot report a complete physical pressed state; receiving input and audio remain available".to_owned(),
+        });
         let ready = refine_ready(
             session,
             capture.is_some(),
@@ -502,6 +507,11 @@ impl Wayland {
     /// The capability report sent right after the attach.
     pub fn ready(&self) -> Ready {
         self.ready.clone()
+    }
+
+    /// InputCapture reports only diverted deltas/modifiers, not a complete physical snapshot.
+    pub fn physical_pressed(&self) -> Option<input_model::PressedState> {
+        None
     }
 
     /// The capture portal owns cursor visibility; no local cursor override is needed.
@@ -633,7 +643,12 @@ impl Wayland {
 
     /// Ends capture. `replay_locally` plays buffered events through the inject session
     /// instead of forwarding them, which is the documented cancellation path.
-    pub async fn end_capture(&mut self, replay_locally: bool) -> Result<Released, String> {
+    /// Capture teardown still runs if releasing the source's injected state fails.
+    pub async fn end_capture(
+        &mut self,
+        replay_locally: bool,
+        release_injected: bool,
+    ) -> Result<Released, String> {
         self.edge_fx(edgefx::Update::Clear);
         if replay_locally && !self.buffered.is_empty() {
             let buffered: Vec<InputEvent> = std::mem::take(&mut self.buffered);
@@ -646,10 +661,10 @@ impl Wayland {
         }
         // Source cancellation replay must not leave synthetic downs held, even
         // before BeginCapture. A receiver's unrelated injection lease stays intact.
-        let released = if self.receiving {
-            Released::default()
-        } else {
+        let released = if release_injected && !self.receiving {
             self.release_session()
+        } else {
+            Ok(Released::default())
         };
         self.buffered.clear();
         self.pending.clear();
@@ -669,12 +684,14 @@ impl Wayland {
                     }
                     self.capture = None;
                     self.activation = None;
-                    return Err(format!("Release of the capture session failed: {error}"));
+                    return released.and(Err(format!(
+                        "Release of the capture session failed: {error}"
+                    )));
                 }
             }
         }
         self.activation = None;
-        Ok(released)
+        released
     }
 
     /// Capture zones are authoritative; xdg-output is the permission-free fallback.
@@ -816,27 +833,13 @@ impl Wayland {
             None
         };
         let actual = outcome.actual.or(relative_actual);
-        for event in events.iter().take(outcome.applied_count) {
-            match event {
-                InputEvent::Key { key, state } => {
-                    if state.is_down() {
-                        self.pressed_keys.insert((key.page, key.usage));
-                    } else {
-                        self.pressed_keys.remove(&(key.page, key.usage));
-                    }
-                }
-                InputEvent::Button { button, state } => {
-                    if state.is_down() {
-                        self.pressed_buttons.insert(*button);
-                    } else {
-                        self.pressed_buttons.remove(button);
-                    }
-                }
-                InputEvent::PointerAbsolute(_)
-                | InputEvent::PointerRelative { .. }
-                | InputEvent::Scroll { .. } => {}
-            }
-        }
+        record_injection_holds(
+            &mut self.pressed_keys,
+            &mut self.pressed_buttons,
+            events,
+            outcome.applied_count,
+            outcome.os_error.is_none(),
+        );
         Injected {
             applied: outcome.applied_count,
             os_error: outcome
@@ -849,27 +852,25 @@ impl Wayland {
 
     /// Releases everything this session emulated, which is what a receiver must do when
     /// it loses the lease.
-    pub fn release_session(&mut self) -> Released {
+    pub fn release_session(&mut self) -> Result<Released, String> {
         self.edge_fx(edgefx::Update::Clear);
         self.receiving = false;
-        let outcome = self.injector.release_all();
-        let released = Released {
-            keys: self.pressed_keys.len() as u32,
-            buttons: self.pressed_buttons.len() as u32,
-        };
-        self.pressed_keys.clear();
-        self.pressed_buttons.clear();
-        if let Some(error) = outcome.os_error {
-            tracing::warn!(%error, "releasing the emulated devices failed");
-        }
-        released
+        finish_session_release(
+            &mut self.pressed_keys,
+            &mut self.pressed_buttons,
+            self.injector.release_all(),
+        )
     }
 
     /// `RECOVERY` (rule 7): release exactly these keys and buttons.
     ///
-    /// The counts come from what the EIS socket accepted, not from the request, so a
-    /// paused device is visible instead of being reported as released.
-    pub async fn release_keys(&mut self, keys: &[HidKey], buttons: &[MouseButton]) -> Released {
+    /// Only a complete, successful EIS flush acknowledges recovery. Failed or
+    /// unqueued requested ups remain in both ledgers for later release attempts.
+    pub async fn release_keys(
+        &mut self,
+        keys: &[HidKey],
+        buttons: &[MouseButton],
+    ) -> Result<Released, String> {
         let mut events = Vec::with_capacity(keys.len() + buttons.len());
         for key in keys {
             events.push(InputEvent::Key {
@@ -883,19 +884,20 @@ impl Wayland {
                 state: KeyState::Up,
             });
         }
-        let applied = self.inject(&events).await.applied;
-        let key_total = keys.len().min(applied) as u32;
-        let button_total = applied.saturating_sub(keys.len()) as u32;
+        let result = self.inject(&events).await;
+        if result.applied != events.len() || !result.os_error.is_empty() {
+            return Err("native recovery release was not fully applied".to_owned());
+        }
         for key in keys {
             self.pressed_keys.remove(&(key.page, key.usage));
         }
         for button in buttons {
             self.pressed_buttons.remove(button);
         }
-        Released {
-            keys: key_total,
-            buttons: button_total,
-        }
+        Ok(Released {
+            keys: keys.len() as u32,
+            buttons: buttons.len() as u32,
+        })
     }
 
     /// `ForgetPortalGrants`: drop the in-memory tokens so the next session asks again.
@@ -934,7 +936,7 @@ impl Wayland {
 
         enum Step {
             Captured(Option<CapturedEvent>),
-            Shortcut(Option<config::HotkeyAction>),
+            Shortcut(Option<(config::HotkeyAction, std::time::Instant)>),
             Updated,
             Tick,
         }
@@ -1008,7 +1010,7 @@ impl Wayland {
                     }),
                 }
             }
-            Step::Shortcut(Some(config::HotkeyAction::EmergencyRelease)) => {
+            Step::Shortcut(Some((config::HotkeyAction::EmergencyRelease, _))) => {
                 if self.capture.is_none() {
                     return Some(Event::Emergency);
                 }
@@ -1016,7 +1018,9 @@ impl Wayland {
                 // capture flag; its Emergency event drains local input state.
                 None
             }
-            Step::Shortcut(Some(action)) => Some(Event::HotkeyPressed(action)),
+            Step::Shortcut(Some((action, issued_at))) => {
+                Some(Event::HotkeyPressed { action, issued_at })
+            }
             Step::Shortcut(None) => {
                 self.shortcuts = None;
                 Some(Event::Failed {
@@ -1187,6 +1191,69 @@ impl Wayland {
                 "SetPointerBarriers failed: {}",
                 error_chain(&error)
             )),
+        }
+    }
+}
+
+fn finish_session_release(
+    keys: &mut HashSet<(u16, u16)>,
+    buttons: &mut HashSet<MouseButton>,
+    outcome: platform_wayland::InjectOutcome,
+) -> Result<Released, String> {
+    if let Some(error) = outcome.os_error {
+        return Err(format!("releasing the emulated devices failed: {error}"));
+    }
+    // release_all also succeeds after protocol-observed pauses or earlier partial
+    // flushes retired native holds; its queued count need not equal the outer ledger.
+    let released = Released {
+        keys: keys.len() as u32,
+        buttons: buttons.len() as u32,
+    };
+    keys.clear();
+    buttons.clear();
+    Ok(released)
+}
+
+fn record_injection_holds(
+    keys: &mut HashSet<(u16, u16)>,
+    buttons: &mut HashSet<MouseButton>,
+    events: &[InputEvent],
+    queued: usize,
+    succeeded: bool,
+) {
+    // Recovery may name holds inherited from an earlier agent, not just this ledger.
+    for event in events {
+        match *event {
+            InputEvent::Key {
+                key,
+                state: KeyState::Up,
+            } => {
+                keys.insert((key.page, key.usage));
+            }
+            InputEvent::Button {
+                button,
+                state: KeyState::Up,
+            } => {
+                buttons.insert(button);
+            }
+            _ => {}
+        }
+    }
+    for event in events.iter().take(queued) {
+        match *event {
+            InputEvent::Key { key, state } if state.is_down() => {
+                keys.insert((key.page, key.usage));
+            }
+            InputEvent::Key { key, .. } if succeeded => {
+                keys.remove(&(key.page, key.usage));
+            }
+            InputEvent::Button { button, state } if state.is_down() => {
+                buttons.insert(button);
+            }
+            InputEvent::Button { button, .. } if succeeded => {
+                buttons.remove(&button);
+            }
+            _ => {}
         }
     }
 }
@@ -1628,6 +1695,140 @@ mod capability_tests {
                 .filter(|name| *name == "CLIPBOARD_IMAGE")
                 .count(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn normal_release_errors_preserve_outer_holds_for_every_partial_flush() {
+        let key = HidKey::keyboard(0x04);
+        for queued in 0..=2 {
+            let mut keys = HashSet::from([(key.page, key.usage)]);
+            let mut buttons = HashSet::from([MouseButton::Left]);
+            let outcome = platform_wayland::InjectOutcome {
+                applied_count: queued,
+                os_error: Some(WaylandError::Io(std::io::Error::from(
+                    std::io::ErrorKind::BrokenPipe,
+                ))),
+                actual: None,
+            };
+            let error = finish_session_release(&mut keys, &mut buttons, outcome).unwrap_err();
+            assert!(error.contains("releasing the emulated devices failed"));
+            assert_eq!(keys, HashSet::from([(key.page, key.usage)]));
+            assert_eq!(buttons, HashSet::from([MouseButton::Left]));
+
+            let outcome = platform_wayland::InjectOutcome {
+                applied_count: 0,
+                os_error: Some(WaylandError::EiDisconnected),
+                actual: None,
+            };
+            assert!(finish_session_release(&mut keys, &mut buttons, outcome).is_err());
+            assert_eq!(keys.len(), 1);
+            assert_eq!(buttons.len(), 1);
+        }
+    }
+
+    #[test]
+    fn successful_native_release_retires_the_exact_outer_holds_after_retry_or_pause() {
+        let key = HidKey::keyboard(0x04);
+        // Native holds may already be neutralized by an observed pause, or partly
+        // released by an earlier successful flush that still reported another failure.
+        for queued in 0..=2 {
+            let mut keys = HashSet::from([(key.page, key.usage)]);
+            let mut buttons = HashSet::from([MouseButton::Left]);
+            let outcome = platform_wayland::InjectOutcome {
+                applied_count: queued,
+                os_error: None,
+                actual: None,
+            };
+            let released = finish_session_release(&mut keys, &mut buttons, outcome).unwrap();
+            assert_eq!((released.keys, released.buttons), (1, 1));
+            assert!(keys.is_empty());
+            assert!(buttons.is_empty());
+
+            let outcome = platform_wayland::InjectOutcome {
+                applied_count: 0,
+                os_error: None,
+                actual: None,
+            };
+            let released = finish_session_release(&mut keys, &mut buttons, outcome).unwrap();
+            assert_eq!((released.keys, released.buttons), (0, 0));
+        }
+    }
+
+    #[test]
+    fn failed_recovery_flush_retains_outer_holds_until_successful_retry() {
+        let key = HidKey::keyboard(0x04);
+        let events = [
+            InputEvent::Key {
+                key,
+                state: KeyState::Up,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: KeyState::Up,
+            },
+        ];
+        let mut keys = HashSet::new();
+        let mut buttons = HashSet::new();
+        record_injection_holds(&mut keys, &mut buttons, &events, events.len(), false);
+        assert!(keys.contains(&(key.page, key.usage)));
+        assert!(buttons.contains(&MouseButton::Left));
+        record_injection_holds(&mut keys, &mut buttons, &events, events.len(), true);
+        assert!(keys.is_empty());
+        assert!(buttons.is_empty());
+    }
+
+    #[test]
+    fn partial_and_unqueued_recovery_keep_every_uncertain_request() {
+        let events = [
+            InputEvent::Key {
+                key: HidKey::keyboard(0x04),
+                state: KeyState::Up,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: KeyState::Up,
+            },
+        ];
+        for queued in [0, 1] {
+            let mut keys = HashSet::new();
+            let mut buttons = HashSet::new();
+            record_injection_holds(&mut keys, &mut buttons, &events, queued, false);
+            assert_eq!(keys.len(), 1);
+            assert_eq!(buttons.len(), 1);
+        }
+    }
+
+    #[test]
+    fn successful_exact_recovery_preserves_unrequested_holds_and_new_downs() {
+        let held = HidKey::keyboard(0x05);
+        let released = HidKey::keyboard(0x04);
+        let mut keys = HashSet::from([(held.page, held.usage), (released.page, released.usage)]);
+        let mut buttons = HashSet::from([MouseButton::Right]);
+        let events = [
+            InputEvent::Key {
+                key: released,
+                state: KeyState::Up,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: KeyState::Up,
+            },
+            InputEvent::Button {
+                button: MouseButton::Left,
+                state: KeyState::Down,
+            },
+        ];
+        record_injection_holds(&mut keys, &mut buttons, &events, events.len(), true);
+        assert_eq!(keys, HashSet::from([(held.page, held.usage)]));
+        assert_eq!(
+            buttons,
+            HashSet::from([MouseButton::Left, MouseButton::Right])
         );
     }
 }
