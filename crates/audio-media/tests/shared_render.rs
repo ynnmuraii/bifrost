@@ -22,6 +22,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+const ONSET_THRESHOLD: f32 = 0.01;
+
 // This fixture stops and catches up its Dry device explicitly. It has no
 // independently advancing native device clock to extrapolate between pumps.
 struct ToneStream {
@@ -143,11 +145,14 @@ impl Backend for ToneBackend {
         let stream = self.dry.start_capture(
             request,
             Box::new(move |block| {
-                if position <= silent_until && position + block.frames as u64 > silent_until {
-                    if let Some((clock, observed)) = &onset {
-                        observed.store(clock.elapsed().as_nanos() as u64 + 1, Ordering::Release);
-                    }
-                }
+                let onset_at =
+                    if position <= silent_until && position + block.frames as u64 > silent_until {
+                        onset
+                            .as_ref()
+                            .map(|(clock, observed)| (clock.elapsed().as_nanos() as u64, observed))
+                    } else {
+                        None
+                    };
                 for (index, frame) in scratch[..block.frames * 2]
                     .as_chunks_mut::<2>()
                     .0
@@ -165,6 +170,20 @@ impl Backend for ToneBackend {
                         0.0
                     };
                     *frame = [sample; 2];
+                }
+                if let Some((captured, observed)) = onset_at {
+                    // Compare the same signal edge at capture and render, not a
+                    // zero-valued leading sample against the rendered threshold.
+                    if let Some(index) = scratch[..block.frames * 2]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|frame| frame[0].abs() > ONSET_THRESHOLD)
+                    {
+                        let offset_ns =
+                            index as u64 * 1_000_000_000 / u64::from(block.format.sample_rate);
+                        observed.store(captured + offset_ns + 1, Ordering::Release);
+                    }
                 }
                 position += block.frames as u64;
                 callback(CaptureBlock {
@@ -360,6 +379,7 @@ fn exercise(rate: u32, shared_source: bool) {
     }));
     let mut windows: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::new());
     let mut actions = [false; 6];
+    let mut retired = [false; 2];
     let start = Instant::now();
     let mut media_start: Option<Instant> = None;
     let mut due = Duration::ZERO;
@@ -406,10 +426,14 @@ fn exercise(rate: u32, shared_source: bool) {
                     2 => listeners[1].set_muted(true).unwrap(),
                     3 => listeners[1].set_muted(false).unwrap(),
                     4 => {
-                        listeners[0].stop().unwrap();
-                        sources[0].stop().unwrap();
+                        listeners[0].begin_stop().unwrap();
+                        sources[0].begin_stop().unwrap();
                     }
                     5 => {
+                        assert_eq!(
+                            retired, [true; 2],
+                            "retire the previous native member first"
+                        );
                         let source_socket = socket();
                         let source_address = source_socket.local_addr().unwrap();
                         let config = |socket, peer| SessionConfig {
@@ -443,6 +467,20 @@ fn exercise(rate: u32, shared_source: bool) {
                     _ => unreachable!(),
                 }
                 actions[index] = true;
+            }
+        }
+        // Native callbacks keep running while a different member finishes retirement.
+        if actions[4] {
+            for (session, complete) in [&mut listeners[0], &mut sources[0]]
+                .into_iter()
+                .zip(&mut retired)
+            {
+                if !*complete {
+                    if let Some(result) = session.poll_stop() {
+                        result.expect("retiring member cleanup");
+                        *complete = true;
+                    }
+                }
             }
         }
         if elapsed >= due {
@@ -707,7 +745,7 @@ fn wired_runtime_tone_onset_stays_in_budget_after_silent_warmup() {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .position(|frame| frame[0].abs() > 0.01)
+                .position(|frame| frame[0].abs() > ONSET_THRESHOLD)
             {
                 output_onset = Some(render_at + offset as f64 / f64::from(RATE));
             }

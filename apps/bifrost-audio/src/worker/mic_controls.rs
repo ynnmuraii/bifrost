@@ -403,12 +403,25 @@ impl<M: MuteGuard + 'static> Controls<M> {
         self.tick(backend, now_ns, now, emit);
         match event {
             Event::MuteChanged(snapshot) => {
+                // Native notifications can outlive a released guard. Never attach an
+                // old observation to a newly acquired guard on the same endpoint.
+                let snapshot = match self.guard.as_ref() {
+                    Some(guard) => match guard.snapshot() {
+                        Ok(current) if current.endpoint == snapshot.endpoint => current,
+                        Ok(_) => return,
+                        Err(_) => {
+                            let _ = self.release(backend, 0, emit);
+                            return;
+                        }
+                    },
+                    None => snapshot.clone(),
+                };
                 if self.snapshot.as_ref().is_some_and(|old| {
                     old.endpoint == snapshot.endpoint && old.generation != snapshot.generation
                 }) {
                     let _ = self.release(backend, 0, emit);
                 }
-                self.publish(0, snapshot.clone(), emit);
+                self.publish(0, snapshot, emit);
             }
             Event::Device(_) => {
                 if let Some(guard) = self.guard.as_ref() {
@@ -813,6 +826,47 @@ mod tests {
             Err(BackendError::Stopped)
         );
         assert!(backend.acquire_mute(&selection()).is_ok());
+    }
+
+    #[test]
+    fn queued_mute_observation_cannot_replay_state_into_a_reacquired_guard() {
+        let (mut backend, mut controls, mut output) = fixture();
+        run(&mut controls, &mut backend, &mut output, acquire()).unwrap();
+        let generation = backend.capture_mute(&selection()).unwrap().generation;
+        run(
+            &mut controls,
+            &mut backend,
+            &mut output,
+            Msg::SetMicMute(w::SetMicMute {
+                expected_generation: generation,
+                muted: true,
+            }),
+        )
+        .unwrap();
+        let delayed = backend.poll_event().expect("the native mute notification");
+        assert!(matches!(&delayed, Event::MuteChanged(snapshot) if snapshot.muted));
+        run(
+            &mut controls,
+            &mut backend,
+            &mut output,
+            Msg::ReleaseMicMute(w::ReleaseMicMute {}),
+        )
+        .unwrap();
+        run(&mut controls, &mut backend, &mut output, acquire()).unwrap();
+        assert!(!backend.capture_mute(&selection()).unwrap().muted);
+        output.clear();
+        controls.event(
+            &mut backend,
+            &delayed,
+            Some(0),
+            Instant::now(),
+            &mut |id, message| output.push((id, message)),
+        );
+        assert!(
+            matches!(output.last(), Some((0, Msg::MuteSnapshot(snapshot)))
+                if snapshot.guard_active && !snapshot.muted && snapshot.generation == generation),
+            "the acquired guard must report its current state, not a queued old observation: {output:?}"
+        );
     }
 
     #[test]

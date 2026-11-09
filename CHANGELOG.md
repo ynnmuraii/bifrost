@@ -13,6 +13,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Persist ownership off the input decision loop with a coalescing writer and orderly shutdown drain. Persist only adopted owner pairs: pending claims cannot synthesize a stale owner that takes over after reconnect. Crash persistence remains best-effort.
 - Keep native audio retirement distinct from logical stop, fence replacement starts/cutovers, and report session-local errors honestly. Linux callback storage retires even on native deletion error.
 - Strengthen PipeWire Source-silence server-instance/policy checks and mute-write ownership, confine Linux artwork opens without symlink traversal, and reject stale artwork generations. Windows IPC verifies the pipe server's user; native PTT uses exact physical key identity.
+- Queued microphone-mute notifications refresh the currently owned guard; old observations cannot overwrite its state after release/reacquire.
 - Encode the XI2 raw-event subscription as one mask word and check server acceptance, restoring native X11 keyboard/button observation without bypassing XTEST filtering.
 - X11 clipboard teardown no longer clears another application's selection; owned selections retire with their native owner window.
 - Recovery agents perform only the native up-only handshake before normal startup; ancillary frames cannot displace the exact release acknowledgement.
@@ -30,6 +31,7 @@ Each release is described in English and Russian. / Каждый выпуск о
 - Объединяющий записи фоновый поток сохраняет владельца без блокировки решений ввода; штатный выход дожидается записи. Сохраняется только принятая пара владельца: незавершённый claim не создаёт ложного старого владельца, захватывающего управление после переподключения. После сбоя гарантий нет.
 - Завершение нативного аудио отделено от логической остановки; новые запуски/смена бэкенда ждут очистки, ошибки сеанса не скрываются. Linux освобождает callback-хранилище даже при ошибке нативного удаления.
 - Усилены проверки экземпляра сервера/политики PipeWire и владения mute; обложки Linux открываются без перехода по символьным ссылкам, устаревшие поколения отвергаются. IPC Windows проверяет пользователя сервера канала; PTT использует точную физическую клавишу.
+- Отложенное уведомление mute обновляет состояние текущего guard микрофона: старое наблюдение не перезаписывает его после освобождения и повторного захвата.
 - Исправлена упаковка XI2 raw-подписки в одно слово маски и проверяется ответ сервера: нативное наблюдение клавиатуры/кнопок X11 работает без обхода фильтра XTEST.
 - Завершение адаптера буфера X11 больше не обнуляет чужое владение; собственное владение освобождается вместе с его нативным окном.
 - Восстановительный агент выполняет только подтверждённое нативное отпускание до обычного запуска; посторонние стартовые кадры не подменяют точный ответ.
