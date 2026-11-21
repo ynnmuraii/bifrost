@@ -4,7 +4,7 @@
 
 Keep your computers separate. Move between their screens over your LAN without changing the keyboard under your hands.
 
-**[Download Bifrost 0.5.1](https://github.com/ynnmuraii/bifrost/releases/latest)** · [Get started](#get-started) · [Platform support](#platform-support) · [Русская инструкция](packaging/README_RU.txt)
+**[Download Bifrost 0.5.2](https://github.com/ynnmuraii/bifrost/releases/latest)** · [Get started](#get-started) · [Platform support](#platform-support) · [Русская инструкция](packaging/README_RU.txt)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/main-dark.png">
@@ -53,10 +53,10 @@ Outgoing capture is refused while physical keys/buttons are held or their state 
 
 ## Download & install
 
-**[Get the 0.5.1 release](https://github.com/ynnmuraii/bifrost/releases/latest)** for both computers. Choose the same version on each.
+**[Get the 0.5.2 release](https://github.com/ynnmuraii/bifrost/releases/latest)** for both computers. Choose the same version on each.
 
-- **Windows 11 · x86_64:** download `bifrost-0.5.1-windows-x86_64.exe`, keep it in a permanent folder, and run it. No administrator account or installer is needed. The executable is not Authenticode-signed; check the download before bypassing SmartScreen.
-- **Linux · x86_64:** extract `bifrost-0.5.1-linux-x86_64.tar.gz`, run `./install.sh` without `sudo`, then open Bifrost from the applications menu. The release requires glibc 2.35 or newer.
+- **Windows 11 · x86_64:** download `bifrost-0.5.2-windows-x86_64.exe`, keep it in a permanent folder, and run it. No administrator account or installer is needed. The executable is not Authenticode-signed; check the download before bypassing SmartScreen.
+- **Linux · x86_64:** extract `bifrost-0.5.2-linux-x86_64.tar.gz`, run `./install.sh` without `sudo`, then open Bifrost from the applications menu. The release requires glibc 2.35 or newer.
 
 On a firewall prompt, allow **private networks only**. Bifrost does not add firewall rules. [Installation, firewall and upgrade details](#technical-details) include ports, signed-checksum verification and older-version migration.
 
@@ -138,7 +138,7 @@ Closing the window does not stop the core or an active session. Use the app's ex
 
 ## Download & install
 
-Get **0.5.1** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
+Get **0.5.2** from [Releases](https://github.com/ynnmuraii/bifrost/releases/latest). The release includes `SHA256SUMS.txt` and its detached Ed25519 signature, `SHA256SUMS.txt.sig`.
 
 Versions from **0.1.4** can update from **Settings** or the startup update notice. The app checks for newer stable releases shortly after startup; turn this off in **Settings → Check on startup**, or check manually next to the version. Updates keep a binary backup and ask before restarting all roles; your configuration and pairing are preserved. System-wide, non-writable installations must be updated manually.
 
@@ -148,7 +148,7 @@ Versions from **0.1.4** can update from **Settings** or the startup update notic
 
 ### Windows 11 · x86_64
 
-Download **`bifrost-0.5.1-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
+Download **`bifrost-0.5.2-windows-x86_64.exe`**, put it somewhere you want to keep it, and run it. No installer or administrator account is needed. The `.zip` contains the same executable plus the Russian guide, third-party notices and example configuration.
 
 The executable has no Authenticode signature. If SmartScreen says “Windows protected your PC”, choose **More info → Run anyway** only if you trust this download. If Windows Firewall asks, allow Bifrost on **private networks only**; allow **TCP 47901/47902 + UDP 47902 (discovery)** (multicast `239.255.47.90`, TTL 1). Opening TCP alone does not enable discovery. Bifrost does **not** automatically add or change Windows Firewall rules.
 
@@ -158,10 +158,10 @@ Settings are created automatically in `%APPDATA%\bifrost`; logs go to `%LOCALAPP
 
 ### Linux · x86_64
 
-Download **`bifrost-0.5.1-linux-x86_64.tar.gz`** and extract it:
+Download **`bifrost-0.5.2-linux-x86_64.tar.gz`** and extract it:
 
 ```sh
-tar -xzf bifrost-0.5.1-linux-x86_64.tar.gz
+tar -xzf bifrost-0.5.2-linux-x86_64.tar.gz
 ./install.sh
 ```
 
