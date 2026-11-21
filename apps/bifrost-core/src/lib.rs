@@ -47,7 +47,7 @@ mod session;
 mod topology;
 
 use std::io::IsTerminal;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -472,12 +472,58 @@ fn run(args: &Args) -> Result<(), Failure> {
     }
     Ok(())
 }
+/// Heals a `network.listen_address` left behind by a DHCP renewal while the app was off.
+///
+/// Shared by `run` and the self-serving half of `pair`. The callers decide when the
+/// address is config-driven; an explicit `--listen` is an operator decision and
+/// never reaches here. Candidates are injected so the decision, the in-memory
+/// update and the persistence can be tested without touching real NICs.
+fn heal_stored_listen(
+    paths: &Paths,
+    config: &mut config::Config,
+    candidates: &[config::Candidate],
+) -> Result<Option<Ipv4Addr>, String> {
+    let Ok(stored) = config.network.listen_address.parse::<Ipv4Addr>() else {
+        // IPv6 or malformed: nothing the /24 rule can say about it.
+        return Ok(None);
+    };
+    match config::first_run::heal_listen_address(stored, candidates) {
+        config::first_run::ListenHeal::BindAsConfigured => Ok(None),
+        config::first_run::ListenHeal::Adopted(healed) => {
+            let adapter = candidates
+                .iter()
+                .find(|candidate| candidate.address == healed)
+                .map_or("?", |candidate| candidate.name.as_str());
+            tracing::info!(
+                stored = %stored,
+                healed = %healed,
+                adapter = adapter,
+                "healed the stored listen address after a DHCP change"
+            );
+            // The healed value must be in memory too: discovery's runtime heal
+            // follows the address this config says is selected.
+            config.network.listen_address = healed.to_string();
+            if let Err(error) = config::first_run::set_listen_address(paths, healed) {
+                tracing::warn!(%error, "cannot persist the healed listen address");
+            }
+            Ok(Some(healed))
+        }
+        config::first_run::ListenHeal::Unavailable { available } => Err(format!(
+            "the configured listen address {stored} is not on any adapter; available: {}; pick one in the settings screen",
+            available
+                .iter()
+                .map(|candidate| format!("{} ({})", candidate.address, candidate.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
 
 /// The daemon's async half, so `run` only owns the runtime and the exit mapping.
 async fn run_async(
     paths: &Paths,
     options: RunOptions,
-    config: config::Config,
+    mut config: config::Config,
     session: LocalSession,
 ) -> Result<(), String> {
     let identity_paths = IdentityPaths {
@@ -492,7 +538,7 @@ async fn run_async(
     let identity = Arc::new(identity);
     let node_id = identity.node_id();
 
-    let listen: SocketAddr = options
+    let mut listen: SocketAddr = options
         .listen
         .clone()
         .unwrap_or_else(|| {
@@ -503,6 +549,14 @@ async fn run_async(
         })
         .parse()
         .map_err(|error| format!("listen address: {error}"))?;
+    // A DHCP lease can change while Bifrost is off. Only the config-driven listener is
+    // healed: an explicit `--listen` is an operator decision, not a stale stored value.
+    if options.listen.is_none() {
+        let candidates = config::first_run::lan_interfaces();
+        if let Some(healed) = heal_stored_listen(paths, &mut config, &candidates)? {
+            listen = SocketAddr::new(healed.into(), config.network.port_input);
+        }
+    }
     let mut peers = dial_targets(&config, &trust).map_err(failure_message)?;
     peers.sort();
     peers.dedup();
@@ -1299,5 +1353,108 @@ mod run_options_tests {
             RunOptions::parse(&arguments, true).is_ok(),
             cfg!(debug_assertions),
         );
+    }
+}
+
+#[cfg(test)]
+mod listen_heal_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A fresh `--root`-shaped tree with a valid `config.toml`, after the pattern in
+    /// `ownership_store` and `layout_store`. No NIC is ever enumerated here.
+    fn temp_paths(label: &str) -> (Paths, config::Config) {
+        let root = std::env::temp_dir().join(format!(
+            "bifrost-listen-heal-{}-{}-{label}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let paths = Paths::new(
+            root.join("config"),
+            root.join("data"),
+            root.join("state"),
+            Some(root.join("run")),
+        );
+        std::fs::create_dir_all(paths.config_dir()).expect("a temporary config directory");
+
+        let mut config = config::Config::default();
+        config.network.listen_address = "192.168.31.37".to_owned();
+        config.node.display_name = "listen heal test".to_owned();
+        config.save(paths.config_file()).expect("a writable config");
+        let config = config::Config::load(paths.config_file()).expect("a loadable config");
+        (paths, config)
+    }
+
+    fn candidate(name: &str, address: Ipv4Addr) -> config::Candidate {
+        config::Candidate {
+            name: name.to_owned(),
+            address,
+            index: 1,
+            prefix_len: 24,
+            is_up: true,
+            has_default_route: false,
+        }
+    }
+
+    #[test]
+    fn an_adopted_address_is_persisted_and_every_other_field_survives() {
+        let (paths, mut config) = temp_paths("adopted");
+        let before = std::fs::read(paths.config_file()).expect("the original config bytes");
+        let mut expected = config.clone();
+        let healed = Ipv4Addr::new(192, 168, 31, 38);
+        let candidates = [candidate("Ethernet 6", healed)];
+
+        assert_eq!(
+            heal_stored_listen(&paths, &mut config, &candidates).expect("the only replacement"),
+            Some(healed)
+        );
+        assert_ne!(
+            std::fs::read(paths.config_file()).expect("the rewritten config"),
+            before
+        );
+
+        expected.network.listen_address = healed.to_string();
+        let persisted = config::Config::load(paths.config_file()).expect("the healed config");
+        assert_eq!(persisted, expected);
+        assert_eq!(config.network.listen_address, healed.to_string());
+    }
+
+    #[test]
+    fn an_unavailable_address_names_every_adapter_in_the_error() {
+        let (paths, mut config) = temp_paths("unavailable");
+        let candidates = [
+            candidate("Ethernet 6", Ipv4Addr::new(192, 168, 31, 38)),
+            candidate("Ethernet 7", Ipv4Addr::new(192, 168, 31, 39)),
+            candidate("Tailscale", Ipv4Addr::new(100, 105, 129, 122)),
+        ];
+
+        let error = heal_stored_listen(&paths, &mut config, &candidates)
+            .expect_err("two physical replacements must refuse to choose");
+        for expected in [
+            "192.168.31.38 (Ethernet 6)",
+            "192.168.31.39 (Ethernet 7)",
+            "100.105.129.122 (Tailscale)",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_live_configured_address_leaves_the_config_file_untouched() {
+        let (paths, mut config) = temp_paths("live");
+        let before = std::fs::read(paths.config_file()).expect("the original config bytes");
+        let candidates = [candidate("Ethernet 6", Ipv4Addr::new(192, 168, 31, 37))];
+
+        assert_eq!(
+            heal_stored_listen(&paths, &mut config, &candidates).expect("no heal needed"),
+            None
+        );
+        assert_eq!(
+            std::fs::read(paths.config_file()).expect("the config bytes"),
+            before
+        );
+        assert_eq!(config.network.listen_address, "192.168.31.37");
     }
 }

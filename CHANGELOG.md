@@ -2,6 +2,16 @@
 
 Each release is described in English and Russian. / Каждый выпуск описан на английском и русском.
 
+## 0.5.2 — 2026-11-21
+
+### English
+
+- A core start heals a listen address that a DHCP change invalidated while the app was off: it adopts the only replacement on the same /24 of the same non-overlay adapter and persists it; otherwise it exits naming the available addresses instead of a bare bind error.
+
+### Русский
+
+- Старт ядра излечивает адрес прослушивания, устаревший после смены DHCP при выключенном приложении: принимается единственная замена в той же /24 того же физического адаптера и сохраняется в конфигурации; иначе — явный отказ со списком доступных адресов вместо безликой ошибки бинда.
+
 ## 0.5.1 — 2026-11-09
 
 ### English

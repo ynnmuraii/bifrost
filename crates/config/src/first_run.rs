@@ -34,6 +34,11 @@
 //! The chooser is pure ([`choose`], [`Candidate`]); only the enumeration knows a
 //! platform. `bifrost-gui` calls [`lan_addresses`] and [`set_listen_address`];
 //! `bifrost-core` calls [`ensure_config`].
+//! A DHCP lease can also change while the app is off. [`heal_listen_address`] is the
+//! pure decision for that restart: adopt a replacement only when it is the sole
+//! non-overlay adapter in the stored address's /24; any other case is reported to
+//! the caller instead of guessing. `bifrost-core` calls it before binding and
+//! persists an adoption through [`set_listen_address`].
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -152,6 +157,59 @@ pub fn lan_interfaces() -> Vec<Candidate> {
     });
     offered.sort_by_key(|candidate| core::cmp::Reverse(rank(candidate)));
     offered
+}
+
+/// What a core start should do with a stored listen address that may be stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenHeal {
+    /// The stored address is still usable: bind it without changing the config.
+    BindAsConfigured,
+    /// The lease moved inside the same LAN: bind and persist this address.
+    Adopted(Ipv4Addr),
+    /// No safe replacement: refuse to start and show `available` in the settings screen.
+    Unavailable { available: Vec<Candidate> },
+}
+
+/// Decides whether a stored listen address needs healing after a DHCP renewal.
+///
+/// Pure — the caller supplies [`lan_interfaces`]'s list, so no platform call or
+/// clock is involved. Unspecified and loopback listeners always bind as
+/// configured (the integration suite listens on `127.0.0.1`, and discovery already
+/// no-ops there), as does any stored address still present in `candidates`.
+///
+/// # Security invariant
+///
+/// Automatic adoption happens **only** within the same `/24` of a non-overlay
+/// adapter — a lease renewal on the same LAN. A subnet change, a move to an overlay
+/// interface or an ambiguous pair of physical adapters in the same subnet is never
+/// guessed at: it is an explicit failure for the settings screen, which must make
+/// the adapter choice («Respect selected adapters and explicit VPN selection»).
+pub fn heal_listen_address(stored: Ipv4Addr, candidates: &[Candidate]) -> ListenHeal {
+    if stored.is_unspecified() || stored.is_loopback() {
+        return ListenHeal::BindAsConfigured;
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.address == stored)
+    {
+        return ListenHeal::BindAsConfigured;
+    }
+
+    let prefix = stored.octets();
+    let adoptions: Vec<Ipv4Addr> = candidates
+        .iter()
+        .filter(|candidate| {
+            let address = candidate.address.octets();
+            address[..3] == prefix[..3] && !is_overlay(&candidate.name)
+        })
+        .map(|candidate| candidate.address)
+        .collect();
+    match adoptions.as_slice() {
+        [healed] => ListenHeal::Adopted(*healed),
+        _ => ListenHeal::Unavailable {
+            available: candidates.to_vec(),
+        },
+    }
 }
 
 /// Discovery interfaces restricted to the configured input/control listener.
@@ -793,5 +851,118 @@ mod posix {
             // significant byte) integer.
             Some(Ipv4Addr::from(u32::from_be(inet.sin_addr.s_addr)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An up LAN candidate. `lan_interfaces` has already applied the platform
+    /// filters before the heal sees this list.
+    fn candidate(name: &str, address: Ipv4Addr) -> Candidate {
+        Candidate {
+            name: name.to_owned(),
+            address,
+            index: 1,
+            prefix_len: 24,
+            is_up: true,
+            has_default_route: false,
+        }
+    }
+
+    #[test]
+    fn a_dead_stored_address_adopts_the_only_replacement_on_its_lan() {
+        let stored = Ipv4Addr::new(192, 168, 31, 37);
+        let replacement = Ipv4Addr::new(192, 168, 31, 38);
+        let candidates = [
+            candidate("Tailscale", Ipv4Addr::new(100, 105, 129, 122)),
+            candidate("Ethernet 6", replacement),
+        ];
+
+        assert_eq!(
+            heal_listen_address(stored, &candidates),
+            ListenHeal::Adopted(replacement)
+        );
+    }
+
+    #[test]
+    fn an_address_that_is_still_live_binds_as_configured() {
+        let stored = Ipv4Addr::new(192, 168, 31, 38);
+        let candidates = [
+            candidate("Ethernet 6", stored),
+            candidate("wlan0", Ipv4Addr::new(192, 168, 31, 39)),
+        ];
+
+        assert_eq!(
+            heal_listen_address(stored, &candidates),
+            ListenHeal::BindAsConfigured
+        );
+    }
+
+    #[test]
+    fn an_unspecified_listener_binds_as_configured() {
+        let candidates = [candidate("Ethernet", Ipv4Addr::new(192, 168, 31, 38))];
+
+        assert_eq!(
+            heal_listen_address(Ipv4Addr::UNSPECIFIED, &candidates),
+            ListenHeal::BindAsConfigured
+        );
+    }
+
+    #[test]
+    fn a_loopback_listener_binds_as_configured() {
+        // Every integration test binds 127.0.0.1; discovery no-ops there too.
+        let candidates = [candidate("Ethernet", Ipv4Addr::new(127, 0, 0, 2))];
+
+        assert_eq!(
+            heal_listen_address(Ipv4Addr::LOCALHOST, &candidates),
+            ListenHeal::BindAsConfigured
+        );
+    }
+
+    #[test]
+    fn an_overlay_on_the_same_subnet_is_not_a_replacement() {
+        let stored = Ipv4Addr::new(192, 168, 31, 37);
+        let candidates = [candidate("tailscale0", Ipv4Addr::new(192, 168, 31, 38))];
+
+        assert_eq!(
+            heal_listen_address(stored, &candidates),
+            ListenHeal::Unavailable {
+                available: candidates.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn two_physical_replacements_on_the_same_subnet_are_ambiguous() {
+        let stored = Ipv4Addr::new(192, 168, 31, 37);
+        let candidates = [
+            candidate("Ethernet 6", Ipv4Addr::new(192, 168, 31, 38)),
+            candidate("Ethernet 7", Ipv4Addr::new(192, 168, 31, 39)),
+        ];
+
+        assert_eq!(
+            heal_listen_address(stored, &candidates),
+            ListenHeal::Unavailable {
+                available: candidates.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn a_replacement_on_another_subnet_is_not_adopted() {
+        let stored = Ipv4Addr::new(192, 168, 31, 37);
+        let candidates = [
+            candidate("Ethernet 6", Ipv4Addr::new(192, 168, 32, 38)),
+            candidate("wlan0", Ipv4Addr::new(10, 0, 0, 4)),
+        ];
+
+        assert_eq!(
+            heal_listen_address(stored, &candidates),
+            ListenHeal::Unavailable {
+                available: candidates.to_vec()
+            }
+        );
     }
 }

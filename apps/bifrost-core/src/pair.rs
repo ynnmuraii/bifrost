@@ -75,15 +75,11 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
         ));
     }
 
-    // The port this node listens on. `PairHello` advertises it so the *opener* can record
-    // an address for a dialer that does not use the documented default: the opener only
-    // sees the dialer's ephemeral source port. A missing or invalid configuration is not
-    // fatal here — `pair` reads this one setting and nothing else from it.
     // The port this node listens on, and the address a window opens on when this CLI has to
     // serve one itself: `network.listen_address` + `network.port_input`, which is where the
     // peer dials (`docs/05-protocol.md`). A missing or invalid configuration is not fatal
     // here — this command reads these two settings and nothing else from it.
-    let configured = config::Config::load(paths.config_file()).ok();
+    let mut configured = config::Config::load(paths.config_file()).ok();
     let listen_port = configured
         .as_ref()
         .map(|config| config.network.port_input)
@@ -130,10 +126,24 @@ pub fn main(paths: &Paths, rest: &[String]) -> Result<(), Failure> {
             if let Some(outcome) = through_core {
                 return outcome;
             }
-            let address: SocketAddr = listen
+            let mut address: SocketAddr = listen
+                .clone()
                 .unwrap_or(default_listen)
                 .parse()
                 .map_err(|error| Failure::Run(format!("--listen: {error}")))?;
+            // The running-core branch above served the window through IPC; here this
+            // CLI owns the listener, so a config-driven address gets the same startup
+            // heal as `run`. An explicit `--listen` is never changed.
+            if listen.is_none() {
+                if let Some(config) = configured.as_mut() {
+                    let candidates = config::first_run::lan_interfaces();
+                    if let Some(healed) = crate::heal_stored_listen(paths, config, &candidates)
+                        .map_err(Failure::Run)?
+                    {
+                        address = SocketAddr::new(healed.into(), listen_port);
+                    }
+                }
+            }
             let mut window = identity::open_window(identity::now_unix_ms() as u64)
                 .map_err(|error| Failure::Run(error.to_string()))?;
             let listener = identity::bind(address)

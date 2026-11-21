@@ -84,8 +84,8 @@ pub use audio::{
 pub use cli::{CliPaths, Taken, PATH_FLAGS};
 pub use error::{ConfigError, ErrorCode};
 pub use first_run::{
-    choose, discoverable_interfaces, ensure_config, lan_addresses, lan_interfaces,
-    set_listen_address, Candidate,
+    choose, discoverable_interfaces, ensure_config, heal_listen_address, lan_addresses,
+    lan_interfaces, set_listen_address, Candidate, ListenHeal,
 };
 pub use hotkey::{Hotkey, HotkeyAction, HotkeyBindings, HotkeyError, Modifier};
 pub use lock::{update_locked, FileLock};
