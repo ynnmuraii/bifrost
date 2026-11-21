@@ -20,7 +20,7 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
-    win::run();
+    let _ = win::run();
 }
 
 #[cfg(windows)]

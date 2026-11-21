@@ -507,9 +507,8 @@ mod tests {
             );
             assert!(!blocked_write.is_finished());
             renewing.abort();
-            if let Err(error) = renewing.await {
-                assert!(error.is_cancelled(), "renewer failed unexpectedly: {error}");
-            }
+            let Err(error) = renewing.await;
+            assert!(error.is_cancelled(), "renewer failed unexpectedly: {error}");
             // Ordinary observations of the same endpoint must not acknowledge a latch.
             publish_target(
                 &targets,

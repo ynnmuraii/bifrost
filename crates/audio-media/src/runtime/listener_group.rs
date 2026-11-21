@@ -414,8 +414,8 @@ fn mix_loop(
         let now = shared.render_clock.load(Ordering::Acquire);
         let mut inputs = lock(&inputs);
         let mut next_decode = None;
-        for slot in 0..MAX_INPUTS {
-            let Some(input) = inputs.slots[slot].as_mut() else {
+        for input_slot in inputs.slots.iter_mut().take(MAX_INPUTS) {
+            let Some(input) = input_slot.as_mut() else {
                 continue;
             };
             input.shared.render_clock.store(now, Ordering::Release);
@@ -434,7 +434,7 @@ fn mix_loop(
                 < render_underruns;
             if input.shared.is_stopped() {
                 input.shared.finish(&input.events);
-                inputs.slots[slot] = None;
+                *input_slot = None;
                 continue;
             }
             let fill = input.queue.len() as f64 / 2.0 * 48_000.0 / f64::from(rate)
