@@ -328,6 +328,7 @@ jobs:
       - name: Test (unit tests of every crate)
         if: runner.os == 'Windows'
         env:
+          BIFROST_BIN: ${{ github.workspace }}\target\debug\bifrost.exe
           BIFROST_KEEP_ROOTS: "1"
           TMP: ${{ runner.temp }}\bifrost-roots
           TEMP: ${{ runner.temp }}\bifrost-roots
@@ -353,6 +354,7 @@ jobs:
       - name: Test
         if: runner.os == 'Linux'
         env:
+          BIFROST_BIN: ${{ github.workspace }}/target/debug/bifrost
           BIFROST_KEEP_ROOTS: "1"
           TMPDIR: /tmp/bifrost-roots
         # Keep the server alive between short-lived probe clients. Xvfb otherwise resets
